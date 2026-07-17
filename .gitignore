@@ -17,6 +17,7 @@ backend/data/uploads/*
 
 # Node/Vite
 node_modules/
+.vite/
 backend/node_modules/
 frontend/node_modules/
 dist/
