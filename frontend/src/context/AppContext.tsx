@@ -38,7 +38,7 @@ interface AppContextValue {
   renameConversation: (id: string, title: string) => void
   deleteConversation: (id: string) => void
   toggleConversationPin: (id: string) => void
-  sendMessage: (question: string) => Promise<void>
+  sendMessage: (question: string, replaceMessageId?: number) => Promise<void>
   clearChat: () => void
   uploadDocuments: (files: File[]) => Promise<UploadResponse[]>
   removeDocument: (id: string) => Promise<void>
@@ -289,17 +289,33 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     }))
   }, [])
 
-  const sendMessage = useCallback(async (question: string) => {
+  const sendMessage = useCallback(async (question: string, replaceMessageId?: number) => {
     const trimmed = question.trim()
     if (!trimmed || loadingConversationId) return
 
     const started = performance.now()
     const conversationId = activeConversationId
     const now = new Date().toISOString()
-    const userMessage: ChatItem = { id: Date.now(), role: 'user', content: trimmed }
+    const userMessage: ChatItem = { id: replaceMessageId ?? Date.now(), role: 'user', content: trimmed }
     setConversations(previous => {
       const existing = previous.find(conversation => conversation.id === conversationId)
-      if (existing) return previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, userMessage], updatedAt: now } : conversation)
+      if (existing) return previous.map(conversation => {
+        if (conversation.id !== conversationId) return conversation
+        if (replaceMessageId === undefined) return { ...conversation, messages: [...conversation.messages, userMessage], updatedAt: now }
+
+        const userIndex = conversation.messages.findIndex(message => message.id === replaceMessageId && message.role === 'user')
+        if (userIndex < 0) return conversation
+        const nextMessages = conversation.messages
+          .filter((message, index) => !(index === userIndex + 1 && message.role === 'assistant'))
+          .map(message => message.id === replaceMessageId ? userMessage : message)
+        return {
+          ...conversation,
+          title: userIndex === 0 ? createConversationTitle(trimmed) : conversation.title,
+          messages: nextMessages,
+          updatedAt: now,
+        }
+      })
+      if (replaceMessageId !== undefined) return previous
       return [{ id: conversationId, title: createConversationTitle(trimmed), createdAt: now, updatedAt: now, messages: [userMessage], isPinned: false, pinnedAt: null }, ...previous]
     })
     setRecentQuestions(previous => [trimmed, ...previous.filter(item => item !== trimmed)].slice(0, 8))
@@ -314,7 +330,15 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
         : 0
 
       const assistantMessage: ChatItem = { id: Date.now() + 1, role: 'assistant', content: response.answer, source: sources[0] }
-      setConversations(previous => previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, assistantMessage], updatedAt: new Date().toISOString() } : conversation))
+      setConversations(previous => previous.map(conversation => {
+        if (conversation.id !== conversationId) return conversation
+        if (replaceMessageId === undefined) return { ...conversation, messages: [...conversation.messages, assistantMessage], updatedAt: new Date().toISOString() }
+        const userIndex = conversation.messages.findIndex(message => message.id === replaceMessageId && message.role === 'user')
+        if (userIndex < 0) return conversation
+        const nextMessages = [...conversation.messages]
+        nextMessages.splice(userIndex + 1, 0, assistantMessage)
+        return { ...conversation, messages: nextMessages, updatedAt: new Date().toISOString() }
+      }))
       if (activeConversationIdRef.current === conversationId) {
         setRetrievedDocuments(sources)
         setConfidence(averageScore)
@@ -329,7 +353,15 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     } catch (error) {
       const message = apiErrorMessage(error, 'Unable to answer right now. Please try again.')
       const errorMessage: ChatItem = { id: Date.now() + 1, role: 'assistant', content: message }
-      setConversations(previous => previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, errorMessage], updatedAt: new Date().toISOString() } : conversation))
+      setConversations(previous => previous.map(conversation => {
+        if (conversation.id !== conversationId) return conversation
+        if (replaceMessageId === undefined) return { ...conversation, messages: [...conversation.messages, errorMessage], updatedAt: new Date().toISOString() }
+        const userIndex = conversation.messages.findIndex(message => message.id === replaceMessageId && message.role === 'user')
+        if (userIndex < 0) return conversation
+        const nextMessages = [...conversation.messages]
+        nextMessages.splice(userIndex + 1, 0, errorMessage)
+        return { ...conversation, messages: nextMessages, updatedAt: new Date().toISOString() }
+      }))
       showToast(message)
       if (error instanceof ApiError && error.status === 401) logout()
     } finally {

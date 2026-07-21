@@ -36,8 +36,8 @@ export default function Sidebar({ onClose, onUpload, onSettings, onHelp }: Sideb
         <div className="flex h-16 shrink-0 items-center gap-2.5 px-3">
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_6px_18px_rgba(37,99,235,.28)]"><Sparkles size={17} /></span>
           <div className="min-w-0 flex-1">
-            <p className="truncate text-[14px] font-semibold text-slate-900">Simple RAG</p>
-            <p className="truncate text-[11px] text-slate-500">Secure Document Assistant</p>
+            <p className="truncate text-[14px] font-semibold text-slate-900">Docsense AI</p>
+            <p className="truncate text-[11px] text-slate-500">Knowledge AI Assistant</p>
           </div>
           <Button variant="ghost" size="icon" className="h-9 w-9 lg:hidden" onClick={onClose} aria-label="Close sidebar"><X size={17} /></Button>
         </div>

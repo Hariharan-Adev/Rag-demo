@@ -1,6 +1,6 @@
 import { Menu, Sparkles } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useApp } from '../context/AppContext'
 import AIMessage from './AIMessage'
 import ChatInput from './ChatInput'
@@ -10,6 +10,7 @@ import UserMessage from './UserMessage'
 export default function ChatArea({ onUpload }: { onUpload: () => void }) {
   const { messages, loading, sendMessage, suggestions, setSidebarOpen } = useApp()
   const bottomRef = useRef<HTMLDivElement>(null)
+  const [editingMessageId, setEditingMessageId] = useState<number | null>(null)
   const hasConversation = messages.some(message => message.role === 'user')
 
   useEffect(() => {
@@ -32,7 +33,19 @@ export default function ChatArea({ onUpload }: { onUpload: () => void }) {
           <div className="chat-scroll min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6">
             <div className="mx-auto flex w-full max-w-[820px] flex-col gap-7">
               <AnimatePresence initial={false}>
-                {messages.map(message => message.role === 'user' ? <UserMessage key={message.id}>{message.content}</UserMessage> : <AIMessage key={message.id} message={message} />)}
+                {messages.map(message => message.role === 'user' ? (
+                  <UserMessage
+                    key={message.id}
+                    message={message}
+                    isEditing={editingMessageId === message.id}
+                    onEditStart={() => setEditingMessageId(message.id)}
+                    onEditEnd={() => setEditingMessageId(null)}
+                    onSubmit={content => {
+                      setEditingMessageId(null)
+                      void sendMessage(content, message.id)
+                    }}
+                  />
+                ) : <AIMessage key={message.id} message={message} />)}
               </AnimatePresence>
               {loading && <motion.div initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-3 py-2 text-[13px] text-slate-500"><span className="grid h-7 w-7 place-items-center rounded-full bg-slate-900 text-white"><Sparkles size={13} /></span><span className="flex gap-1" aria-label="Generating answer"><i className="typing-dot" /><i className="typing-dot [animation-delay:150ms]" /><i className="typing-dot [animation-delay:300ms]" /></span></motion.div>}
               <div ref={bottomRef} />

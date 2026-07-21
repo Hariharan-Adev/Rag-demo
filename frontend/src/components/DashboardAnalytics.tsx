@@ -20,7 +20,7 @@ export default function DashboardAnalytics() {
         <button type="button" onClick={() => setSidebarOpen(true)} className="mb-4 grid h-10 w-10 place-items-center rounded-[10px] text-slate-600 hover:bg-slate-100 lg:hidden" aria-label="Open sidebar"><Menu size={20}/></button>
         <div>
           <p className="text-[11px] font-semibold uppercase tracking-[.1em] text-slate-400">Workspace overview</p>
-          <h2 className="mt-1 text-2xl font-bold tracking-[-.03em]">Simple RAG Dashboard</h2>
+          <h2 className="mt-1 text-2xl font-bold tracking-[-.03em]">Docsense AI Dashboard</h2>
           <p className="mt-1 text-sm text-slate-500">Monitor indexed documents and your current browser conversation.</p>
         </div>
         <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">

@@ -22,7 +22,7 @@ export default function AIMessage({ message }: { message: ChatItem }) {
   const bookmark = () => { updateMessage(message.id, { bookmarked: !message.bookmarked }); showToast(message.bookmarked ? 'Bookmark removed' : 'Response bookmarked') }
   const share = async () => {
     if (navigator.share) {
-      try { await navigator.share({ title: 'Simple RAG answer', text: `${message.content}\n${message.detail ?? ''}` }) } catch { return }
+      try { await navigator.share({ title: 'Docsense AI answer', text: `${message.content}\n${message.detail ?? ''}` }) } catch { return }
     } else await navigator.clipboard?.writeText(message.content)
     showToast('Share text copied')
   }

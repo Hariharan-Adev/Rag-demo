@@ -50,9 +50,9 @@ export default function App() {
   return (
     <main className="relative grid min-h-screen place-items-center overflow-hidden bg-[#f8fafc] px-4 py-10 before:absolute before:left-1/2 before:top-1/2 before:h-[520px] before:w-[720px] before:-translate-x-1/2 before:-translate-y-1/2 before:rounded-full before:bg-blue-100/60 before:blur-3xl">
       <section className="relative w-full max-w-sm rounded-[18px] border border-[#e6ecf5] bg-white/90 p-6 shadow-[0_20px_60px_rgba(37,99,235,.12)] backdrop-blur-xl">
-        <div className="mb-6">
+        <div className="mb-6 flex flex-col items-center text-center">
           <span className="mb-4 grid h-11 w-11 place-items-center rounded-full bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_8px_22px_rgba(37,99,235,.25)]"><Sparkles size={19} /></span>
-          <p className="text-[11px] font-semibold uppercase tracking-[.14em] text-blue-600">Simple RAG</p>
+          <p className="text-[11px] font-semibold uppercase tracking-[.14em] text-blue-600">Docsense AI</p>
           <h1 className="mt-2 text-2xl font-bold tracking-[-.03em] text-slate-900">
             {isRegistering ? 'Create your account' : 'Sign in to your workspace'}
           </h1>

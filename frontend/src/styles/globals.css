@@ -172,12 +172,12 @@
   }
   .chat-composer__send-button:hover:not(:disabled) { background: #111827; transform: scale(1.03); }
   .chat-composer__send-button:disabled { cursor: not-allowed; background: #e5e7eb; color: #94a3b8; transform: none; }
-  .markdown-content { @apply break-words text-[14px] leading-[1.65] text-slate-800; }
+  .markdown-content { @apply w-full max-w-full break-words text-[14px] leading-[1.7] text-slate-800; overflow-wrap: anywhere; }
   .markdown-content p + p { @apply mt-3; }
-  .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4 { @apply mb-2 mt-5 font-semibold leading-tight text-slate-900 first:mt-0; }
+  .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { @apply mb-2 mt-5 font-semibold leading-tight text-slate-900 first:mt-0; }
   .markdown-content h1 { @apply text-xl; }
   .markdown-content h2 { @apply text-lg; }
-  .markdown-content h3, .markdown-content h4 { @apply text-base; }
+  .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { @apply text-base; }
   .markdown-content ul { @apply my-3 list-disc space-y-1 pl-5; }
   .markdown-content ol { @apply my-3 list-decimal space-y-1 pl-5; }
   .markdown-content a { @apply text-blue-600 underline decoration-blue-200 underline-offset-2 hover:text-blue-700; }
@@ -185,10 +185,25 @@
   .markdown-content pre { @apply my-4 max-w-full overflow-x-auto rounded-xl bg-slate-900 p-4 text-slate-100; }
   .markdown-content pre code { @apply font-mono text-[12px] leading-5; }
   .markdown-content blockquote { @apply my-3 border-l-2 border-slate-300 pl-4 text-slate-600; }
-  .markdown-content .table-scroll { @apply my-4 max-w-full overflow-x-auto; }
-  .markdown-content table { @apply w-full min-w-[480px] border-collapse text-left text-[12px]; }
-  .markdown-content th { @apply border border-slate-200 bg-slate-50 px-3 py-2 font-semibold; }
-  .markdown-content td { @apply border border-slate-200 px-3 py-2 align-top; }
+  .markdown-content .markdown-table-wrapper { @apply my-4 w-full max-w-full overflow-x-auto; }
+  .markdown-content table { @apply w-full min-w-[640px] border-collapse text-left text-[13px]; }
+  .markdown-content th, .markdown-content td { @apply border border-slate-200 px-3.5 py-3 align-top; }
+  .markdown-content th { @apply bg-slate-50 font-semibold text-slate-900; }
+  .markdown-content tbody tr:nth-child(even) td { @apply bg-slate-50/60; }
+  .user-message-actions {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-2px);
+    transition: opacity 150ms ease, transform 150ms ease, visibility 150ms ease;
+  }
+  .user-message-group:hover .user-message-actions,
+  .user-message-group:focus-within .user-message-actions {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
 }
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }
@@ -223,6 +238,15 @@
   .chat-composer { padding: 9px 12px 7px; border-radius: 24px; }
   .chat-composer__textarea { font-size: 16px; }
   .chat-composer__send-button { width: 36px; height: 36px; }
+}
+
+@media (hover: none) {
+  .user-message-actions {
+    opacity: .72;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
