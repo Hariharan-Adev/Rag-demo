@@ -14,7 +14,7 @@ type UploadItem = {
   error?: string
 }
 
-const allowedExtensions = ['pdf', 'docx', 'txt']
+const allowedExtensions = ['txt', 'pdf', 'docx', 'xlsx', 'xls', 'csv', 'pptx', 'ppt', 'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp']
 const maxFileSize = 10 * 1024 * 1024
 
 export default function UploadDocumentsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
@@ -31,7 +31,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
     })
 
     if (valid.length < incoming.length) {
-      showToast('Use TXT, PDF, or DOCX files up to 10 MB.')
+      showToast('Choose a supported document, spreadsheet, presentation, or image up to 10 MB.')
     }
 
     setFiles(previous => [
@@ -91,10 +91,10 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
         }}
         onDragLeave={() => setDragging(false)}
         onDrop={drop}
-        className={`grid min-h-40 place-items-center rounded-2xl border-2 border-dashed p-6 text-center transition ${dragging ? 'border-blue-500 bg-blue-50' : 'border-slate-200 bg-slate-50'}`}
+        className={`grid min-h-44 place-items-center rounded-2xl border border-dashed p-6 text-center transition ${dragging ? 'border-blue-500 bg-blue-50' : 'border-[#d9e3f1] bg-[#f8fbff]'}`}
       >
         <div>
-          <motion.div animate={dragging ? { y: [0, -5, 0] } : {}} transition={{ repeat: dragging ? Infinity : 0, duration: 1 }} className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-blue-100 text-blue-600">
+          <motion.div animate={dragging ? { y: [0, -5, 0] } : {}} transition={{ repeat: dragging ? Infinity : 0, duration: 1 }} className="mx-auto grid h-12 w-12 place-items-center rounded-2xl bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_8px_20px_rgba(37,99,235,.22)]">
             <UploadCloud size={23} />
           </motion.div>
           <p className="mt-3 text-sm font-semibold">
@@ -103,14 +103,20 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
               browse
             </button>
           </p>
-          <p className="mt-1 text-[10px] text-slate-500">TXT, PDF, or DOCX. Maximum 10 MB each.</p>
-          <input ref={inputRef} type="file" multiple accept=".pdf,.docx,.txt" className="hidden" onChange={event => accept(Array.from(event.target.files ?? []))} />
+          <div className="mt-2 grid grid-cols-2 gap-x-5 gap-y-1.5 text-left text-[10px] leading-4 text-slate-500">
+            <p><span className="block font-semibold text-slate-700">Documents</span>TXT • PDF • DOCX</p>
+            <p><span className="block font-semibold text-slate-700">Spreadsheets</span>XLSX • XLS • CSV</p>
+            <p><span className="block font-semibold text-slate-700">Presentations</span>PPTX • PPT</p>
+            <p><span className="block font-semibold text-slate-700">Images</span>PNG • JPG • JPEG • BMP • GIF • TIFF • WEBP</p>
+          </div>
+          <p className="mt-2 text-[10px] text-slate-500">Maximum 10 MB per file.</p>
+          <input ref={inputRef} type="file" multiple accept=".txt,.pdf,.docx,.xlsx,.xls,.csv,.pptx,.ppt,.png,.jpg,.jpeg,.bmp,.gif,.tiff,.webp" className="hidden" onChange={event => accept(Array.from(event.target.files ?? []))} />
         </div>
       </div>
 
       <div className="mt-4 max-h-56 space-y-2 overflow-y-auto">
         {files.map(item => (
-          <div key={item.id} className="rounded-xl border border-slate-200 p-3">
+          <div key={item.id} className="rounded-xl border border-[#eef2f7] bg-white p-3 shadow-[0_4px_16px_rgba(37,99,235,.04)]">
             <div className="flex items-center gap-3">
               <span className="grid h-9 w-9 place-items-center rounded-lg bg-red-50 text-red-500">
                 {item.status === 'done' ? <CheckCircle2 className="text-emerald-500" size={18} /> : <FileText size={17} />}
@@ -126,7 +132,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
               )}
             </div>
 
-            {item.status === 'uploading' && <p className="mt-2 text-[10px] font-semibold text-blue-600">Processing and indexing...</p>}
+            {item.status === 'uploading' && <div className="mt-2"><div className="h-1.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full w-2/3 animate-pulse rounded-full bg-blue-600" /></div><p className="mt-1.5 text-[10px] font-medium text-blue-600">Processing and indexing...</p></div>}
             {item.status === 'done' && item.result && (
               <p className="mt-2 text-[10px] font-semibold text-emerald-700">
                 Document #{item.result.document_id} indexed with {item.result.chunk_count} chunks.

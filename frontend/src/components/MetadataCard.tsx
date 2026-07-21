@@ -1,5 +1,0 @@
-import { Activity } from 'lucide-react'
-import { useApp } from '../context/AppContext'
-import { Card } from './ui/Card'
-
-export default function MetadataCard(){const {metadata}=useApp();const items=metadata?[["Embedding Model",metadata.embeddingModel],["LLM Model",metadata.llmModel],["Chunks Retrieved",String(metadata.chunksRetrieved)],["Latency",metadata.latency],["Timestamp",metadata.timestamp]]:[];return <Card className="p-4"><div className="flex items-center gap-2"><Activity size={16} className="text-blue-600"/><h3 className="text-sm font-bold">Response Metadata</h3></div><dl className="mt-3 space-y-2.5">{items.map(([k,v])=><div key={k} className="flex items-start justify-between gap-3"><dt className="text-[10px] text-slate-500">{k}</dt><dd className="text-right text-[10px] font-semibold text-slate-700">{v}</dd></div>)}{!metadata&&<p className="rounded-xl border border-dashed border-slate-200 p-3 text-center text-[10px] text-slate-400">Metadata will appear after an answer.</p>}</dl></Card>}

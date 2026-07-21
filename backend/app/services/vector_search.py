@@ -19,16 +19,22 @@ def search_chunks(
             """
             SELECT
                 chunks.id,
-                chunks.document_id,
-                chunks.content,
+                chunks.content_id,
+                chunks.text,
                 chunks.embedding,
-                documents.filename
+                MIN(documents.id) AS document_id,
+                MIN(documents.display_filename) AS filename,
+                GROUP_CONCAT(documents.display_filename, '|') AS referencing_filenames
             FROM chunks
-            JOIN documents ON documents.id = chunks.document_id
+            JOIN document_contents ON document_contents.id = chunks.content_id
+            JOIN documents ON documents.content_id = document_contents.id
             WHERE chunks.embedding IS NOT NULL
             AND documents.owner_id = ?
+            AND document_contents.owner_id = ?
+            AND document_contents.processing_status = 'completed'
+            GROUP BY chunks.id, chunks.content_id, chunks.text, chunks.embedding
             """,
-            (owner_id,),
+            (owner_id, owner_id),
         ).fetchall()
 
     results = []
@@ -46,8 +52,12 @@ def search_chunks(
             {
                 "chunk_id": row["id"],
                 "document_id": row["document_id"],
+                "content_id": row["content_id"],
                 "filename": row["filename"],
-                "content": row["content"],
+                "referencing_filenames": list(dict.fromkeys(
+                    str(row["referencing_filenames"] or "").split("|")
+                )),
+                "content": row["text"],
                 "score": round(score, 4),
             }
         )

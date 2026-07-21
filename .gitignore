@@ -12,6 +12,7 @@ __pycache__/
 
 # Runtime data
 backend/data/*.db
+backend/data/*.db.*.bak
 backend/data/uploads/*
 !backend/data/uploads/.gitkeep
 

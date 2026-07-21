@@ -1,8 +1,5 @@
-import type { LucideIcon } from 'lucide-react'
-
 export type Theme = 'light' | 'dark'
-export type View = 'chat' | 'dashboard'
-export type Category = { label: string; icon: LucideIcon }
+export type View = 'chat' | 'dashboard' | 'library'
 
 export interface User {
   id: string
@@ -14,7 +11,7 @@ export interface User {
 export interface PolicyDocument {
   id: string
   name: string
-  type: 'PDF' | 'DOCX' | 'TXT'
+  type: 'TXT' | 'PDF' | 'DOCX' | 'XLSX' | 'XLS' | 'CSV' | 'PPTX' | 'PPT' | 'PNG' | 'JPG' | 'JPEG' | 'BMP' | 'GIF' | 'TIFF' | 'WEBP'
   size: string
   chunks: number
   category: string
@@ -47,6 +44,17 @@ export interface ChatItem {
   liked?: boolean
   disliked?: boolean
   bookmarked?: boolean
+}
+
+export interface Conversation {
+  id: string
+  title: string
+  createdAt: string
+  updatedAt: string
+  messages: ChatItem[]
+  isPinned: boolean
+  pinnedAt?: string | null
+  selectedDocumentIds?: string[]
 }
 
 export interface NotificationItem {

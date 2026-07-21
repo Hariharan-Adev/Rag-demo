@@ -1,19 +1,46 @@
-import { Bot, Eraser, Sparkles } from 'lucide-react'
+import { Menu, Sparkles } from 'lucide-react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { useApp } from '../context/AppContext'
 import AIMessage from './AIMessage'
 import ChatInput from './ChatInput'
 import SuggestedQuestions from './SuggestedQuestions'
 import UserMessage from './UserMessage'
-import { Badge } from './ui/Badge'
-import { Button } from './ui/Button'
-import { Modal } from './ui/Modal'
-import { SkeletonLoader } from './ui/SkeletonLoader'
-import MobileCategoryStrip from './MobileCategoryStrip'
 
-export default function ChatArea(){
-  const {messages,loading,sendMessage,clearChat,suggestions,selectedCategory}=useApp();const [confirm,setConfirm]=useState(false);const bottomRef=useRef<HTMLDivElement>(null)
-  useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:'smooth',block:'end'})},[messages,loading])
-  return <section className="flex min-w-0 flex-1 flex-col bg-[#f8fafc]"><div className="flex h-[68px] shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4 sm:px-6"><div className="flex items-center gap-3"><div className="grid h-10 w-10 place-items-center rounded-[13px] bg-blue-50 text-blue-600"><Bot size={21}/></div><div><div className="flex items-center gap-2"><h2 className="text-sm font-bold text-slate-900">RAG Assistant</h2><Badge><span className="h-1.5 w-1.5 rounded-full bg-emerald-500"/> Online</Badge>{selectedCategory!=='All Documents'&&<Badge className="bg-blue-50 text-blue-700">{selectedCategory}</Badge>}</div><p className="mt-0.5 hidden text-[10px] text-slate-500 sm:block">Powered by your uploaded document library</p></div></div><Button variant="ghost" size="sm" onClick={()=>setConfirm(true)}><Eraser size={15}/><span className="hidden sm:inline">Clear chat</span></Button></div><MobileCategoryStrip/><div className="chat-scroll flex-1 overflow-y-auto px-4 py-6 sm:px-6"><div className="mx-auto flex max-w-4xl flex-col gap-5"><AnimatePresence initial={false}>{messages.map(m=>m.role==='user'?<UserMessage key={m.id}>{m.content}</UserMessage>:<AIMessage key={m.id} message={m}/>)}</AnimatePresence>{messages.length===0&&!loading&&<div className="rounded-2xl border border-dashed border-slate-200 bg-white p-8 text-center"><Bot className="mx-auto text-slate-300"/><p className="mt-3 text-sm font-semibold">No messages yet</p><p className="mt-1 text-xs text-slate-500">Ask a question about your uploaded documents.</p></div>}{loading&&<motion.div initial={{opacity:0,y:8}} animate={{opacity:1,y:0}} className="flex max-w-2xl items-start gap-3 text-xs text-slate-500"><div className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-blue-600 text-white"><Sparkles size={15}/></div><div className="min-w-0 flex-1 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="mb-3 flex items-center gap-2"><div className="flex gap-1"><i className="typing-dot"/><i className="typing-dot [animation-delay:150ms]"/><i className="typing-dot [animation-delay:300ms]"/></div><span>Retrieving context and generating an answer...</span></div><SkeletonLoader/></div></motion.div>}{messages.length>0&&!loading&&<SuggestedQuestions suggestions={suggestions} onSelect={sendMessage}/>}<div ref={bottomRef}/></div></div><ChatInput/><Modal open={confirm} onClose={()=>setConfirm(false)} title="Clear conversation?"><p className="text-sm leading-6 text-slate-600">This clears only the current browser conversation. Uploaded documents remain indexed until deleted.</p><div className="mt-6 flex justify-end gap-2"><Button variant="secondary" onClick={()=>setConfirm(false)}>Cancel</Button><Button variant="primary" className="bg-red-600 hover:bg-red-700" onClick={()=>{clearChat();setConfirm(false)}}>Clear chat</Button></div></Modal></section>
+export default function ChatArea({ onUpload }: { onUpload: () => void }) {
+  const { messages, loading, sendMessage, suggestions, setSidebarOpen } = useApp()
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const hasConversation = messages.some(message => message.role === 'user')
+
+  useEffect(() => {
+    if (hasConversation) bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+  }, [hasConversation, messages, loading])
+
+  return (
+    <section className="relative flex h-screen min-w-0 flex-1 flex-col overflow-hidden bg-[#f8fafc]">
+      <button type="button" onClick={() => setSidebarOpen(true)} className="absolute left-3 top-3 z-20 grid h-10 w-10 place-items-center rounded-xl bg-white text-slate-500 shadow-sm hover:bg-blue-50 hover:text-blue-600 lg:hidden" aria-label="Open sidebar"><Menu size={20} /></button>
+
+      {!hasConversation ? (
+        <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-3 pb-16 before:pointer-events-none before:absolute before:left-1/2 before:top-1/2 before:h-[420px] before:w-[620px] before:-translate-x-1/2 before:-translate-y-1/2 before:rounded-full before:bg-blue-100/35 before:blur-3xl">
+          <div className="relative z-10 mb-7 grid h-16 w-16 place-items-center rounded-full bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_12px_32px_rgba(37,99,235,.28)]"><Sparkles size={26} /><span className="absolute -right-1 top-0 text-sm text-blue-400">✦</span></div>
+          <h1 className="relative z-10 mb-8 max-w-[760px] text-center text-[clamp(30px,3.4vw,38px)] font-bold leading-[1.2] tracking-[-.035em] text-[#0f172a]">What would you like to know about <span className="text-blue-600">your documents?</span></h1>
+          <div className="relative z-10 w-full"><ChatInput onUpload={onUpload} /></div>
+          <div className="relative z-10 mt-3"><SuggestedQuestions suggestions={suggestions} onSelect={sendMessage} /></div>
+        </div>
+      ) : (
+        <>
+          <div className="chat-scroll min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6">
+            <div className="mx-auto flex w-full max-w-[820px] flex-col gap-7">
+              <AnimatePresence initial={false}>
+                {messages.map(message => message.role === 'user' ? <UserMessage key={message.id}>{message.content}</UserMessage> : <AIMessage key={message.id} message={message} />)}
+              </AnimatePresence>
+              {loading && <motion.div initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-3 py-2 text-[13px] text-slate-500"><span className="grid h-7 w-7 place-items-center rounded-full bg-slate-900 text-white"><Sparkles size={13} /></span><span className="flex gap-1" aria-label="Generating answer"><i className="typing-dot" /><i className="typing-dot [animation-delay:150ms]" /><i className="typing-dot [animation-delay:300ms]" /></span></motion.div>}
+              <div ref={bottomRef} />
+            </div>
+          </div>
+          <div className="shrink-0 bg-gradient-to-t from-[#f8fafc] via-[#f8fafc] to-[#f8fafc]/80 pt-2"><ChatInput onUpload={onUpload} /></div>
+        </>
+      )}
+    </section>
+  )
 }

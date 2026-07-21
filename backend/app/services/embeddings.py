@@ -1,16 +1,21 @@
 """Create local vector embeddings for RAG retrieval."""
 
-from sentence_transformers import SentenceTransformer
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-model: SentenceTransformer | None = None
+model: Any | None = None
 
 
-def get_model() -> SentenceTransformer:
+def get_model() -> "SentenceTransformer":
     """Load the embedding model once and reuse it."""
     global model
 
     if model is None:
+        from sentence_transformers import SentenceTransformer
+
         model = SentenceTransformer(MODEL_NAME)
 
     return model

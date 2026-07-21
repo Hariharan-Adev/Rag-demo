@@ -58,6 +58,7 @@ def search_documents(
             "chunk_id": result["chunk_id"],
             "document_id": result["document_id"],
             "filename": result["filename"],
+            "referencing_filenames": result["referencing_filenames"],
             "score": result["score"],
             "preview": make_preview(str(result["content"])),
         }

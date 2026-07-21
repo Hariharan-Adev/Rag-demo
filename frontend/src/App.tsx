@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react'
+import { Sparkles } from 'lucide-react'
 import Dashboard from './pages/Dashboard'
 import { AppProvider } from './context/AppContext'
 import { login, register, setAccessToken } from './services/api'
@@ -47,11 +48,12 @@ export default function App() {
   }
 
   return (
-    <main className="grid min-h-screen place-items-center bg-slate-50 px-4 py-10">
-      <section className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-6 shadow-xl">
+    <main className="relative grid min-h-screen place-items-center overflow-hidden bg-[#f8fafc] px-4 py-10 before:absolute before:left-1/2 before:top-1/2 before:h-[520px] before:w-[720px] before:-translate-x-1/2 before:-translate-y-1/2 before:rounded-full before:bg-blue-100/60 before:blur-3xl">
+      <section className="relative w-full max-w-sm rounded-[18px] border border-[#e6ecf5] bg-white/90 p-6 shadow-[0_20px_60px_rgba(37,99,235,.12)] backdrop-blur-xl">
         <div className="mb-6">
-          <p className="text-xs font-bold uppercase tracking-[.16em] text-blue-600">Simple RAG</p>
-          <h1 className="mt-2 text-2xl font-bold text-slate-900">
+          <span className="mb-4 grid h-11 w-11 place-items-center rounded-full bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_8px_22px_rgba(37,99,235,.25)]"><Sparkles size={19} /></span>
+          <p className="text-[11px] font-semibold uppercase tracking-[.14em] text-blue-600">Simple RAG</p>
+          <h1 className="mt-2 text-2xl font-bold tracking-[-.03em] text-slate-900">
             {isRegistering ? 'Create your account' : 'Sign in to your workspace'}
           </h1>
           <p className="mt-2 text-sm leading-6 text-slate-500">
@@ -66,7 +68,7 @@ export default function App() {
               type="email"
               value={email}
               onChange={event => setEmail(event.target.value)}
-              className="mt-1 h-11 w-full rounded-xl border border-slate-200 px-3 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              className="mt-1 h-11 w-full rounded-xl border border-[#e6ecf5] bg-white px-3 text-sm outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60"
               autoComplete="email"
               required
             />
@@ -78,7 +80,7 @@ export default function App() {
               type="password"
               value={password}
               onChange={event => setPassword(event.target.value)}
-              className="mt-1 h-11 w-full rounded-xl border border-slate-200 px-3 text-sm outline-none focus:border-blue-400 focus:ring-2 focus:ring-blue-100"
+              className="mt-1 h-11 w-full rounded-xl border border-[#e6ecf5] bg-white px-3 text-sm outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60"
               autoComplete={isRegistering ? 'new-password' : 'current-password'}
               minLength={12}
               required
@@ -94,7 +96,7 @@ export default function App() {
           <button
             type="submit"
             disabled={submitting}
-            className="h-11 w-full rounded-xl bg-blue-600 px-4 text-sm font-bold text-white shadow-lg shadow-blue-100 hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+            className="h-11 w-full rounded-xl bg-gradient-to-br from-blue-600 to-indigo-500 px-4 text-sm font-semibold text-white shadow-[0_6px_18px_rgba(37,99,235,.22)] hover:-translate-y-0.5 hover:shadow-[0_9px_22px_rgba(37,99,235,.28)] disabled:cursor-not-allowed disabled:opacity-60"
           >
             {submitting ? 'Please wait...' : isRegistering ? 'Register and sign in' : 'Sign in'}
           </button>
@@ -105,7 +107,7 @@ export default function App() {
               setIsRegistering(current => !current)
               setError('')
             }}
-            className="h-10 w-full rounded-xl border border-slate-200 text-sm font-semibold text-slate-600 hover:bg-slate-50"
+            className="h-10 w-full rounded-xl border border-[#e6ecf5] bg-white text-sm font-semibold text-slate-600 hover:bg-[#f5f9ff] hover:text-blue-600"
           >
             {isRegistering ? 'Use an existing account' : 'Create an account'}
           </button>

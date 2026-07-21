@@ -1,12 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
-import type { ChatItem, NotificationItem, PolicyDocument, ResponseMetadata, RetrievedDocument, Theme, User, View } from '../types'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import type { ChatItem, Conversation, NotificationItem, PolicyDocument, ResponseMetadata, RetrievedDocument, Theme, User, View } from '../types'
 import { ApiError, deleteDocument, listDocuments, sendChatMessage, uploadDocument, type ChatSource, type DocumentRecord, type UploadResponse } from '../services/api'
-
-const welcomeMessage: ChatItem = {
-  id: Date.now(),
-  role: 'assistant',
-  content: 'Hello. Upload a TXT, PDF, or DOCX document, then ask a question about your own indexed content.',
-}
 
 const defaultSuggestions = [
   'What is this document about?',
@@ -17,6 +11,8 @@ const defaultSuggestions = [
 interface AppContextValue {
   user: User
   messages: ChatItem[]
+  conversations: Conversation[]
+  activeConversationId: string
   documents: PolicyDocument[]
   selectedCategory: string
   retrievedDocuments: RetrievedDocument[]
@@ -38,6 +34,10 @@ interface AppContextValue {
   setSelectedDocument: (doc: PolicyDocument | null) => void
   showToast: (message: string) => void
   newChat: () => void
+  selectConversation: (id: string) => void
+  renameConversation: (id: string, title: string) => void
+  deleteConversation: (id: string) => void
+  toggleConversationPin: (id: string) => void
   sendMessage: (question: string) => Promise<void>
   clearChat: () => void
   uploadDocuments: (files: File[]) => Promise<UploadResponse[]>
@@ -57,6 +57,51 @@ interface AppProviderProps {
 }
 
 const AppContext = createContext<AppContextValue | null>(null)
+const CHAT_HISTORY_VERSION = 'simple-rag-chat-history-v1'
+
+function conversationStorageKey(email: string) {
+  return `${CHAT_HISTORY_VERSION}:${email.toLowerCase()}`
+}
+
+function createConversationId() {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function createConversationTitle(question: string) {
+  const normalized = question.replace(/\s+/g, ' ').trim()
+  return normalized.length > 48 ? `${normalized.slice(0, 47).trimEnd()}…` : normalized
+}
+
+function isChatItem(value: unknown): value is ChatItem {
+  if (!value || typeof value !== 'object') return false
+  const message = value as Partial<ChatItem>
+  return typeof message.id === 'number' && (message.role === 'user' || message.role === 'assistant') && typeof message.content === 'string'
+}
+
+function readConversations(email: string): Conversation[] {
+  try {
+    const raw = localStorage.getItem(conversationStorageKey(email))
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((value): value is Conversation => {
+      if (!value || typeof value !== 'object') return false
+      const conversation = value as Partial<Conversation>
+      return typeof conversation.id === 'string'
+        && typeof conversation.title === 'string'
+        && typeof conversation.createdAt === 'string'
+        && typeof conversation.updatedAt === 'string'
+        && Array.isArray(conversation.messages)
+        && conversation.messages.every(isChatItem)
+    }).map(conversation => ({
+      ...conversation,
+      isPinned: conversation.isPinned === true,
+      pinnedAt: conversation.isPinned === true && typeof conversation.pinnedAt === 'string' ? conversation.pinnedAt : null,
+    }))
+  } catch {
+    return []
+  }
+}
 
 function readTheme(): Theme {
   try {
@@ -72,7 +117,8 @@ function initialsFromEmail(email: string) {
 
 function documentType(filename: string): PolicyDocument['type'] {
   const extension = filename.split('.').pop()?.toUpperCase()
-  return extension === 'PDF' || extension === 'DOCX' || extension === 'TXT' ? extension : 'TXT'
+  const supported: PolicyDocument['type'][] = ['TXT', 'PDF', 'DOCX', 'XLSX', 'XLS', 'CSV', 'PPTX', 'PPT', 'PNG', 'JPG', 'JPEG', 'BMP', 'GIF', 'TIFF', 'WEBP']
+  return supported.includes(extension as PolicyDocument['type']) ? extension as PolicyDocument['type'] : 'TXT'
 }
 
 function formatDate(value: string) {
@@ -119,7 +165,9 @@ function apiErrorMessage(error: unknown, fallback: string) {
 }
 
 export function AppProvider({ children, userEmail, onLogout }: AppProviderProps) {
-  const [messages, setMessages] = useState<ChatItem[]>([welcomeMessage])
+  const [conversations, setConversations] = useState<Conversation[]>(() => readConversations(userEmail))
+  const [activeConversationId, setActiveConversationId] = useState(createConversationId)
+  const [loadingConversationId, setLoadingConversationId] = useState<string | null>(null)
   const [documents, setDocuments] = useState<PolicyDocument[]>([])
   const [selectedCategory, setCategory] = useState('All Documents')
   const [retrievedDocuments, setRetrievedDocuments] = useState<RetrievedDocument[]>([])
@@ -129,12 +177,15 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const [theme, setTheme] = useState<Theme>(readTheme)
   const [notifications, setNotifications] = useState<NotificationItem[]>([])
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [loading, setLoading] = useState(false)
   const [bookmarks, setBookmarks] = useState<ChatItem[]>([])
   const [recentQuestions, setRecentQuestions] = useState<string[]>([])
   const [view, setView] = useState<View>('chat')
   const [toast, setToast] = useState('')
   const [selectedDocument, setSelectedDocument] = useState<PolicyDocument | null>(null)
+  const activeConversationIdRef = useRef(activeConversationId)
+
+  const messages = useMemo(() => conversations.find(conversation => conversation.id === activeConversationId)?.messages ?? [], [activeConversationId, conversations])
+  const loading = loadingConversationId === activeConversationId
 
   const user = useMemo<User>(() => ({
     id: userEmail,
@@ -143,13 +194,16 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     initials: initialsFromEmail(userEmail),
   }), [userEmail])
 
+  useEffect(() => {
+    activeConversationIdRef.current = activeConversationId
+  }, [activeConversationId])
+
   const showToast = useCallback((message: string) => {
     setToast(message)
     window.setTimeout(() => setToast(''), 3000)
   }, [])
 
   const logout = useCallback(() => {
-    setMessages([])
     setDocuments([])
     setRetrievedDocuments([])
     setBookmarks([])
@@ -173,6 +227,14 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   }, [theme])
 
   useEffect(() => {
+    try {
+      localStorage.setItem(conversationStorageKey(userEmail), JSON.stringify(conversations))
+    } catch {
+      // Keep the current session usable when browser storage is unavailable.
+    }
+  }, [conversations, userEmail])
+
+  useEffect(() => {
     void refreshDocuments()
   }, [refreshDocuments])
 
@@ -182,25 +244,66 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   }, [])
 
   const newChat = useCallback(() => {
-    setMessages([{ ...welcomeMessage, id: Date.now() }])
+    setActiveConversationId(createConversationId())
     setRetrievedDocuments([])
     setConfidence(0)
     setMetadata(null)
-    setLoading(false)
     setView('chat')
     setSidebarOpen(false)
     showToast('New conversation started')
   }, [showToast])
 
+  const selectConversation = useCallback((id: string) => {
+    if (!conversations.some(conversation => conversation.id === id)) return
+    setActiveConversationId(id)
+    setRetrievedDocuments([])
+    setConfidence(0)
+    setMetadata(null)
+    setView('chat')
+    setSidebarOpen(false)
+  }, [conversations])
+
+  const renameConversation = useCallback((id: string, title: string) => {
+    const normalized = title.replace(/\s+/g, ' ').trim()
+    if (!normalized) return
+    setConversations(previous => previous.map(conversation => conversation.id === id ? { ...conversation, title: normalized.slice(0, 48) } : conversation))
+  }, [])
+
+  const deleteConversation = useCallback((id: string) => {
+    setConversations(previous => previous.filter(conversation => conversation.id !== id))
+    if (activeConversationIdRef.current === id) {
+      setActiveConversationId(createConversationId())
+      setRetrievedDocuments([])
+      setConfidence(0)
+      setMetadata(null)
+      setView('chat')
+    }
+    showToast('Conversation deleted')
+  }, [showToast])
+
+  const toggleConversationPin = useCallback((id: string) => {
+    setConversations(previous => previous.map(conversation => {
+      if (conversation.id !== id) return conversation
+      const isPinned = !conversation.isPinned
+      return { ...conversation, isPinned, pinnedAt: isPinned ? new Date().toISOString() : null }
+    }))
+  }, [])
+
   const sendMessage = useCallback(async (question: string) => {
     const trimmed = question.trim()
-    if (!trimmed || loading) return
+    if (!trimmed || loadingConversationId) return
 
     const started = performance.now()
+    const conversationId = activeConversationId
+    const now = new Date().toISOString()
     const userMessage: ChatItem = { id: Date.now(), role: 'user', content: trimmed }
-    setMessages(previous => [...previous, userMessage])
+    setConversations(previous => {
+      const existing = previous.find(conversation => conversation.id === conversationId)
+      if (existing) return previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, userMessage], updatedAt: now } : conversation)
+      return [{ id: conversationId, title: createConversationTitle(trimmed), createdAt: now, updatedAt: now, messages: [userMessage], isPinned: false, pinnedAt: null }, ...previous]
+    })
     setRecentQuestions(previous => [trimmed, ...previous.filter(item => item !== trimmed)].slice(0, 8))
-    setLoading(true)
+    setLoadingConversationId(conversationId)
     setView('chat')
 
     try {
@@ -210,36 +313,34 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
         ? Math.round(sources.reduce((total, source) => total + source.score, 0) / sources.length)
         : 0
 
-      setRetrievedDocuments(sources)
-      setConfidence(averageScore)
-      setMetadata({
-        embeddingModel: 'Backend embedding service',
-        llmModel: 'Configured Groq model',
-        chunksRetrieved: sources.length,
-        latency: `${((performance.now() - started) / 1000).toFixed(2)} sec`,
-        timestamp: new Date().toLocaleString(),
-      })
-      setMessages(previous => [
-        ...previous,
-        {
-          id: Date.now() + 1,
-          role: 'assistant',
-          content: response.answer,
-          source: sources[0],
-        },
-      ])
+      const assistantMessage: ChatItem = { id: Date.now() + 1, role: 'assistant', content: response.answer, source: sources[0] }
+      setConversations(previous => previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, assistantMessage], updatedAt: new Date().toISOString() } : conversation))
+      if (activeConversationIdRef.current === conversationId) {
+        setRetrievedDocuments(sources)
+        setConfidence(averageScore)
+        setMetadata({
+          embeddingModel: 'Backend embedding service',
+          llmModel: 'Configured Groq model',
+          chunksRetrieved: sources.length,
+          latency: `${((performance.now() - started) / 1000).toFixed(2)} sec`,
+          timestamp: new Date().toLocaleString(),
+        })
+      }
     } catch (error) {
       const message = apiErrorMessage(error, 'Unable to answer right now. Please try again.')
-      setMessages(previous => [...previous, { id: Date.now() + 1, role: 'assistant', content: message }])
+      const errorMessage: ChatItem = { id: Date.now() + 1, role: 'assistant', content: message }
+      setConversations(previous => previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: [...conversation.messages, errorMessage], updatedAt: new Date().toISOString() } : conversation))
       showToast(message)
       if (error instanceof ApiError && error.status === 401) logout()
     } finally {
-      setLoading(false)
+      setLoadingConversationId(current => current === conversationId ? null : current)
     }
-  }, [loading, logout, showToast])
+  }, [activeConversationId, loadingConversationId, logout, showToast])
 
   const clearChat = useCallback(() => {
-    setMessages([])
+    const currentId = activeConversationIdRef.current
+    setConversations(previous => previous.filter(conversation => conversation.id !== currentId))
+    setActiveConversationId(createConversationId())
     setRetrievedDocuments([])
     setConfidence(0)
     setMetadata(null)
@@ -295,7 +396,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   }, [])
 
   const updateMessage = useCallback((id: number, patch: Partial<ChatItem>) => {
-    setMessages(previous => previous.map(message => (message.id === id ? { ...message, ...patch } : message)))
+    const conversationId = activeConversationIdRef.current
+    setConversations(previous => previous.map(conversation => conversation.id === conversationId ? { ...conversation, messages: conversation.messages.map(message => message.id === id ? { ...message, ...patch } : message), updatedAt: new Date().toISOString() } : conversation))
     if ('bookmarked' in patch) {
       setBookmarks(previous => {
         const current = messages.find(message => message.id === id)
@@ -317,6 +419,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const value = useMemo(() => ({
     user,
     messages,
+    conversations,
+    activeConversationId,
     documents,
     selectedCategory,
     retrievedDocuments,
@@ -338,6 +442,10 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     setSelectedDocument,
     showToast,
     newChat,
+    selectConversation,
+    renameConversation,
+    deleteConversation,
+    toggleConversationPin,
     sendMessage,
     clearChat,
     uploadDocuments,
@@ -348,7 +456,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     regenerate,
     clearHistory,
     logout,
-  }), [bookmarks, clearChat, clearHistory, confidence, documents, loading, logout, markNotificationsRead, messages, metadata, newChat, notifications, recentQuestions, regenerate, removeDocument, retrievedDocuments, selectedCategory, selectedDocument, sendMessage, showToast, sidebarOpen, suggestions, theme, toggleTheme, updateMessage, uploadDocuments, user, view, toast])
+  }), [activeConversationId, bookmarks, clearChat, clearHistory, confidence, conversations, deleteConversation, documents, loading, logout, markNotificationsRead, messages, metadata, newChat, notifications, recentQuestions, regenerate, removeDocument, renameConversation, retrievedDocuments, selectedCategory, selectedDocument, selectConversation, sendMessage, showToast, sidebarOpen, suggestions, theme, toggleConversationPin, toggleTheme, updateMessage, uploadDocuments, user, view, toast])
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }

@@ -1,10 +1,10 @@
-import { BarChart3, BookOpen, FileUp, MessageSquareText, TrendingUp } from 'lucide-react'
+import { BarChart3, BookOpen, FileUp, Menu, MessageSquareText, TrendingUp } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { useApp } from '../context/AppContext'
 import { Card } from './ui/Card'
 
 export default function DashboardAnalytics() {
-  const { documents, messages, confidence, recentQuestions } = useApp()
+  const { documents, messages, confidence, recentQuestions, setSidebarOpen } = useApp()
   const questionCount = messages.filter(message => message.role === 'user').length
   const cards = [
     ['Indexed Documents', documents.length, BookOpen, 'text-blue-600 bg-blue-50'],
@@ -15,11 +15,12 @@ export default function DashboardAnalytics() {
   const bars = [20, 45, 35, 70, 55, 80, Math.max(12, confidence)]
 
   return (
-    <motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="min-w-0 flex-1 overflow-y-auto bg-slate-50 p-5 sm:p-7">
+    <motion.section initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="min-w-0 flex-1 overflow-y-auto bg-[#f8fafc] p-5 sm:p-7">
       <div className="mx-auto max-w-6xl">
+        <button type="button" onClick={() => setSidebarOpen(true)} className="mb-4 grid h-10 w-10 place-items-center rounded-[10px] text-slate-600 hover:bg-slate-100 lg:hidden" aria-label="Open sidebar"><Menu size={20}/></button>
         <div>
-          <p className="text-xs font-semibold text-blue-600">WORKSPACE OVERVIEW</p>
-          <h2 className="mt-1 text-2xl font-bold">Simple RAG Dashboard</h2>
+          <p className="text-[11px] font-semibold uppercase tracking-[.1em] text-slate-400">Workspace overview</p>
+          <h2 className="mt-1 text-2xl font-bold tracking-[-.03em]">Simple RAG Dashboard</h2>
           <p className="mt-1 text-sm text-slate-500">Monitor indexed documents and your current browser conversation.</p>
         </div>
         <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -45,7 +46,7 @@ export default function DashboardAnalytics() {
             <div className="mt-8 flex h-52 items-end justify-between gap-3 border-b border-slate-200 px-2">
               {bars.map((height, index) => (
                 <div key={index} className="flex h-full flex-1 flex-col justify-end">
-                  <motion.div initial={{ height: 0 }} animate={{ height: `${height}%` }} transition={{ duration: .7, delay: index * .06 }} className="rounded-t-lg bg-gradient-to-t from-blue-600 to-blue-400" />
+                  <motion.div initial={{ height: 0 }} animate={{ height: `${height}%` }} transition={{ duration: .7, delay: index * .06 }} className="rounded-t-md bg-gradient-to-t from-blue-600 to-indigo-400" />
                   <span className="mt-2 text-center text-[10px] text-slate-400">{['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][index]}</span>
                 </div>
               ))}
