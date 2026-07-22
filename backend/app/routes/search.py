@@ -18,6 +18,8 @@ class SearchRequest(BaseModel):
 
     query: str = Field(min_length=1, max_length=1000)
     limit: int = Field(default=3, ge=1, le=10)
+    collection_id: int | None = Field(default=None, gt=0)
+    document_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("")
@@ -62,7 +64,7 @@ def search_documents(
             "score": result["score"],
             "preview": make_preview(str(result["content"])),
         }
-        for result in search_chunks(query, int(current_user["id"]), request.limit)
+        for result in search_chunks(query, int(current_user["id"]), request.limit, request.collection_id, request.document_id)
     ]
 
     log_audit_event(

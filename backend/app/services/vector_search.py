@@ -10,6 +10,8 @@ def search_chunks(
     query: str,
     owner_id: int,
     limit: int = 3,
+    collection_id: int | None = None,
+    document_id: int | None = None,
 ) -> list[dict[str, object]]:
     """Return the highest-scoring chunks using cosine similarity."""
     query_embedding = create_embeddings([query])[0]
@@ -32,9 +34,11 @@ def search_chunks(
             AND documents.owner_id = ?
             AND document_contents.owner_id = ?
             AND document_contents.processing_status = 'completed'
+            AND (? IS NULL OR documents.collection_id = ?)
+            AND (? IS NULL OR documents.id = ?)
             GROUP BY chunks.id, chunks.content_id, chunks.text, chunks.embedding
             """,
-            (owner_id, owner_id),
+            (owner_id, owner_id, collection_id, collection_id, document_id, document_id),
         ).fetchall()
 
     results = []

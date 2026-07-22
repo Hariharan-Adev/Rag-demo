@@ -1,4 +1,4 @@
-import { ChevronDown, FileText, Menu, Plus, Search, Trash2, Upload } from 'lucide-react'
+import { ChevronDown, FileText, FolderOpen, Menu, Plus, Search, Trash2, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { useApp } from '../context/AppContext'
 import type { PolicyDocument } from '../types'
@@ -19,7 +19,7 @@ function relativeDate(value: string) {
 }
 
 export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
-  const { documents, setSelectedDocument, removeDocument, setSidebarOpen } = useApp()
+  const { documents, collections, selectedCollectionId, setSelectedCollectionId, setSelectedDocument, removeDocument, setSidebarOpen } = useApp()
   const [search, setSearch] = useState('')
   const [tab, setTab] = useState<'all' | 'documents'>('all')
   const [documentToDelete, setDocumentToDelete] = useState<PolicyDocument | null>(null)
@@ -28,7 +28,8 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
   const deleteTriggerRef = useRef<HTMLButtonElement | null>(null)
   const filtered = useMemo(() => [...documents]
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-    .filter(document => document.name.toLowerCase().includes(search.trim().toLowerCase())), [documents, search])
+    .filter(document => selectedCollectionId === null || document.collectionId === selectedCollectionId)
+    .filter(document => document.name.toLowerCase().includes(search.trim().toLowerCase())), [documents, search, selectedCollectionId])
 
   const requestDelete = (document: PolicyDocument, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation()
@@ -75,6 +76,11 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
       <div className="mb-5 flex items-center gap-1 border-b border-[#e6ecf5]">
         {(['all', 'documents'] as const).map(value => <button key={value} type="button" onClick={() => setTab(value)} className={`relative px-4 py-2.5 text-[12px] font-semibold capitalize ${tab === value ? 'text-blue-600 after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:rounded-full after:bg-blue-600' : 'text-slate-500 hover:text-slate-900'}`}>{value}</button>)}
       </div>
+
+      {collections.length > 0 && <div className="mb-4 flex gap-2 overflow-x-auto pb-1">
+        <button type="button" onClick={() => setSelectedCollectionId(null)} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedCollectionId === null ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />All documents</button>
+        {collections.map(collection => <button key={collection.id} type="button" onClick={() => setSelectedCollectionId(collection.id)} className={`flex shrink-0 items-center gap-2 rounded-xl border px-3 py-2 text-xs font-semibold ${selectedCollectionId === collection.id ? 'border-blue-200 bg-blue-50 text-blue-700' : 'border-slate-200 bg-white text-slate-600'}`}><FolderOpen size={15} />{collection.name}<span className="text-[10px] text-slate-400">{collection.document_count ?? 0}</span></button>)}
+      </div>}
 
       <div className="mb-4 flex gap-2 sm:hidden">
         <div className="relative min-w-0 flex-1"><Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" /><input id="library-search-mobile" value={search} onChange={event => setSearch(event.target.value)} placeholder="Search documents" className="h-10 w-full rounded-xl border border-[#e6ecf5] bg-white pl-9 pr-3 text-[12px] outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100/60" /></div>

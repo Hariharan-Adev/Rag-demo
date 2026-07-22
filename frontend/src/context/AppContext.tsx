@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ChatItem, Conversation, NotificationItem, PolicyDocument, ResponseMetadata, RetrievedDocument, Theme, User, View } from '../types'
-import { ApiError, deleteDocument, listDocuments, sendChatMessage, uploadDocument, type ChatSource, type DocumentRecord, type UploadResponse } from '../services/api'
+import { ApiError, deleteDocument, listCollections, listDocuments, sendChatMessage, uploadDocument, type ChatSource, type CollectionRecord, type DocumentRecord, type UploadResponse } from '../services/api'
 
 const defaultSuggestions = [
   'What is this document about?',
@@ -14,6 +14,8 @@ interface AppContextValue {
   conversations: Conversation[]
   activeConversationId: string
   documents: PolicyDocument[]
+  collections: CollectionRecord[]
+  selectedCollectionId: number | null
   selectedCategory: string
   retrievedDocuments: RetrievedDocument[]
   suggestions: string[]
@@ -32,6 +34,8 @@ interface AppContextValue {
   setSidebarOpen: (open: boolean) => void
   setView: (view: View) => void
   setSelectedDocument: (doc: PolicyDocument | null) => void
+  setSelectedCollectionId: (id: number | null) => void
+  refreshDocuments: () => Promise<void>
   showToast: (message: string) => void
   newChat: () => void
   selectConversation: (id: string) => void
@@ -136,6 +140,9 @@ function mapDocument(row: DocumentRecord): PolicyDocument {
     category: 'Uploaded Documents',
     updatedAt: formatDate(row.created_at),
     uploaded: true,
+    collectionId: row.collection_id,
+    collectionName: row.collection_name,
+    relativePath: row.relative_path,
   }
 }
 
@@ -169,6 +176,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const [activeConversationId, setActiveConversationId] = useState(createConversationId)
   const [loadingConversationId, setLoadingConversationId] = useState<string | null>(null)
   const [documents, setDocuments] = useState<PolicyDocument[]>([])
+  const [collections, setCollections] = useState<CollectionRecord[]>([])
+  const [selectedCollectionId, setSelectedCollectionId] = useState<number | null>(null)
   const [selectedCategory, setCategory] = useState('All Documents')
   const [retrievedDocuments, setRetrievedDocuments] = useState<RetrievedDocument[]>([])
   const [suggestions, setSuggestions] = useState(defaultSuggestions)
@@ -205,6 +214,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
 
   const logout = useCallback(() => {
     setDocuments([])
+    setCollections([])
+    setSelectedCollectionId(null)
     setRetrievedDocuments([])
     setBookmarks([])
     setRecentQuestions([])
@@ -213,8 +224,9 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
 
   const refreshDocuments = useCallback(async () => {
     try {
-      const result = await listDocuments()
-      setDocuments(result.documents.map(mapDocument))
+      const [documentResult, collectionResult] = await Promise.all([listDocuments(), listCollections()])
+      setDocuments(documentResult.documents.map(mapDocument))
+      setCollections(collectionResult.collections)
     } catch (error) {
       showToast(apiErrorMessage(error, 'Unable to load documents.'))
       if (error instanceof ApiError && error.status === 401) logout()
@@ -323,7 +335,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     setView('chat')
 
     try {
-      const response = await sendChatMessage(trimmed)
+      const response = await sendChatMessage(trimmed, selectedCollectionId)
       const sources = response.sources.map(mapSource)
       const averageScore = sources.length
         ? Math.round(sources.reduce((total, source) => total + source.score, 0) / sources.length)
@@ -367,7 +379,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     } finally {
       setLoadingConversationId(current => current === conversationId ? null : current)
     }
-  }, [activeConversationId, loadingConversationId, logout, showToast])
+  }, [activeConversationId, loadingConversationId, logout, selectedCollectionId, showToast])
 
   const clearChat = useCallback(() => {
     const currentId = activeConversationIdRef.current
@@ -454,6 +466,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     conversations,
     activeConversationId,
     documents,
+    collections,
+    selectedCollectionId,
     selectedCategory,
     retrievedDocuments,
     suggestions,
@@ -472,6 +486,8 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     setSidebarOpen,
     setView,
     setSelectedDocument,
+    setSelectedCollectionId,
+    refreshDocuments,
     showToast,
     newChat,
     selectConversation,
@@ -488,7 +504,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     regenerate,
     clearHistory,
     logout,
-  }), [activeConversationId, bookmarks, clearChat, clearHistory, confidence, conversations, deleteConversation, documents, loading, logout, markNotificationsRead, messages, metadata, newChat, notifications, recentQuestions, regenerate, removeDocument, renameConversation, retrievedDocuments, selectedCategory, selectedDocument, selectConversation, sendMessage, showToast, sidebarOpen, suggestions, theme, toggleConversationPin, toggleTheme, updateMessage, uploadDocuments, user, view, toast])
+  }), [activeConversationId, bookmarks, clearChat, clearHistory, collections, confidence, conversations, deleteConversation, documents, loading, logout, markNotificationsRead, messages, metadata, newChat, notifications, recentQuestions, refreshDocuments, regenerate, removeDocument, renameConversation, retrievedDocuments, selectedCategory, selectedCollectionId, selectedDocument, selectConversation, sendMessage, showToast, sidebarOpen, suggestions, theme, toggleConversationPin, toggleTheme, updateMessage, uploadDocuments, user, view, toast])
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>
 }

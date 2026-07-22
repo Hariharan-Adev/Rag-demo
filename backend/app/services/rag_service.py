@@ -10,9 +10,10 @@ def answer_question(
     question: str,
     user_id: int,
     client_ip: str = "",
+    collection_id: int | None = None,
 ) -> dict[str, object]:
     """Retrieve relevant chunks and ask Groq to answer from them."""
-    sources = search_chunks(question, owner_id=user_id, limit=3)
+    sources = search_chunks(question, owner_id=user_id, limit=3, collection_id=collection_id)
 
     if not sources:
         log_audit_event(

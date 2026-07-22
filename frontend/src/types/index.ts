@@ -17,6 +17,9 @@ export interface PolicyDocument {
   category: string
   updatedAt: string
   uploaded?: boolean
+  collectionId?: number | null
+  collectionName?: string | null
+  relativePath?: string | null
 }
 
 export interface RetrievedDocument {

@@ -9,7 +9,7 @@ from sqlite3 import IntegrityError
 from time import monotonic, sleep
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.auth import get_current_user
@@ -18,19 +18,20 @@ from app.database import UPLOAD_DIRECTORY, get_connection
 from app.services.chunking import chunk_text
 from app.services.document_loader import DocumentParseError, SUPPORTED_EXTENSIONS, extract_text
 from app.services.embeddings import create_embeddings
+from app.services.folder_uploads import record_batch_result, sanitize_relative_path, validate_upload_context
 from app.utils.audit import log_audit_event
 from app.utils.document_content import (
     generate_unique_display_filename,
     normalize_extracted_text,
     sanitize_filename,
 )
+from app.utils.file_validation import validate_file_signature
 from app.utils.rate_limit import enforce_request_limit
 from app.utils.security import SecurityValidationError, validate_chunks, validate_extracted_text
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 ALLOWED_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
-MAX_FILE_SIZE = 10 * 1024 * 1024
 CONTENT_WAIT_SECONDS = 30.0
 
 
@@ -78,7 +79,8 @@ def _completed_content_for_file(owner_id: int, file_hash: str):
 
 def _insert_document(
     *, owner_id: int, original_filename: str, stored_filename: str,
-    file_hash: str, content_id: int, duplicate: bool,
+    file_hash: str, content_id: int, duplicate: bool, collection_id: int | None = None,
+    upload_batch_id: int | None = None, relative_path: str | None = None,
 ) -> tuple[int, str]:
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -87,11 +89,13 @@ def _insert_document(
             """
             INSERT INTO documents
                 (owner_id, original_filename, display_filename, stored_filename,
-                 file_hash, content_id, is_duplicate_content)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                file_hash, content_id, is_duplicate_content, collection_id,
+                upload_batch_id, relative_path, processing_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')
             """,
             (owner_id, original_filename, display_filename, stored_filename,
-             file_hash, content_id, int(duplicate)),
+             file_hash, content_id, int(duplicate), collection_id, upload_batch_id,
+             relative_path),
         )
         return int(cursor.lastrowid), display_filename
 
@@ -170,16 +174,19 @@ def _conflict(existing) -> JSONResponse:
     )
 
 
-@router.post("/upload")
-async def upload_document(
+async def _process_document_upload(
     request: Request,
-    file: UploadFile = File(...),
-    current_user: dict[str, object] = Depends(get_current_user),
+    file: UploadFile,
+    current_user: dict[str, object],
+    collection_id: int | None = None,
+    upload_batch_id: int | None = None,
+    relative_path: str | None = None,
 ):
     """Store one upload while reusing identical processed content for the same owner."""
     owner_id = int(current_user["id"])
     client_ip = request.client.host if request.client else "unknown"
-    enforce_request_limit(owner_id, client_ip, "upload", settings.uploads_per_hour)
+    if upload_batch_id is None:
+        enforce_request_limit(owner_id, client_ip, "upload", settings.uploads_per_hour)
 
     try:
         original_filename = sanitize_filename(file.filename or "", ALLOWED_EXTENSIONS)
@@ -189,8 +196,9 @@ async def upload_document(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="Maximum file size is 10 MB.")
+    if len(content) > settings.max_file_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"Maximum file size is {settings.max_file_size_mb} MB.")
+    validate_file_signature(original_filename, content)
 
     file_hash = sha256(content).hexdigest()
     existing = _same_filename_duplicate(owner_id, original_filename, "file_hash", file_hash)
@@ -213,6 +221,8 @@ async def upload_document(
                 owner_id=owner_id, original_filename=original_filename,
                 stored_filename=stored_name, file_hash=file_hash,
                 content_id=int(exact_content["id"]), duplicate=True,
+                collection_id=collection_id, upload_batch_id=upload_batch_id,
+                relative_path=relative_path,
             )
         except Exception:
             saved_path.unlink(missing_ok=True)
@@ -294,7 +304,8 @@ async def upload_document(
         document_id, display_filename = _insert_document(
             owner_id=owner_id, original_filename=original_filename,
             stored_filename=stored_name, file_hash=file_hash, content_id=content_id,
-            duplicate=not should_process,
+            duplicate=not should_process, collection_id=collection_id,
+            upload_batch_id=upload_batch_id, relative_path=relative_path,
         )
     except Exception:
         saved_path.unlink(missing_ok=True)
@@ -316,3 +327,56 @@ async def upload_document(
     if reused:
         response["existing_content_id"] = content_id
     return response
+
+
+@router.get("/upload-config")
+def upload_config(current_user: dict[str, object] = Depends(get_current_user)) -> dict[str, object]:
+    """Expose non-secret upload constraints so folder previews match backend validation."""
+    return {
+        "supported_extensions": sorted(ALLOWED_EXTENSIONS),
+        "max_file_size_mb": settings.max_file_size_mb,
+        "max_folder_files": settings.max_folder_files,
+        "max_folder_total_size_mb": settings.max_folder_total_size_mb,
+        "max_concurrent_uploads": settings.max_concurrent_file_processing,
+    }
+
+
+@router.post("/upload")
+async def upload_document(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: dict[str, object] = Depends(get_current_user),
+    collection_id: int | None = Form(default=None),
+    upload_batch_id: int | None = Form(default=None),
+    relative_path: str | None = Form(default=None),
+):
+    """Run a single file through the existing pipeline with optional folder metadata."""
+    owner_id = int(current_user["id"])
+    safe_filename = sanitize_filename(file.filename or "", ALLOWED_EXTENSIONS)
+    relative_path_value = relative_path if isinstance(relative_path, str) else None
+    collection_id_value = collection_id if isinstance(collection_id, int) and not isinstance(collection_id, bool) else None
+    batch_id_value = upload_batch_id if isinstance(upload_batch_id, int) and not isinstance(upload_batch_id, bool) else None
+    safe_relative_path = sanitize_relative_path(relative_path_value, safe_filename)
+    validate_upload_context(owner_id, collection_id_value, batch_id_value)
+    try:
+        result = await _process_document_upload(
+            request, file, current_user, collection_id_value, batch_id_value, safe_relative_path
+        )
+        if isinstance(result, JSONResponse):
+            record_batch_result(batch_id_value, owner_id, "duplicate")
+            log_audit_event(event_type="folder.file_duplicate", endpoint="documents/upload", outcome="duplicate", user_id=owner_id, client_ip=request.client.host if request.client else "", metadata={"batch_id": batch_id_value})
+            return result
+        reused = bool(result.get("content_reused"))
+        result.update({
+            "relative_path": safe_relative_path,
+            "duplicate_type": "same_content_different_filename" if reused else None,
+        })
+        record_batch_result(batch_id_value, owner_id, "duplicate" if reused else "successful")
+        if batch_id_value is not None:
+            log_audit_event(event_type="folder.file_duplicate" if reused else "folder.file_uploaded", endpoint="documents/upload", outcome="duplicate" if reused else "success", user_id=owner_id, client_ip=request.client.host if request.client else "", metadata={"batch_id": batch_id_value, "document_id": result["document_id"], "content_reused": reused})
+        return result
+    except HTTPException:
+        record_batch_result(batch_id_value, owner_id, "failed")
+        if batch_id_value is not None:
+            log_audit_event(event_type="folder.file_failed", endpoint="documents/upload", outcome="failed", user_id=owner_id, client_ip=request.client.host if request.client else "", metadata={"batch_id": batch_id_value})
+        raise

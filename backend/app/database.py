@@ -87,6 +87,53 @@ def _create_document_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_folder_schema(connection: sqlite3.Connection) -> None:
+    """Add owner-scoped collections and upload batches without rebuilding user data."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS document_collections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE (owner_id, name)
+        );
+
+        CREATE TABLE IF NOT EXISTS upload_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            collection_id INTEGER NOT NULL,
+            original_folder_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'created',
+            total_files INTEGER NOT NULL,
+            total_bytes INTEGER NOT NULL DEFAULT 0,
+            processed_files INTEGER NOT NULL DEFAULT 0,
+            successful_files INTEGER NOT NULL DEFAULT 0,
+            duplicate_files INTEGER NOT NULL DEFAULT 0,
+            skipped_files INTEGER NOT NULL DEFAULT 0,
+            failed_files INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY (collection_id) REFERENCES document_collections(id) ON DELETE CASCADE
+        );
+        """
+    )
+    document_columns = _columns(connection, "documents")
+    additions = {
+        "collection_id": "INTEGER REFERENCES document_collections(id) ON DELETE SET NULL",
+        "upload_batch_id": "INTEGER REFERENCES upload_batches(id) ON DELETE SET NULL",
+        "relative_path": "TEXT",
+        "processing_status": "TEXT NOT NULL DEFAULT 'completed'",
+        "processing_error": "TEXT",
+    }
+    for column, definition in additions.items():
+        if column not in document_columns:
+            connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+
+
 def _legacy_file_hash(document: sqlite3.Row) -> str:
     stored_filename = document["stored_filename"]
     if stored_filename:
@@ -243,6 +290,10 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
             ON document_contents(owner_id, normalized_content_hash);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_chunks_content_chunk_index
             ON chunks(content_id, chunk_index);
+        CREATE INDEX IF NOT EXISTS idx_collections_owner ON document_collections(owner_id);
+        CREATE INDEX IF NOT EXISTS idx_batches_owner ON upload_batches(owner_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_owner_collection
+            ON documents(owner_id, collection_id);
         """
     )
 
@@ -294,6 +345,7 @@ def initialize_database() -> None:
                 _migrate_legacy_documents(connection)
             else:
                 _create_document_schema(connection)
+            _migrate_folder_schema(connection)
             _create_indexes(connection)
             connection.commit()
         except Exception:

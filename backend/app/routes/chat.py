@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     """Question sent to the RAG assistant."""
 
     question: str = Field(min_length=1, max_length=1000)
+    collection_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("")
@@ -38,6 +39,7 @@ def chat(
             request.question.strip(),
             int(current_user["id"]),
             client_ip,
+            request.collection_id,
         )
     except HTTPException:
         raise

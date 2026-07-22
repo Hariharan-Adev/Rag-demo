@@ -39,10 +39,15 @@ def list_documents(
                 documents.display_filename,
                 documents.uploaded_at,
                 documents.is_duplicate_content,
+                documents.collection_id,
+                documents.upload_batch_id,
+                documents.relative_path,
+                document_collections.name AS collection_name,
                 COUNT(chunks.id) AS chunk_count
             FROM documents
             JOIN document_contents ON document_contents.id = documents.content_id
             LEFT JOIN chunks ON chunks.content_id = document_contents.id
+            LEFT JOIN document_collections ON document_collections.id = documents.collection_id
             WHERE documents.owner_id = ?
             GROUP BY documents.id
             ORDER BY documents.uploaded_at DESC, documents.id DESC
@@ -59,6 +64,10 @@ def list_documents(
             "uploaded_at": row["uploaded_at"],
             "chunk_count": row["chunk_count"],
             "content_reused": bool(row["is_duplicate_content"]),
+            "collection_id": row["collection_id"],
+            "collection_name": row["collection_name"],
+            "upload_batch_id": row["upload_batch_id"],
+            "relative_path": row["relative_path"],
         }
         for row in rows
     ]
