@@ -61,6 +61,8 @@ def search_documents(
             "document_id": result["document_id"],
             "filename": result["filename"],
             "referencing_filenames": result["referencing_filenames"],
+            "sheet_name": result["sheet_name"],
+            "row_number": result["row_number"],
             "score": result["score"],
             "preview": make_preview(str(result["content"])),
         }

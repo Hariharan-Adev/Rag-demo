@@ -24,6 +24,8 @@ def search_chunks(
                 chunks.content_id,
                 chunks.text,
                 chunks.embedding,
+                chunks.sheet_name,
+                chunks.row_number,
                 MIN(documents.id) AS document_id,
                 MIN(documents.display_filename) AS filename,
                 GROUP_CONCAT(documents.display_filename, '|') AS referencing_filenames
@@ -36,7 +38,8 @@ def search_chunks(
             AND document_contents.processing_status = 'completed'
             AND (? IS NULL OR documents.collection_id = ?)
             AND (? IS NULL OR documents.id = ?)
-            GROUP BY chunks.id, chunks.content_id, chunks.text, chunks.embedding
+            GROUP BY chunks.id, chunks.content_id, chunks.text, chunks.embedding,
+                     chunks.sheet_name, chunks.row_number
             """,
             (owner_id, owner_id, collection_id, collection_id, document_id, document_id),
         ).fetchall()
@@ -62,6 +65,8 @@ def search_chunks(
                     str(row["referencing_filenames"] or "").split("|")
                 )),
                 "content": row["text"],
+                "sheet_name": row["sheet_name"],
+                "row_number": row["row_number"],
                 "score": round(score, 4),
             }
         )

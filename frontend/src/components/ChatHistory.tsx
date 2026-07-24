@@ -23,7 +23,7 @@ function conversationGroup(value: string): GroupName {
 }
 
 export default function ChatHistory() {
-  const { conversations, activeConversationId, selectConversation, renameConversation, deleteConversation } = useApp()
+  const { conversations, activeConversationId, view, selectConversation, renameConversation, deleteConversation } = useApp()
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null)
@@ -73,7 +73,7 @@ export default function ChatHistory() {
   }
 
   const row = (conversation: Conversation) => {
-    const active = conversation.id === activeConversationId
+    const active = view === 'chat' && conversation.id === activeConversationId
     const renaming = renamingId === conversation.id
 
     return (
@@ -103,6 +103,7 @@ export default function ChatHistory() {
             type="button"
             onClick={() => selectConversation(conversation.id)}
             aria-current={active ? 'page' : undefined}
+            aria-pressed={active}
             className="flex min-w-0 flex-1 items-center gap-2 self-stretch text-left text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-blue-500/35"
           >
             <MessageSquare size={14} className="shrink-0" />

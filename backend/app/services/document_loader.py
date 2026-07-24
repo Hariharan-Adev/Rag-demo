@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import csv
+import os
+import shutil
 import struct
 from pathlib import Path
 from typing import Protocol
@@ -196,12 +198,34 @@ class PowerPointParser:
             raise DocumentParseError("The legacy PowerPoint presentation could not be read.") from error
 
 
+def _configure_tesseract(pytesseract) -> None:
+    """Find common Windows installs when the current process has a stale PATH."""
+    configured = str(pytesseract.pytesseract.tesseract_cmd)
+    if shutil.which(configured):
+        return
+
+    candidates = [
+        os.getenv("TESSERACT_CMD"),
+        str(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Tesseract-OCR" / "tesseract.exe")
+        if os.getenv("LOCALAPPDATA")
+        else None,
+        str(Path(os.environ["ProgramFiles"]) / "Tesseract-OCR" / "tesseract.exe")
+        if os.getenv("ProgramFiles")
+        else None,
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            pytesseract.pytesseract.tesseract_cmd = candidate
+            return
+
+
 class OcrParser:
     def extract_text(self, file_path: Path) -> str:
         try:
             import pytesseract
             from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
 
+            _configure_tesseract(pytesseract)
             output = [f"Image: {file_path.stem}"]
             with Image.open(file_path) as image:
                 for index, frame in enumerate(ImageSequence.Iterator(image), start=1):

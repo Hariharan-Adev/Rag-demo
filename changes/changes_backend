@@ -1,0 +1,6 @@
+## 2026-07-23 — Domain-neutral Excel ingestion and analysis
+
+- Files changed: `backend/app/config.py`, `backend/app/database.py`, `backend/app/routes/chat.py`, `backend/app/routes/search.py`, `backend/app/routes/upload.py`, `backend/app/services/rag_service.py`, `backend/app/services/vector_search.py`, `backend/app/services/workbooks.py`, `backend/app/services/workbook_analysis.py`, and `backend/tests/test_workbook_domain_neutral.py`.
+- Change summary: added safe all-sheet Excel extraction, structured owner-scoped sheet/row storage, row-level semantic chunks, deterministic cross-sheet calculations and lists, dynamic schema/alias matching with clarification, sheet/document scope, and sheet/row citations.
+- Reason: arbitrary business workbooks must be queried across all tabs without employee-specific assumptions or top-K-based calculations.
+- Test result: `python -m unittest discover -s tests -v` passed all 51 tests; `npm run build` passed with only Vite's existing non-fatal large-chunk warning.

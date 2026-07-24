@@ -134,6 +134,47 @@ def _migrate_folder_schema(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
 
 
+def _migrate_workbook_schema(connection: sqlite3.Connection) -> None:
+    """Add owner-scoped structured spreadsheet storage and chunk provenance."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workbook_sheets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            sheet_index INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            visibility TEXT NOT NULL DEFAULT 'visible',
+            status TEXT NOT NULL,
+            header_row INTEGER,
+            headers_json TEXT NOT NULL DEFAULT '[]',
+            processing_error TEXT,
+            FOREIGN KEY (content_id) REFERENCES document_contents(id) ON DELETE CASCADE,
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE (content_id, sheet_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS workbook_rows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_id INTEGER NOT NULL,
+            content_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            row_number INTEGER NOT NULL,
+            values_json TEXT NOT NULL,
+            FOREIGN KEY (sheet_id) REFERENCES workbook_sheets(id) ON DELETE CASCADE,
+            FOREIGN KEY (content_id) REFERENCES document_contents(id) ON DELETE CASCADE,
+            FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+            UNIQUE (sheet_id, row_number)
+        );
+        """
+    )
+    chunk_columns = _columns(connection, "chunks")
+    if "sheet_name" not in chunk_columns:
+        connection.execute("ALTER TABLE chunks ADD COLUMN sheet_name TEXT")
+    if "row_number" not in chunk_columns:
+        connection.execute("ALTER TABLE chunks ADD COLUMN row_number INTEGER")
+
+
 def _legacy_file_hash(document: sqlite3.Row) -> str:
     stored_filename = document["stored_filename"]
     if stored_filename:
@@ -294,6 +335,12 @@ def _create_indexes(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_batches_owner ON upload_batches(owner_id);
         CREATE INDEX IF NOT EXISTS idx_documents_owner_collection
             ON documents(owner_id, collection_id);
+        CREATE INDEX IF NOT EXISTS idx_workbook_sheets_owner_content
+            ON workbook_sheets(owner_id, content_id);
+        CREATE INDEX IF NOT EXISTS idx_workbook_rows_owner_content
+            ON workbook_rows(owner_id, content_id);
+        CREATE INDEX IF NOT EXISTS idx_workbook_rows_sheet
+            ON workbook_rows(sheet_id, row_number);
         """
     )
 
@@ -346,6 +393,7 @@ def initialize_database() -> None:
             else:
                 _create_document_schema(connection)
             _migrate_folder_schema(connection)
+            _migrate_workbook_schema(connection)
             _create_indexes(connection)
             connection.commit()
         except Exception:

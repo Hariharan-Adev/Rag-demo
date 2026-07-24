@@ -1,0 +1,6 @@
+## 2026-07-23 — Structured workbook storage
+
+- Files changed: `backend/app/database.py`.
+- Change summary: added `workbook_sheets` and `workbook_rows` with content, owner, sheet, row, headers, typed JSON values, visibility, and processing-status metadata; added `sheet_name` and `row_number` provenance columns to `chunks`; added owner/content and sheet/row indexes.
+- Reason: deterministic workbook-wide calculations require complete structured rows while semantic retrieval requires sheet-level provenance.
+- Test result: the migration and owner-scoped queries passed the complete 51-test backend suite, including legacy database migration and unauthorized-workbook coverage.

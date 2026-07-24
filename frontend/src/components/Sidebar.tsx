@@ -15,13 +15,13 @@ type SidebarProps = {
 }
 
 export default function Sidebar({ onClose, onUpload, onSettings, onHelp }: SidebarProps) {
-  const { sidebarOpen, newChat, view, user, logout } = useApp()
+  const { sidebarOpen, newChat, activeConversationId, view, user, logout } = useApp()
   const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const profileRef = useRef<HTMLButtonElement>(null)
   const email = user.id
   const displayName = email.split('@')[0].split(/[._-]/).filter(Boolean).map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ') || 'User'
   const nav = [
-    { label: 'New Chat', icon: MessageSquarePlus, onClick: newChat, active: view === 'chat' },
+    { label: 'New Chat', icon: MessageSquarePlus, onClick: newChat, active: view === 'chat' && activeConversationId === null },
     { label: 'Documents', icon: FileUp, onClick: onUpload, active: view === 'library' },
   ]
 
@@ -48,6 +48,7 @@ export default function Sidebar({ onClose, onUpload, onSettings, onHelp }: Sideb
               key={label}
               type="button"
               aria-current={active ? 'page' : undefined}
+              aria-pressed={label === 'New Chat' ? active : undefined}
               onClick={() => { onClick(); if (label !== 'New Chat') onClose() }}
               className={cn('flex h-10 w-full items-center gap-2.5 rounded-xl px-3 text-left text-[13px] font-medium text-slate-600 hover:bg-[#f3f7ff] hover:text-blue-600', active && 'bg-[#eef4ff] text-blue-600 shadow-[0_2px_8px_rgba(37,99,235,.05)]')}
             >

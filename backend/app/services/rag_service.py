@@ -2,6 +2,11 @@
 
 from app.services.groq_client import generate_answer
 from app.services.vector_search import search_chunks
+from app.services.workbook_analysis import (
+    analyze_workbook_question,
+    has_structured_workbook,
+    is_analytical_question,
+)
 from app.utils.audit import log_audit_event
 from app.utils.rate_limit import record_groq_tokens, reserve_groq_call
 
@@ -11,9 +16,41 @@ def answer_question(
     user_id: int,
     client_ip: str = "",
     collection_id: int | None = None,
+    document_id: int | None = None,
 ) -> dict[str, object]:
-    """Retrieve relevant chunks and ask Groq to answer from them."""
-    sources = search_chunks(question, owner_id=user_id, limit=3, collection_id=collection_id)
+    """Route calculations to structured rows and details to semantic retrieval."""
+    if is_analytical_question(question) and has_structured_workbook(
+        user_id,
+        collection_id,
+        document_id,
+    ):
+        result = analyze_workbook_question(
+            question,
+            owner_id=user_id,
+            collection_id=collection_id,
+            document_id=document_id,
+        )
+        log_audit_event(
+            event_type="chat.request",
+            endpoint="chat",
+            outcome="structured_analysis",
+            user_id=user_id,
+            client_ip=client_ip,
+            metadata={
+                "question_type": result.get("question_type"),
+                "document_id": document_id,
+                "collection_id": collection_id,
+            },
+        )
+        return result
+
+    sources = search_chunks(
+        question,
+        owner_id=user_id,
+        limit=3,
+        collection_id=collection_id,
+        document_id=document_id,
+    )
 
     if not sources:
         log_audit_event(
@@ -30,7 +67,9 @@ def answer_question(
 
     context = "\n\n".join(
         (
-            f"<source filename=\"{source['filename']}\">\n"
+            f"<source filename=\"{source['filename']}\" "
+            f"sheet=\"{source.get('sheet_name') or ''}\" "
+            f"row=\"{source.get('row_number') or ''}\">\n"
             f"{source['content']}\n"
             "</source>"
         )
@@ -80,9 +119,13 @@ Question:
 
     return {
         "answer": answer_result["answer"],
+        "question_type": "retrieval",
         "sources": [
             {
+                "document_id": source["document_id"],
                 "filename": source["filename"],
+                "sheet_name": source.get("sheet_name"),
+                "row_number": source.get("row_number"),
                 "score": source["score"],
             }
             for source in sources

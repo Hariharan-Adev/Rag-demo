@@ -12,7 +12,7 @@ interface AppContextValue {
   user: User
   messages: ChatItem[]
   conversations: Conversation[]
-  activeConversationId: string
+  activeConversationId: string | null
   documents: PolicyDocument[]
   collections: CollectionRecord[]
   selectedCollectionId: number | null
@@ -65,6 +65,19 @@ const CHAT_HISTORY_VERSION = 'simple-rag-chat-history-v1'
 
 function conversationStorageKey(email: string) {
   return `${CHAT_HISTORY_VERSION}:${email.toLowerCase()}`
+}
+
+function conversationSelectionStorageKey(email: string) {
+  return `${CHAT_HISTORY_VERSION}:active:${email.toLowerCase()}`
+}
+
+function readActiveConversationId(email: string, conversations: Conversation[]): string | null {
+  try {
+    const storedId = localStorage.getItem(conversationSelectionStorageKey(email))
+    return storedId && conversations.some(conversation => conversation.id === storedId) ? storedId : null
+  } catch {
+    return null
+  }
 }
 
 function createConversationId() {
@@ -152,10 +165,14 @@ function sourceScore(source: ChatSource) {
 }
 
 function mapSource(source: ChatSource, index: number): RetrievedDocument {
+  const location = [
+    source.sheet_name ? `Sheet: ${source.sheet_name}` : null,
+    source.row_number ? `Row: ${source.row_number}` : null,
+  ].filter(Boolean).join(' · ')
   return {
-    id: source.filename,
+    id: source.document_id ? String(source.document_id) : source.filename,
     name: source.filename,
-    section: `Retrieved source ${index + 1}`,
+    section: location || `Retrieved source ${index + 1}`,
     score: sourceScore(source),
     category: 'Uploaded Documents',
   }
@@ -173,7 +190,8 @@ function apiErrorMessage(error: unknown, fallback: string) {
 
 export function AppProvider({ children, userEmail, onLogout }: AppProviderProps) {
   const [conversations, setConversations] = useState<Conversation[]>(() => readConversations(userEmail))
-  const [activeConversationId, setActiveConversationId] = useState(createConversationId)
+  // A null ID is the single source of truth that represents the blank New Chat screen.
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(() => readActiveConversationId(userEmail, conversations))
   const [loadingConversationId, setLoadingConversationId] = useState<string | null>(null)
   const [documents, setDocuments] = useState<PolicyDocument[]>([])
   const [collections, setCollections] = useState<CollectionRecord[]>([])
@@ -194,7 +212,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const activeConversationIdRef = useRef(activeConversationId)
 
   const messages = useMemo(() => conversations.find(conversation => conversation.id === activeConversationId)?.messages ?? [], [activeConversationId, conversations])
-  const loading = loadingConversationId === activeConversationId
+  const loading = activeConversationId !== null && loadingConversationId === activeConversationId
 
   const user = useMemo<User>(() => ({
     id: userEmail,
@@ -247,6 +265,16 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   }, [conversations, userEmail])
 
   useEffect(() => {
+    try {
+      // Persist only a real history selection; absence restores New Chat on refresh.
+      if (activeConversationId === null) localStorage.removeItem(conversationSelectionStorageKey(userEmail))
+      else localStorage.setItem(conversationSelectionStorageKey(userEmail), activeConversationId)
+    } catch {
+      // Keep selection functional in memory when browser storage is unavailable.
+    }
+  }, [activeConversationId, userEmail])
+
+  useEffect(() => {
     void refreshDocuments()
   }, [refreshDocuments])
 
@@ -256,7 +284,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   }, [])
 
   const newChat = useCallback(() => {
-    setActiveConversationId(createConversationId())
+    setActiveConversationId(null)
     setRetrievedDocuments([])
     setConfidence(0)
     setMetadata(null)
@@ -284,7 +312,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const deleteConversation = useCallback((id: string) => {
     setConversations(previous => previous.filter(conversation => conversation.id !== id))
     if (activeConversationIdRef.current === id) {
-      setActiveConversationId(createConversationId())
+      setActiveConversationId(null)
       setRetrievedDocuments([])
       setConfidence(0)
       setMetadata(null)
@@ -304,9 +332,12 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   const sendMessage = useCallback(async (question: string, replaceMessageId?: number) => {
     const trimmed = question.trim()
     if (!trimmed || loadingConversationId) return
+    if (replaceMessageId !== undefined && activeConversationId === null) return
 
     const started = performance.now()
-    const conversationId = activeConversationId
+    // The first message promotes the blank New Chat state into a persisted conversation.
+    const conversationId = activeConversationId ?? createConversationId()
+    if (activeConversationId === null) setActiveConversationId(conversationId)
     const now = new Date().toISOString()
     const userMessage: ChatItem = { id: replaceMessageId ?? Date.now(), role: 'user', content: trimmed }
     setConversations(previous => {
@@ -335,7 +366,12 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     setView('chat')
 
     try {
-      const response = await sendChatMessage(trimmed, selectedCollectionId)
+      const selectedDocumentId = selectedDocument?.uploaded ? Number(selectedDocument.id) : null
+      const response = await sendChatMessage(
+        trimmed,
+        selectedCollectionId,
+        Number.isFinite(selectedDocumentId) ? selectedDocumentId : null,
+      )
       const sources = response.sources.map(mapSource)
       const averageScore = sources.length
         ? Math.round(sources.reduce((total, source) => total + source.score, 0) / sources.length)
@@ -379,12 +415,12 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     } finally {
       setLoadingConversationId(current => current === conversationId ? null : current)
     }
-  }, [activeConversationId, loadingConversationId, logout, selectedCollectionId, showToast])
+  }, [activeConversationId, loadingConversationId, logout, selectedCollectionId, selectedDocument, showToast])
 
   const clearChat = useCallback(() => {
     const currentId = activeConversationIdRef.current
     setConversations(previous => previous.filter(conversation => conversation.id !== currentId))
-    setActiveConversationId(createConversationId())
+    setActiveConversationId(null)
     setRetrievedDocuments([])
     setConfidence(0)
     setMetadata(null)

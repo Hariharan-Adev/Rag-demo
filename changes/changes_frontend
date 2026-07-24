@@ -1,0 +1,17 @@
+# Frontend changes
+
+## 2026-07-22 — Mutually exclusive sidebar chat selection
+
+- Made nullable `activeConversationId` the single source of truth for chat selection: `null` represents New Chat and a conversation ID represents a selected history chat.
+- New Chat now clears the selected conversation and shows the blank chat screen; selecting history removes the New Chat highlight and loads that conversation's messages.
+- Persisted valid history selection per authenticated user and restore it after refresh. Missing, deleted, or invalid selections fall back to New Chat.
+- Limited chat selection highlighting to the chat view so Documents and chat entries cannot appear active together.
+- Preserved native button behavior and added `aria-current`/`aria-pressed` selection state for keyboard and assistive-technology users.
+- Existing sidebar styling and layout are unchanged.
+
+## 2026-07-23 — Workbook scope and sheet citations
+
+- Files changed: `frontend/src/services/api.ts`, `frontend/src/context/AppContext.tsx`.
+- Change summary: chat requests can include a selected document ID; chat sources accept document, worksheet, and row metadata; source cards display sheet and row citations and open the cited uploaded document by ID.
+- Reason: workbook answers need visible tab-level evidence and must remain within the selected workbook boundary.
+- Test result: `npm run build` passed TypeScript checking and the Vite production build; Vite reported its existing non-fatal large-chunk warning.

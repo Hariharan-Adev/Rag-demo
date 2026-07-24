@@ -63,10 +63,33 @@ export interface UploadBatchRecord {
 
 export interface UploadConfig {
   supported_extensions: string[]
+  archive_extensions: string[]
   max_file_size_mb: number
+  max_zip_upload_mb: number
   max_folder_files: number
   max_folder_total_size_mb: number
   max_concurrent_uploads: number
+}
+
+export interface ZipUploadFileResult {
+  filename: string
+  status: 'uploaded' | 'duplicate' | 'duplicate_content_reused' | 'rejected' | 'failed'
+  document_id: number | null
+  display_filename?: string
+  message?: string
+  reason?: string
+}
+
+export interface ZipUploadResponse {
+  archive: string
+  status: 'completed' | 'partially_completed'
+  summary: {
+    total_entries: number
+    uploaded: number
+    duplicates: number
+    failed: number
+  }
+  files: ZipUploadFileResult[]
 }
 
 export interface ListDocumentsResponse {
@@ -74,7 +97,10 @@ export interface ListDocumentsResponse {
 }
 
 export interface ChatSource {
+  document_id?: number
   filename: string
+  sheet_name?: string | null
+  row_number?: number | null
   score: number
 }
 
@@ -150,6 +176,19 @@ export async function uploadDocument(file: File, options: { collectionId?: numbe
   })
 }
 
+export async function uploadZipArchive(file: File, options: { collectionId?: number; signal?: AbortSignal } = {}) {
+  const formData = new FormData()
+  formData.append('archive', file)
+  if (options.collectionId !== undefined) formData.append('collection_id', String(options.collectionId))
+
+  return requestJson<ZipUploadResponse>('/documents/upload-zip', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: formData,
+    signal: options.signal,
+  })
+}
+
 export async function getUploadConfig() {
   return requestJson<UploadConfig>('/documents/upload-config', { method: 'GET', headers: authHeaders() })
 }
@@ -199,13 +238,17 @@ export async function deleteDocument(documentId: string) {
   })
 }
 
-export async function sendChatMessage(question: string, collectionId?: number | null) {
+export async function sendChatMessage(question: string, collectionId?: number | null, documentId?: number | null) {
   return requestJson<ChatResponse>('/chat', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...authHeaders(),
     },
-    body: JSON.stringify({ question, collection_id: collectionId ?? null }),
+    body: JSON.stringify({
+      question,
+      collection_id: collectionId ?? null,
+      document_id: documentId ?? null,
+    }),
   })
 }

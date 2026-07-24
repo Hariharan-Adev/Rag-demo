@@ -9,8 +9,10 @@ import {
   getUploadConfig,
   skipUploadBatchFiles,
   uploadDocument,
+  uploadZipArchive,
   type UploadConfig,
   type UploadResponse,
+  type ZipUploadResponse,
 } from '../services/api'
 import { Button } from './ui/Button'
 import { Modal } from './ui/Modal'
@@ -26,12 +28,15 @@ interface UploadItem {
   validation: Validation
   status: FileStatus
   result?: UploadResponse
+  archiveResult?: ZipUploadResponse
   error?: string
 }
 
 const defaultConfig: UploadConfig = {
   supported_extensions: ['.txt', '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp'],
+  archive_extensions: ['.zip'],
   max_file_size_mb: 25,
+  max_zip_upload_mb: 50,
   max_folder_files: 25,
   max_folder_total_size_mb: 200,
   max_concurrent_uploads: 3,
@@ -79,13 +84,16 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
 
   const selectFiles = (incoming: File[], isFolder: boolean) => {
     const maxBytes = config.max_file_size_mb * 1024 * 1024
+    const maxZipBytes = config.max_zip_upload_mb * 1024 * 1024
     const knownNames = new Set(documents.map(document => document.name.toLowerCase()))
     const selected = incoming.map(file => {
       const relativePath = isFolder && file.webkitRelativePath ? file.webkitRelativePath : file.name
+      const suffix = extension(file)
+      const isArchive = !isFolder && config.archive_extensions.includes(suffix)
       let validation: Validation = 'Ready'
-      if (!config.supported_extensions.includes(extension(file))) validation = 'Unsupported'
+      if (!config.supported_extensions.includes(suffix) && !isArchive) validation = 'Unsupported'
       else if (file.size === 0) validation = 'Empty'
-      else if (file.size > maxBytes) validation = 'Too large'
+      else if (file.size > (isArchive ? maxZipBytes : maxBytes)) validation = 'Too large'
       else if (knownNames.has(file.name.toLowerCase())) validation = 'Duplicate candidate'
       return {
         id: crypto.randomUUID(), file, relativePath, validation,
@@ -149,12 +157,17 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
             setItems(previous => previous.map(current => current.id === item.id && current.status === 'uploading' ? { ...current, status: 'processing' } : current))
           }, 250)
           try {
-            const result = await uploadDocument(item.file, {
-              collectionId, batchId: activeBatchId,
-              relativePath: mode === 'folder' ? item.relativePath : undefined,
-              signal: controller.signal,
-            })
-            setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', result } : current))
+            if (extension(item.file) === '.zip' && mode === 'files') {
+              const archiveResult = await uploadZipArchive(item.file, { collectionId, signal: controller.signal })
+              setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', archiveResult } : current))
+            } else {
+              const result = await uploadDocument(item.file, {
+                collectionId, batchId: activeBatchId,
+                relativePath: mode === 'folder' ? item.relativePath : undefined,
+                signal: controller.signal,
+              })
+              setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', result } : current))
+            }
           } catch (error) {
             const aborted = error instanceof DOMException && error.name === 'AbortError'
             const message = error instanceof ApiError ? error.message : aborted ? 'Cancelled' : error instanceof Error ? error.message : 'Upload failed.'
@@ -214,7 +227,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
         {mode === 'folder' ? <FolderOpen className="mx-auto text-blue-600" size={28} /> : <UploadCloud className="mx-auto text-blue-600" size={28} />}
         <p className="mt-2 text-sm font-semibold">Choose {mode === 'folder' ? 'a folder' : 'documents'} to preview</p>
         <Button className="mt-3" onClick={() => (mode === 'folder' ? folderInputRef : fileInputRef).current?.click()}>Browse {mode === 'folder' ? 'folder' : 'files'}</Button>
-        <input ref={fileInputRef} type="file" multiple className="hidden" onChange={event => { selectFiles(Array.from(event.target.files ?? []), false); event.target.value = '' }} />
+        <input ref={fileInputRef} type="file" multiple accept={[...config.supported_extensions, ...config.archive_extensions].join(',')} className="hidden" onChange={event => { selectFiles(Array.from(event.target.files ?? []), false); event.target.value = '' }} />
         <input ref={folderInputRef} type="file" multiple className="hidden" {...folderAttributes} onChange={onFolderSelection} />
       </div>
 
@@ -242,6 +255,15 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
               <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
             </table>
           </div>
+
+          {items.some(item => item.archiveResult) && <div className="mt-3 space-y-2">{items.filter(item => item.archiveResult).map(item => {
+            const archive = item.archiveResult!
+            return <div key={`${item.id}-archive`} className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs">
+              <p className="font-semibold text-slate-800">{archive.archive}: {archive.status.replace('_', ' ')}</p>
+              <p className="mt-1 text-slate-500">{archive.summary.uploaded} uploaded · {archive.summary.duplicates} duplicate/reused · {archive.summary.failed} failed</p>
+              <div className="mt-2 max-h-28 space-y-1 overflow-auto">{archive.files.map((file, index) => <div key={`${file.filename}-${index}`} className="flex justify-between gap-3"><span className="truncate">{file.filename}</span><span className={file.status === 'uploaded' || file.status === 'duplicate_content_reused' ? 'text-emerald-600' : file.status === 'duplicate' ? 'text-slate-600' : 'text-red-600'} title={file.reason}>{file.status.replace(/_/g, ' ')}</span></div>)}</div>
+            </div>
+          })}</div>}
 
           {!uploading && summary.processed === items.length && <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs"><p className="font-semibold">Upload summary</p><div className="mt-2 flex flex-wrap gap-4"><span className="text-emerald-700"><CheckCircle2 className="mr-1 inline" size={14} />{summary.completed} uploaded</span><span>{summary.duplicates} already existed/reused</span><span>{summary.skipped} skipped</span><span className="text-red-700"><AlertCircle className="mr-1 inline" size={14} />{summary.failed} failed</span></div></div>}
         </>

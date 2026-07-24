@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 25
     max_folder_total_size_mb: int = 200
     max_concurrent_file_processing: int = 3
+    max_zip_upload_mb: int = 50
+    max_zip_extracted_mb: int = 250
+    max_zip_files: int = 100
+    max_zip_compression_ratio: float = 100.0
+    include_hidden_worksheets: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
