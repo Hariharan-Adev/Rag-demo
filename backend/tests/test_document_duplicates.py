@@ -23,6 +23,8 @@ from app.auth import get_current_user
 from app.main import app
 from app.routes import documents, upload
 from app.services import vector_search
+from app.services.vector_store import reset_vector_store_for_tests
+from app.services import vector_store
 from app.utils.document_content import generate_unique_display_filename, normalize_extracted_text, sanitize_filename
 
 
@@ -50,12 +52,14 @@ class DocumentDuplicateTests(unittest.TestCase):
             patch.object(upload, "enforce_request_limit", lambda *args, **kwargs: None),
             patch.object(upload, "log_audit_event", lambda **kwargs: None),
             patch.object(documents, "log_audit_event", lambda **kwargs: None),
+            patch.object(vector_store.settings, "qdrant_local_path", ""),
             patch.object(upload, "extract_text", lambda path: path.read_text(encoding="utf-8")),
-            patch.object(upload, "create_embeddings", lambda chunks: [[1.0, 0.0] for _ in chunks]),
+            patch.object(upload, "create_embeddings", lambda chunks: [[1.0] + [0.0] * 383 for _ in chunks]),
         ]
         for patcher in self.patchers:
             patcher.start()
         database.initialize_database()
+        reset_vector_store_for_tests()
         with database.get_connection() as connection:
             connection.executemany(
                 "INSERT INTO users (id, email, password_hash) VALUES (?, ?, 'hash')",
@@ -90,13 +94,13 @@ class DocumentDuplicateTests(unittest.TestCase):
         with patch.object(upload, "extract_text", side_effect=AssertionError("extracted twice")):
             body = response(self.upload("n2.txt", b"same bytes"))[1]
         self.assertTrue(body["content_reused"])
-        self.assertEqual(self.counts(), (2, 1, 1))
+        self.assertEqual(self.counts(), (2, 1, 2))
 
     def test_different_filename_same_normalized_text_reuses_content(self):
         self.upload("n1.txt", b"same   words\n\n\nparagraph")
         body = response(self.upload("n2.csv", b"same\twords\r\n\r\nparagraph"))[1]
         self.assertTrue(body["content_reused"])
-        self.assertEqual(self.counts(), (2, 1, 1))
+        self.assertEqual(self.counts(), (2, 1, 2))
 
     def test_same_filename_identical_bytes_returns_conflict(self):
         first = response(self.upload("n1.txt", b"same"))[1]
@@ -153,22 +157,30 @@ class DocumentDuplicateTests(unittest.TestCase):
         first = response(self.upload("one.txt", b"shared"))[1]
         self.upload("two.txt", b"shared")
         result = documents.delete_document(int(first["document_id"]), request(), {"id": 1})
-        self.assertFalse(result["content_deleted"])
-        self.assertEqual(self.counts(), (1, 1, 1))
+        self.assertTrue(result["soft_deleted"])
+        self.assertEqual(self.counts(), (2, 1, 2))
+        with database.get_connection() as connection:
+            self.assertIsNotNone(connection.execute(
+                "SELECT deleted_at FROM documents WHERE id = ?",
+                (first["document_id"],),
+            ).fetchone()[0])
 
     def test_deleting_final_reference_removes_content_and_chunks(self):
         first = response(self.upload("one.txt", b"shared"))[1]
         result = documents.delete_document(int(first["document_id"]), request(), {"id": 1})
-        self.assertTrue(result["content_deleted"])
-        self.assertEqual(self.counts(), (0, 0, 0))
+        self.assertTrue(result["soft_deleted"])
+        self.assertEqual(self.counts(), (1, 1, 1))
 
     def test_retrieval_returns_shared_chunk_once(self):
         self.upload("one.txt", b"shared")
         self.upload("two.txt", b"shared")
-        with patch.object(vector_search, "create_embeddings", return_value=[[1.0, 0.0]]):
+        with patch.object(vector_search, "create_embeddings", return_value=[[1.0] + [0.0] * 383]):
             results = vector_search.search_chunks("question", 1, limit=10)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(set(results[0]["referencing_filenames"]), {"one.txt", "two.txt"})
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {result["filename"] for result in results},
+            {"one.txt", "two.txt"},
+        )
 
     def test_concurrent_duplicate_uploads_create_one_content(self):
         calls = 0
@@ -179,7 +191,7 @@ class DocumentDuplicateTests(unittest.TestCase):
             with lock:
                 calls += 1
             time.sleep(0.15)
-            return [[1.0, 0.0] for _ in chunks]
+            return [[1.0] + [0.0] * 383 for _ in chunks]
 
         results: list[object] = []
         with patch.object(upload, "create_embeddings", side_effect=embeddings):
@@ -190,16 +202,16 @@ class DocumentDuplicateTests(unittest.TestCase):
                 thread.join()
         self.assertEqual(len(results), 2)
         self.assertEqual(calls, 1)
-        self.assertEqual(self.counts(), (2, 1, 1))
+        self.assertEqual(self.counts(), (2, 1, 2))
 
     def test_upload_api_exercises_all_four_duplicate_cases(self):
         app.dependency_overrides[get_current_user] = lambda: {"id": 1, "email": "one@example.com"}
         try:
             with TestClient(app) as client:
-                first = client.post("/documents/upload", files={"file": ("n1.txt", b"alpha", "text/plain")})
-                same_name_new_content = client.post("/documents/upload", files={"file": ("n1.txt", b"beta", "text/plain")})
-                new_name_same_content = client.post("/documents/upload", files={"file": ("n2.txt", b"alpha", "text/plain")})
-                exact_duplicate = client.post("/documents/upload", files={"file": ("n1.txt", b"alpha", "text/plain")})
+                first = client.post("/documents/upload-legacy", files={"file": ("n1.txt", b"alpha", "text/plain")})
+                same_name_new_content = client.post("/documents/upload-legacy", files={"file": ("n1.txt", b"beta", "text/plain")})
+                new_name_same_content = client.post("/documents/upload-legacy", files={"file": ("n2.txt", b"alpha", "text/plain")})
+                exact_duplicate = client.post("/documents/upload-legacy", files={"file": ("n1.txt", b"alpha", "text/plain")})
             self.assertEqual(first.status_code, 200)
             self.assertEqual(first.json()["status"], "processed")
             self.assertEqual(same_name_new_content.json()["display_filename"], "n1(1).txt")

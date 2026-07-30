@@ -20,6 +20,10 @@ export interface PolicyDocument {
   collectionId?: number | null
   collectionName?: string | null
   relativePath?: string | null
+  visibility?: 'private' | 'organization'
+  processingStatus?: string
+  currentVersionId?: number | null
+  currentVersionNumber?: number | null
 }
 
 export interface RetrievedDocument {

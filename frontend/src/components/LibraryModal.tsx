@@ -1,18 +1,31 @@
-import { FileText, Search, Trash2 } from 'lucide-react'
-import { useMemo, useRef, useState, type MouseEvent } from 'react'
+import { FileText, RotateCcw, Search, Trash2 } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { useApp } from '../context/AppContext'
 import type { PolicyDocument } from '../types'
 import DocumentDeleteModal from './DocumentDeleteModal'
 import { Modal } from './ui/Modal'
+import { listDeletedDocuments, restoreDocument } from '../services/api'
 
 export default function LibraryModal({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const { documents, setSelectedDocument, removeDocument } = useApp()
+  const { documents, setSelectedDocument, removeDocument, refreshDocuments, showToast } = useApp()
+  const [deletedDocuments, setDeletedDocuments] = useState<Array<{ id: number; display_filename: string; deleted_at: string }>>([])
   const [search, setSearch] = useState('')
   const [documentToDelete, setDocumentToDelete] = useState<PolicyDocument | null>(null)
   const [isDeleting, setIsDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState('')
   const deleteTriggerRef = useRef<HTMLButtonElement | null>(null)
   const filtered = useMemo(() => documents.filter(doc => doc.name.toLowerCase().includes(search.toLowerCase())), [documents, search])
+
+  useEffect(() => {
+    if (open) void listDeletedDocuments().then(result => setDeletedDocuments(result.documents)).catch(() => setDeletedDocuments([]))
+  }, [open, documents])
+
+  const restore = async (id: number) => {
+    await restoreDocument(String(id))
+    setDeletedDocuments(previous => previous.filter(document => document.id !== id))
+    await refreshDocuments()
+    showToast('Document restored')
+  }
 
   const requestDelete = (document: PolicyDocument, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation()
@@ -71,6 +84,7 @@ export default function LibraryModal({ open, onClose }: { open: boolean; onClose
         ))}
         {filtered.length === 0 && <p className="rounded-xl border border-dashed border-slate-200 p-8 text-center text-xs text-slate-400">No search results</p>}
       </div>
+      {deletedDocuments.length > 0 && <div className="mt-4 border-t border-slate-100 pt-3"><p className="mb-2 text-xs font-semibold text-slate-600">Recently deleted</p>{deletedDocuments.map(document => <div key={document.id} className="flex items-center gap-2 rounded-lg bg-slate-50 p-2 text-xs"><span className="min-w-0 flex-1 truncate">{document.display_filename}</span><button onClick={() => void restore(document.id)} className="flex items-center gap-1 rounded-md px-2 py-1 text-blue-600 hover:bg-blue-50"><RotateCcw size={13} />Restore</button></div>)}</div>}
       <DocumentDeleteModal open={documentToDelete !== null} documentName={documentToDelete?.name ?? ''} isDeleting={isDeleting} error={deleteError} onCancel={cancelDelete} onConfirm={() => void confirmDelete()} />
     </Modal>
   )

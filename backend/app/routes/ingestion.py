@@ -49,6 +49,7 @@ def _job_response(row) -> dict[str, object]:
             {
                 "code": row["last_error_code"] or row["error_code"],
                 "message": row["last_error_message"] or row["error_message"],
+                "retryable": row["status"] == "retry_scheduled",
             }
             if (
                 row["last_error_code"] or row["error_code"]
@@ -164,10 +165,11 @@ async def queue_document_upload(
                     saved_path.unlink(missing_ok=True)
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            "An identical current version already exists. Use the "
-                            "document version endpoint to create an explicit version."
-                        ),
+                        detail={
+                            "code": "DOCUMENT_ALREADY_EXISTS",
+                            "message": "An identical active document already exists.",
+                            "retryable": False,
+                        },
                     )
                 next_version = int(connection.execute(
                     "SELECT COALESCE(MAX(version_number), 0) + 1 FROM document_versions WHERE document_id = ? AND organization_id = ?",
@@ -229,6 +231,7 @@ async def queue_document_upload(
                 version_id=version_id,
                 storage_key=storage_key,
                 idempotency_key=effective_key,
+                allow_active_content_reuse=explicit_version,
                 connection=connection,
             )
             accepted_job = connection.execute(
@@ -374,8 +377,8 @@ def get_job(
     with get_connection() as connection:
         row = connection.execute(
             """SELECT * FROM ingestion_jobs
-               WHERE id = ? AND organization_id = ?""",
-            (job_id, current_user["organization_id"]),
+               WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+            (job_id, current_user["organization_id"], current_user["id"]),
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Ingestion job was not found.")
@@ -394,17 +397,25 @@ def retry_job(
     with get_connection() as connection:
         row = connection.execute(
             """SELECT * FROM ingestion_jobs
-               WHERE id = ? AND organization_id = ?""",
-            (job_id, current_user["organization_id"]),
+               WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+            (job_id, current_user["organization_id"], current_user["id"]),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Ingestion job was not found.")
-        if row["document_id"] is not None:
-            require_document(connection, int(row["document_id"]), current_user, manage=True)
-        elif int(row["owner_id"]) != int(current_user["id"]) and current_user["role"] != "organization_admin":
-            raise HTTPException(status_code=404, detail="Ingestion job was not found.")
         if row["status"] != "failed":
             raise HTTPException(status_code=409, detail="Only failed jobs can be retried.")
+        if (row["last_error_code"] or row["error_code"]) in {
+            "DOCUMENT_ALREADY_EXISTS",
+            "DOCUMENT_REUPLOAD_FAILED",
+        }:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": row["last_error_code"] or row["error_code"],
+                    "message": row["last_error_message"] or row["error_message"],
+                    "retryable": False,
+                },
+            )
         connection.execute(
             """UPDATE ingestion_jobs SET status = 'queued', attempt_count = 0,
                available_at = CURRENT_TIMESTAMP, completed_at = NULL,
@@ -434,14 +445,10 @@ def cancel_job(
     with get_connection() as connection:
         row = connection.execute(
             """SELECT * FROM ingestion_jobs
-               WHERE id = ? AND organization_id = ?""",
-            (job_id, current_user["organization_id"]),
+               WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+            (job_id, current_user["organization_id"], current_user["id"]),
         ).fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail="Ingestion job was not found.")
-        if row["document_id"] is not None:
-            require_document(connection, int(row["document_id"]), current_user, manage=True)
-        elif int(row["owner_id"]) != int(current_user["id"]) and current_user["role"] != "organization_admin":
             raise HTTPException(status_code=404, detail="Ingestion job was not found.")
         cursor = connection.execute(
             """UPDATE ingestion_jobs SET status = 'cancelled',

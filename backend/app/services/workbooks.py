@@ -144,7 +144,9 @@ def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> 
     )
 
 
-def _extract_xlsx(path: Path, include_hidden: bool) -> WorkbookData:
+def _extract_xlsx(
+    path: Path, include_hidden: bool, include_very_hidden: bool
+) -> WorkbookData:
     from openpyxl import load_workbook
 
     workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
@@ -152,7 +154,10 @@ def _extract_xlsx(path: Path, include_hidden: bool) -> WorkbookData:
     try:
         for worksheet in workbook.worksheets:
             state = str(worksheet.sheet_state)
-            if not include_hidden and state != "visible":
+            if (
+                state == "hidden" and not include_hidden
+                or state == "veryHidden" and not include_very_hidden
+            ):
                 sheets.append(WorkbookSheet(worksheet.title, state, "disabled"))
                 continue
             try:
@@ -175,7 +180,9 @@ def _extract_xlsx(path: Path, include_hidden: bool) -> WorkbookData:
     return WorkbookData(sheets)
 
 
-def _extract_xls(path: Path, include_hidden: bool) -> WorkbookData:
+def _extract_xls(
+    path: Path, include_hidden: bool, include_very_hidden: bool
+) -> WorkbookData:
     import xlrd
 
     workbook = xlrd.open_workbook(str(path), on_demand=True)
@@ -184,8 +191,15 @@ def _extract_xls(path: Path, include_hidden: bool) -> WorkbookData:
         for index in range(workbook.nsheets):
             worksheet = workbook.sheet_by_index(index)
             visibility = int(workbook.sheet_visibility[index])
-            state = "visible" if visibility == 0 else "hidden"
-            if not include_hidden and visibility != 0:
+            state = (
+                "visible" if visibility == 0
+                else "hidden" if visibility == 1
+                else "veryHidden"
+            )
+            if (
+                visibility == 1 and not include_hidden
+                or visibility >= 2 and not include_very_hidden
+            ):
                 sheets.append(WorkbookSheet(worksheet.name, state, "disabled"))
                 continue
             try:
@@ -218,13 +232,17 @@ def _extract_xls(path: Path, include_hidden: bool) -> WorkbookData:
     return WorkbookData(sheets)
 
 
-def extract_workbook(path: Path, include_hidden: bool = True) -> WorkbookData:
+def extract_workbook(
+    path: Path,
+    include_hidden: bool = True,
+    include_very_hidden: bool = False,
+) -> WorkbookData:
     """Read all configured sheets without evaluating formulas, links, or macros."""
     try:
         if path.suffix.lower() == ".xlsx":
-            workbook = _extract_xlsx(path, include_hidden)
+            workbook = _extract_xlsx(path, include_hidden, include_very_hidden)
         elif path.suffix.lower() == ".xls":
-            workbook = _extract_xls(path, include_hidden)
+            workbook = _extract_xls(path, include_hidden, include_very_hidden)
         else:
             raise DocumentParseError("Unsupported spreadsheet type.")
     except DocumentParseError:

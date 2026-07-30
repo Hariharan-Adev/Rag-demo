@@ -17,6 +17,7 @@ class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     collection_id: int | None = Field(default=None, gt=0)
     document_id: int | None = Field(default=None, gt=0)
+    version_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("")
@@ -42,6 +43,7 @@ def chat(
             client_ip,
             request.collection_id,
             request.document_id,
+            request.version_id,
         )
     except HTTPException:
         raise

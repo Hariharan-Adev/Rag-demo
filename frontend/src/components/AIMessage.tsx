@@ -50,7 +50,7 @@ export default function AIMessage({ message }: { message: ChatItem }) {
           <button type="button" onClick={openSource} className="mt-4 flex max-w-md items-center gap-2.5 rounded-xl border border-[#e6ecf5] bg-[#f8fbff] px-3 py-2.5 text-left hover:border-blue-200 hover:bg-[#eef4ff]">
             <FileText size={15} className="shrink-0 text-blue-500" />
             <span className="min-w-0"><span className="block truncate text-[11px] font-semibold text-slate-700">{message.source.name}</span><span className="block text-[10px] text-slate-400">{message.source.section}</span></span>
-            <span className="ml-auto text-[10px] font-semibold text-slate-500">{message.source.score}%</span>
+            <span className="ml-auto text-[10px] font-semibold text-slate-500">Cited source</span>
           </button>
         )}
         <AnimatePresence>{feedback && <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="overflow-hidden"><div className="mt-3 rounded-xl bg-slate-50 p-3"><p className="text-[11px] font-semibold text-slate-700">What could be improved?</p><div className="mt-2 flex flex-wrap gap-1.5">{['Incorrect', 'Unclear', 'Missing source', 'Not relevant'].map(tag => <button key={tag} type="button" onClick={() => { setFeedback(false); showToast('Thanks for your feedback') }} className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] text-slate-600 hover:bg-slate-100">{tag}</button>)}</div></div></motion.div>}</AnimatePresence>

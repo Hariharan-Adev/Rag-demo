@@ -6,6 +6,7 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app.services.document_loader import (
@@ -17,6 +18,11 @@ from app.services.document_loader import (
     SUPPORTED_EXTENSIONS,
     _extract_legacy_ppt_text,
     extract_text,
+)
+from app.services.source_extraction import (
+    extract_source_chunks,
+    extract_source_metadata,
+    validate_source_location,
 )
 
 
@@ -81,6 +87,82 @@ class DocumentParserTests(unittest.TestCase):
         self.assertIn("Revenue increased by 15%", text)
         self.assertIn("Region\tRevenue", text)
 
+    def test_pdf_chunks_retain_exact_page_numbers(self):
+        path = self.root / "policy.pdf"
+        path.write_bytes(b"%PDF-test")
+        pages = [
+            SimpleNamespace(extract_text=lambda: "First page"),
+            SimpleNamespace(extract_text=lambda: "Second page"),
+        ]
+        with patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=pages)):
+            chunks = extract_source_chunks(path)
+        self.assertEqual(
+            [chunk.location["page_start"] for chunk in chunks],
+            [1, 2],
+        )
+        self.assertTrue(all(chunk.source_type == "pdf" for chunk in chunks))
+
+    def test_pptx_chunks_retain_slide_shape_and_table_row(self):
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        path = self.root / "located.pptx"
+        presentation = Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[1])
+        slide.shapes.title.text = "Located title"
+        table = slide.shapes.add_table(
+            1, 2, Inches(1), Inches(4), Inches(6), Inches(1)
+        ).table
+        table.cell(0, 0).text = "Region"
+        table.cell(0, 1).text = "Revenue"
+        presentation.save(path)
+        chunks = extract_source_chunks(path)
+        title = next(chunk for chunk in chunks if "Located title" in chunk.text)
+        table_chunk = next(chunk for chunk in chunks if "Region" in chunk.text)
+        self.assertEqual(title.location["slide_number"], 1)
+        self.assertEqual(title.location["slide_start"], 1)
+        self.assertEqual(title.location["slide_end"], 1)
+        self.assertIn("shape_index", title.location)
+        self.assertEqual(title.location["shape_ids"], ["shape-1"])
+        self.assertFalse(title.location["speaker_notes_included"])
+        self.assertEqual(table_chunk.location["row_start"], 1)
+        self.assertEqual(table_chunk.location["content_type"], "table")
+
+    def test_xlsx_chunks_retain_sheet_cell_range_table_and_formula(self):
+        from openpyxl import Workbook
+        from openpyxl.worksheet.table import Table
+
+        path = self.root / "located.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "Revenue"
+        sheet.append(["Amount", "Tax"])
+        sheet.append([100, "=A2*0.1"])
+        sheet.add_table(Table(displayName="RevenueTable", ref="A1:B2"))
+        workbook.save(path)
+        workbook.close()
+        chunks = extract_source_chunks(path)
+        formula_row = next(chunk for chunk in chunks if "=A2*0.1" in chunk.text)
+        self.assertEqual(formula_row.location["sheet_name"], "Revenue")
+        self.assertEqual(formula_row.location["cell_range"], "A2:B2")
+        self.assertEqual(formula_row.location["table_name"], "RevenueTable")
+        self.assertEqual(formula_row.location["formulas"], {"B2": "=A2*0.1"})
+        self.assertEqual(formula_row.location["header_rows"], [1])
+        self.assertEqual(formula_row.location["header_context"], ["Amount", "Tax"])
+        self.assertFalse(formula_row.location["hidden_sheet"])
+        metadata = extract_source_metadata(path)
+        self.assertEqual(metadata["sheet_count"], 1)
+        self.assertEqual(metadata["visible_sheet_count"], 1)
+        self.assertEqual(metadata["total_non_empty_rows"], 2)
+        self.assertEqual(
+            metadata["detected_tables"],
+            [{"sheet_name": "Revenue", "table_name": "RevenueTable"}],
+        )
+
+    def test_source_location_validation_rejects_incomplete_citations(self):
+        with self.assertRaisesRegex(DocumentParseError, "missing page_end"):
+            validate_source_location("pdf", {"page_start": 1})
+
     def test_legacy_ppt_text_atom_extraction(self):
         payload = "Legacy slide text".encode("utf-16-le")
         record = struct.pack("<HHI", 0, 4000, len(payload)) + payload
@@ -91,10 +173,21 @@ class DocumentParserTests(unittest.TestCase):
 
         path = self.root / "scan.png"
         Image.new("RGB", (30, 20), "white").save(path)
-        with patch("pytesseract.image_to_string", return_value="Invoice total 42") as ocr:
+        with (
+            patch("pytesseract.image_to_string", return_value="Invoice total 42") as ocr,
+            patch(
+                "app.services.image_processor.image_parser.vision_is_configured",
+                return_value=True,
+            ),
+            patch(
+                "app.services.image_processor.image_parser.describe_image",
+                return_value="A scanned invoice with a visible total.",
+            ),
+        ):
             text = extract_text(path)
         self.assertIn("Image: scan", text)
         self.assertIn("Invoice total 42", text)
+        self.assertIn("A scanned invoice with a visible total.", text)
         ocr.assert_called_once()
 
     def test_missing_tesseract_returns_clear_error(self):
@@ -103,7 +196,13 @@ class DocumentParserTests(unittest.TestCase):
 
         path = self.root / "scan.jpg"
         Image.new("RGB", (30, 20), "white").save(path)
-        with patch("pytesseract.image_to_string", side_effect=pytesseract.TesseractNotFoundError()):
+        with (
+            patch("pytesseract.image_to_string", side_effect=pytesseract.TesseractNotFoundError()),
+            patch(
+                "app.services.image_processor.image_parser.vision_is_configured",
+                return_value=False,
+            ),
+        ):
             with self.assertRaisesRegex(DocumentParseError, "Tesseract service is not installed"):
                 extract_text(path)
 

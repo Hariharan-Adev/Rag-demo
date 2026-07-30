@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 import zipfile
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,8 @@ from app import database
 from app.auth import get_current_user
 from app.main import app
 from app.services import ingestion_jobs, vector_search
+from app.services.rag_service import answer_question
+from app.services.source_extraction import SourceChunk
 from app.services.vector_store import VectorPoint, VectorStore
 
 
@@ -34,6 +37,7 @@ class FakeVectorStore(VectorStore):
         current_version_ids: list[int],
         limit: int,
         document_id: int | None = None,
+        score_threshold: float | None = None,
     ) -> list[dict[str, object]]:
         matches = [
             {
@@ -53,6 +57,11 @@ class FakeVectorStore(VectorStore):
             and point.version_id in current_version_ids
             and (document_id is None or point.document_id == document_id)
         ]
+        if score_threshold is not None:
+            matches = [
+                match for match in matches
+                if float(match["score"]) >= score_threshold
+            ]
         return matches[:limit]
 
     def contains_points(self, point_ids: list[str]) -> bool:
@@ -191,9 +200,12 @@ class MultitenantArchitectureTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def upload(self, content: bytes, key: str):
+        return self.upload_named("policy.txt", content, key)
+
+    def upload_named(self, filename: str, content: bytes, key: str):
         return self.client.post(
             "/api/documents/upload",
-            files={"file": ("policy.txt", content, "text/plain")},
+            files={"file": (filename, content, "application/octet-stream")},
             headers={"Idempotency-Key": key},
         )
 
@@ -234,7 +246,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.assertTrue({
                 "source_type", "source_location_json", "token_count",
                 "vector_point_id", "embedding_model", "embedding_dimension",
-                "deleted_at", "deleted_by",
+                "qdrant_indexed_at", "indexing_status", "deleted_at", "deleted_by",
             }.issubset(chunk_columns))
             job_columns = {
                 row["name"]
@@ -252,6 +264,68 @@ class MultitenantArchitectureTests(unittest.TestCase):
                         for row in connection.execute(f"PRAGMA table_info({table})")
                     },
                 )
+            indexes = {
+                row["name"]: row["sql"]
+                for row in connection.execute(
+                    """SELECT name, sql FROM sqlite_master
+                       WHERE type = 'index'"""
+                )
+            }
+            self.assertNotIn("idx_document_contents_owner_content_hash", indexes)
+            self.assertNotIn("idx_chunks_content_chunk_index", indexes)
+            self.assertIn(
+                "WHERE deleted_at IS NULL",
+                indexes["idx_document_contents_owner_active_content_hash"],
+            )
+            self.assertIn("idx_chunks_content_version_index", indexes)
+            self.assertIn("ux_chunks_vector_point_id", indexes)
+            self.assertIsNotNone(connection.execute(
+                """SELECT 1 FROM schema_migrations
+                   WHERE version = '008_active_content_indexes'"""
+            ).fetchone())
+            self.assertIsNotNone(connection.execute(
+                """SELECT 1 FROM schema_migrations
+                   WHERE version = '009_chunk_vector_sync'"""
+            ).fetchone())
+
+    def test_active_content_index_migration_is_restart_safe(self) -> None:
+        database.initialize_database()
+        database.initialize_database()
+        with database.get_connection() as connection:
+            indexes = {
+                row["name"]: row["sql"]
+                for row in connection.execute(
+                    """SELECT name, sql FROM sqlite_master
+                       WHERE type = 'index'"""
+                )
+            }
+            self.assertNotIn("idx_document_contents_owner_content_hash", indexes)
+            self.assertNotIn("idx_chunks_content_chunk_index", indexes)
+            self.assertIn(
+                "WHERE deleted_at IS NULL",
+                indexes["idx_document_contents_owner_active_content_hash"],
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA integrity_check").fetchone()[0], "ok"
+            )
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def test_active_content_index_migration_rejects_ambiguous_active_duplicates(self) -> None:
+        with database.get_connection() as connection:
+            connection.execute(
+                "DROP INDEX idx_document_contents_owner_active_content_hash"
+            )
+            connection.executemany(
+                """INSERT INTO document_contents
+                   (owner_id, organization_id, file_hash,
+                    normalized_content_hash, extracted_text, processing_status)
+                   VALUES (10, 'org-a', ?, 'conflict', 'conflict', 'completed')""",
+                [("one",), ("two",)],
+            )
+        with self.assertRaisesRegex(
+            RuntimeError, "active duplicate content identities"
+        ):
+            database.initialize_database()
 
     def test_lifecycle_repair_checks_schema_even_when_old_migration_was_recorded(self) -> None:
         with database.get_connection() as connection:
@@ -491,11 +565,21 @@ class MultitenantArchitectureTests(unittest.TestCase):
         self.assertEqual(alias.status_code, 202)
         self.assertNotEqual(alias.json()["document_id"], first["document_id"])
         self.assertTrue(ingestion_jobs.run_one("worker-duplicate"))
+        duplicate_job = self.client.get(
+            f"/api/jobs/{alias.json()['job_id']}"
+        ).json()
+        self.assertEqual(duplicate_job["status"], "failed")
+        self.assertEqual(
+            duplicate_job["error"]["code"], "DOCUMENT_ALREADY_EXISTS"
+        )
+        self.assertFalse(duplicate_job["error"]["retryable"])
 
         with database.get_connection() as connection:
             org_a_versions = connection.execute(
                 """SELECT document_id, content_id, storage_key
-                   FROM document_versions WHERE organization_id = 'org-a'
+                   FROM document_versions
+                   WHERE organization_id = 'org-a'
+                     AND status = 'completed' AND deleted_at IS NULL
                    ORDER BY id"""
             ).fetchall()
             beta_content_ids = {
@@ -506,10 +590,11 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.assertEqual(
                 connection.execute(
                     """SELECT COUNT(DISTINCT document_id) FROM chunks
-                       WHERE organization_id = 'org-a' AND content_id = ?""",
+                       WHERE organization_id = 'org-a' AND content_id = ?
+                         AND deleted_at IS NULL""",
                     (next(iter(beta_content_ids)),),
                 ).fetchone()[0],
-                2,
+                1,
             )
 
         self.current_user = {
@@ -546,6 +631,345 @@ class MultitenantArchitectureTests(unittest.TestCase):
             'rag_chunks_created_total{organization_id="org-b"}',
             metrics.text,
         )
+
+    def test_deleted_content_reupload_reuses_embeddings_and_is_searchable(self) -> None:
+        first = self.upload(b"restorable policy", "reupload-original").json()
+        self.assertTrue(ingestion_jobs.run_one("worker-reupload-original"))
+        with database.get_connection() as connection:
+            original = connection.execute(
+                """SELECT dv.content_id, c.embedding, c.vector_point_id
+                   FROM document_versions dv
+                   JOIN chunks c ON c.version_id = dv.id
+                   WHERE dv.id = ?""",
+                (first["version_id"],),
+            ).fetchone()
+        self.assertEqual(
+            self.client.delete(f"/documents/{first['document_id']}").status_code,
+            200,
+        )
+
+        second = self.upload(
+            b"restorable policy", "reupload-replacement"
+        ).json()
+        with patch.object(
+            ingestion_jobs,
+            "create_embeddings",
+            side_effect=AssertionError("valid deleted embeddings must be reused"),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-reupload-replacement"))
+        completed = self.client.get(f"/api/jobs/{second['job_id']}").json()
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["result"]["reused_deleted_content"])
+
+        with database.get_connection() as connection:
+            replacement = connection.execute(
+                """SELECT dv.content_id, c.embedding, c.vector_point_id
+                   FROM document_versions dv
+                   JOIN chunks c ON c.version_id = dv.id
+                   WHERE dv.id = ?""",
+                (second["version_id"],),
+            ).fetchone()
+            self.assertEqual(replacement["content_id"], original["content_id"])
+            self.assertEqual(replacement["embedding"], original["embedding"])
+            self.assertNotEqual(
+                replacement["vector_point_id"], original["vector_point_id"]
+            )
+            self.assertEqual(
+                connection.execute(
+                    """SELECT COUNT(*) FROM chunks
+                       WHERE version_id = ? AND deleted_at IS NULL""",
+                    (second["version_id"],),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertIsNotNone(connection.execute(
+                """SELECT 1 FROM audit_events
+                   WHERE event_type = 'document.reupload.reused'
+                     AND job_id = ?""",
+                (second["job_id"],),
+            ).fetchone())
+
+        before = len(self.fake_store.points)
+        ingestion_jobs.process_job(second["job_id"])
+        self.assertEqual(len(self.fake_store.points), before)
+        results = vector_search.search_chunks(
+            "restorable", 10, organization_id="org-a"
+        )
+        self.assertEqual({row["document_id"] for row in results}, {second["document_id"]})
+        with patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "Grounded answer",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ), patch("app.services.rag_service.reserve_groq_call"), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ):
+            chat = answer_question(
+                "What is the policy?",
+                10,
+                document_id=second["document_id"],
+            )
+        self.assertEqual(chat["sources"][0]["document_id"], second["document_id"])
+        restore_conflict = self.client.post(
+            f"/documents/{first['document_id']}/restore"
+        )
+        self.assertEqual(restore_conflict.status_code, 409)
+        self.assertEqual(
+            restore_conflict.json()["detail"]["code"], "DOCUMENT_ALREADY_EXISTS"
+        )
+
+    def test_active_duplicate_is_terminal_and_cross_user_content_is_isolated(self) -> None:
+        first = self.upload(b"owner scoped content", "active-owner").json()
+        self.assertTrue(ingestion_jobs.run_one("worker-active-owner"))
+        same_name = self.upload_named(
+            "policy.txt", b"owner scoped content", "active-same-name"
+        )
+        self.assertEqual(same_name.status_code, 409)
+        self.assertEqual(
+            same_name.json()["detail"]["code"], "DOCUMENT_ALREADY_EXISTS"
+        )
+
+        alias = self.upload_named(
+            "alias.txt", b"owner scoped content", "active-alias"
+        ).json()
+        with patch.object(
+            ingestion_jobs,
+            "create_embeddings",
+            side_effect=AssertionError("active duplicates must fail before embedding"),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-active-alias"))
+        alias_job = self.client.get(f"/api/jobs/{alias['job_id']}").json()
+        self.assertEqual(alias_job["error"]["code"], "DOCUMENT_ALREADY_EXISTS")
+        self.assertFalse(alias_job["error"]["retryable"])
+        retry = self.client.post(f"/api/jobs/{alias['job_id']}/retry")
+        self.assertEqual(retry.status_code, 409)
+        self.assertEqual(
+            retry.json()["detail"]["code"], "DOCUMENT_ALREADY_EXISTS"
+        )
+        with database.get_connection() as connection:
+            self.assertIsNotNone(connection.execute(
+                "SELECT deleted_at FROM documents WHERE id = ?",
+                (alias["document_id"],),
+            ).fetchone()["deleted_at"])
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE document_id = ?",
+                    (alias["document_id"],),
+                ).fetchone()[0],
+                0,
+            )
+
+        self.current_user = {
+            "id": 11,
+            "email": "reader@example.com",
+            "organization_id": "org-a",
+            "role": "member",
+        }
+        self.assertEqual(
+            self.client.get(f"/api/jobs/{first['job_id']}").status_code, 404
+        )
+        other_owner = self.upload_named(
+            "other-owner.txt", b"owner scoped content", "other-owner"
+        ).json()
+        self.assertTrue(ingestion_jobs.run_one("worker-other-owner"))
+        self.assertEqual(
+            self.client.get(f"/api/jobs/{other_owner['job_id']}").json()["status"],
+            "completed",
+        )
+        self.current_user = {
+            "id": 10,
+            "email": "owner@example.com",
+            "organization_id": "org-a",
+            "role": "organization_admin",
+        }
+        self.assertEqual(
+            self.client.get(f"/api/jobs/{other_owner['job_id']}").status_code,
+            404,
+        )
+        with database.get_connection() as connection:
+            content_ids = {
+                row["content_id"]
+                for row in connection.execute(
+                    """SELECT content_id FROM document_versions
+                       WHERE id IN (?, ?)""",
+                    (first["version_id"], other_owner["version_id"]),
+                )
+            }
+        self.assertEqual(len(content_ids), 2)
+
+    def test_deleted_reupload_supported_format_matrix(self) -> None:
+        def office_bytes(marker: str) -> bytes:
+            output = BytesIO()
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("marker.txt", marker)
+            return output.getvalue()
+
+        fixtures = {
+            ".txt": b"format txt",
+            ".pdf": b"%PDF-1.4\nformat pdf",
+            ".docx": office_bytes("format docx"),
+            ".xlsx": office_bytes("format xlsx"),
+            ".pptx": office_bytes("format pptx"),
+            ".png": b"\x89PNG\r\n\x1a\nformat image",
+        }
+
+        def extracted(path: Path):
+            text = sha256(path.read_bytes()).hexdigest()
+            return [
+                SourceChunk(
+                    text=text,
+                    source_type="text",
+                    location={"line_start": 1, "line_end": 1},
+                )
+            ], {}, None
+
+        with patch.object(
+            ingestion_jobs, "_extract_bundle", side_effect=extracted
+        ), patch("app.routes.ingestion.enforce_request_limit"):
+            for extension, content in fixtures.items():
+                with self.subTest(extension=extension):
+                    first = self.upload_named(
+                        f"original{extension}",
+                        content,
+                        f"format-original-{extension}",
+                    ).json()
+                    self.assertTrue(ingestion_jobs.run_one("worker-format-original"))
+                    self.assertEqual(
+                        self.client.delete(
+                            f"/documents/{first['document_id']}"
+                        ).status_code,
+                        200,
+                    )
+                    second = self.upload_named(
+                        f"renamed{extension}",
+                        content,
+                        f"format-reupload-{extension}",
+                    ).json()
+                    with patch.object(
+                        ingestion_jobs,
+                        "create_embeddings",
+                        side_effect=AssertionError(
+                            "format re-upload must reuse embeddings"
+                        ),
+                    ):
+                        self.assertTrue(
+                            ingestion_jobs.run_one("worker-format-reupload")
+                        )
+                    job = self.client.get(
+                        f"/api/jobs/{second['job_id']}"
+                    ).json()
+                    self.assertEqual(job["status"], "completed")
+                    self.assertTrue(job["result"]["reused_deleted_content"])
+
+    def test_deleted_reupload_rebuilds_missing_embeddings(self) -> None:
+        first = self.upload(b"rebuild missing embedding", "missing-embedding").json()
+        self.assertTrue(ingestion_jobs.run_one("worker-missing-original"))
+        self.assertEqual(
+            self.client.delete(f"/documents/{first['document_id']}").status_code,
+            200,
+        )
+        with database.get_connection() as connection:
+            original_content_id = connection.execute(
+                "SELECT content_id FROM document_versions WHERE id = ?",
+                (first["version_id"],),
+            ).fetchone()["content_id"]
+            connection.execute(
+                "UPDATE chunks SET embedding = NULL WHERE version_id = ?",
+                (first["version_id"],),
+            )
+
+        second = self.upload(
+            b"rebuild missing embedding", "missing-embedding-reupload"
+        ).json()
+        embedded_batches: list[list[str]] = []
+
+        def regenerate(texts: list[str]) -> list[list[float]]:
+            embedded_batches.append(texts)
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+        with patch.object(
+            ingestion_jobs, "create_embeddings", side_effect=regenerate
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-missing-reupload"))
+
+        completed = self.client.get(f"/api/jobs/{second['job_id']}").json()
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(completed["result"]["reused_deleted_content"])
+        self.assertEqual(len(embedded_batches), 1)
+        with database.get_connection() as connection:
+            rebuilt = connection.execute(
+                """SELECT dv.content_id, c.embedding
+                   FROM document_versions dv
+                   JOIN chunks c ON c.version_id = dv.id
+                   WHERE dv.id = ?""",
+                (second["version_id"],),
+            ).fetchone()
+        self.assertEqual(rebuilt["content_id"], original_content_id)
+        self.assertIsNotNone(rebuilt["embedding"])
+
+    def test_deleted_reupload_missing_vectors_resumes_without_reembedding(self) -> None:
+        first = self.upload(b"vector recovery", "vector-original").json()
+        self.assertTrue(ingestion_jobs.run_one("worker-vector-original"))
+        self.assertEqual(
+            self.client.delete(f"/documents/{first['document_id']}").status_code,
+            200,
+        )
+        second = self.upload(b"vector recovery", "vector-reupload").json()
+        with patch.object(
+            ingestion_jobs,
+            "create_embeddings",
+            side_effect=AssertionError("deleted embeddings must be reused"),
+        ), patch.object(
+            self.fake_store,
+            "upsert",
+            side_effect=ConnectionError("qdrant temporarily unavailable"),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-vector-failure"))
+        scheduled = self.client.get(f"/api/jobs/{second['job_id']}").json()
+        self.assertEqual(scheduled["status"], "retry_scheduled")
+        with database.get_connection() as connection:
+            self.assertEqual(
+                connection.execute(
+                    """SELECT DISTINCT indexing_status FROM chunks
+                       WHERE version_id = ?""",
+                    (second["version_id"],),
+                ).fetchone()["indexing_status"],
+                "failed",
+            )
+            connection.execute(
+                """UPDATE ingestion_jobs
+                   SET available_at = CURRENT_TIMESTAMP,
+                       next_retry_at = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (second["job_id"],),
+            )
+        with patch.object(
+            ingestion_jobs,
+            "_extract_bundle",
+            side_effect=AssertionError("retry must reuse persisted chunks"),
+        ), patch.object(
+            ingestion_jobs,
+            "create_embeddings",
+            side_effect=AssertionError("retry must not regenerate embeddings"),
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-vector-resume"))
+        completed = self.client.get(f"/api/jobs/{second['job_id']}").json()
+        self.assertEqual(completed["status"], "completed")
+        with database.get_connection() as connection:
+            rows = [
+                row
+                for row in connection.execute(
+                    """SELECT vector_point_id, indexing_status, qdrant_indexed_at
+                       FROM chunks WHERE version_id = ?""",
+                    (second["version_id"],),
+                )
+            ]
+        point_ids = [row["vector_point_id"] for row in rows]
+        self.assertTrue(all(row["indexing_status"] == "completed" for row in rows))
+        self.assertTrue(all(row["qdrant_indexed_at"] for row in rows))
+        self.assertTrue(self.fake_store.contains_points(point_ids))
 
     def test_transient_vector_failure_resumes_existing_chunks_with_backoff(self) -> None:
         accepted = self.upload(b"recover without re-extracting", "resume-job").json()

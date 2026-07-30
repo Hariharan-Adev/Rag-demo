@@ -30,7 +30,7 @@ def verify_password(password: str, password_hash: str) -> bool:
     return password_hasher.verify(password, password_hash)
 
 
-def create_access_token(user_id: int) -> str:
+def create_access_token(user_id: int, organization_id: str) -> str:
     """Create a short-lived JWT for one user."""
     if not settings.jwt_secret_key:
         raise ValueError("JWT_SECRET_KEY is not configured.")
@@ -40,7 +40,7 @@ def create_access_token(user_id: int) -> str:
     )
 
     return jwt.encode(
-        {"sub": str(user_id), "exp": expires_at},
+        {"sub": str(user_id), "org": organization_id, "exp": expires_at},
         settings.jwt_secret_key,
         algorithm="HS256",
     )
@@ -55,16 +55,19 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict[str, object]:
             algorithms=["HS256"],
         )
         user_id = int(payload.get("sub", ""))
+        token_organization_id = str(payload.get("org", ""))
     except (JWTError, ValueError, TypeError):
         raise CREDENTIALS_ERROR
 
     with get_connection() as connection:
         row = connection.execute(
-            "SELECT id, email FROM users WHERE id = ?",
+            "SELECT id, email, organization_id, role FROM users WHERE id = ? AND deleted_at IS NULL",
             (user_id,),
         ).fetchone()
 
     if row is None:
+        raise CREDENTIALS_ERROR
+    if token_organization_id and token_organization_id != row["organization_id"]:
         raise CREDENTIALS_ERROR
 
     return dict(row)

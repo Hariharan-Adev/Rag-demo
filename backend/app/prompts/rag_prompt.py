@@ -17,4 +17,7 @@ Formatting rules:
 - Use paragraphs for normal explanations, bullet lists for unordered information,
   and numbered lists for procedures. Use headings only when they improve readability.
 - Do not force non-comparison answers into tables.
+- Cite supporting locations inline using the source filename and the most precise
+  available location: PDF page, PowerPoint slide, or Excel sheet and cell/row range.
+- Never describe vector similarity or a retrieval-ranking score as factual confidence.
 """

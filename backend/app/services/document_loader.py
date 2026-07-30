@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import csv
-import os
-import shutil
 import struct
 from pathlib import Path
 from typing import Protocol
+
+from app.services.image_processor import (
+    IMAGE_EXTENSIONS,
+    ImageProcessingError,
+    extract_image_text,
+)
 
 
 class DocumentParseError(ValueError):
@@ -198,53 +202,12 @@ class PowerPointParser:
             raise DocumentParseError("The legacy PowerPoint presentation could not be read.") from error
 
 
-def _configure_tesseract(pytesseract) -> None:
-    """Find common Windows installs when the current process has a stale PATH."""
-    configured = str(pytesseract.pytesseract.tesseract_cmd)
-    if shutil.which(configured):
-        return
-
-    candidates = [
-        os.getenv("TESSERACT_CMD"),
-        str(Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Tesseract-OCR" / "tesseract.exe")
-        if os.getenv("LOCALAPPDATA")
-        else None,
-        str(Path(os.environ["ProgramFiles"]) / "Tesseract-OCR" / "tesseract.exe")
-        if os.getenv("ProgramFiles")
-        else None,
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            pytesseract.pytesseract.tesseract_cmd = candidate
-            return
-
-
 class OcrParser:
     def extract_text(self, file_path: Path) -> str:
         try:
-            import pytesseract
-            from PIL import Image, ImageOps, ImageSequence, UnidentifiedImageError
-
-            _configure_tesseract(pytesseract)
-            output = [f"Image: {file_path.stem}"]
-            with Image.open(file_path) as image:
-                for index, frame in enumerate(ImageSequence.Iterator(image), start=1):
-                    prepared = ImageOps.exif_transpose(frame.copy()).convert("RGB")
-                    text = pytesseract.image_to_string(prepared).strip()
-                    if text:
-                        if getattr(image, "n_frames", 1) > 1:
-                            output.append(f"Frame {index}")
-                        output.append(text)
-            return "\n".join(output)
-        except Exception as error:
-            try:
-                import pytesseract
-
-                if isinstance(error, pytesseract.TesseractNotFoundError):
-                    raise DocumentParseError("OCR is unavailable because the Tesseract service is not installed.") from error
-            except ImportError:
-                pass
-            raise DocumentParseError("The image could not be read or OCR processing failed.") from error
+            return extract_image_text(file_path)
+        except ImageProcessingError as error:
+            raise DocumentParseError(str(error)) from error
 
 
 PARSER_REGISTRY: dict[str, DocumentParser] = {}
@@ -261,7 +224,7 @@ register_parser((".docx",), DocxParser())
 register_parser((".xlsx", ".xls"), ExcelParser())
 register_parser((".csv",), CsvParser())
 register_parser((".pptx", ".ppt"), PowerPointParser())
-register_parser((".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"), OcrParser())
+register_parser(tuple(IMAGE_EXTENSIONS), OcrParser())
 
 SUPPORTED_EXTENSIONS = frozenset(PARSER_REGISTRY)
 

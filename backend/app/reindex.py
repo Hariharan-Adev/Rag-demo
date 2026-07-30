@@ -13,7 +13,7 @@ from app.services.vector_store import VectorPoint, get_vector_store
 def reindex(*, organization_id: str | None = None) -> int:
     with get_connection() as connection:
         rows = connection.execute(
-            """SELECT c.id, c.organization_id, c.document_id, c.version_id,
+            """SELECT c.id, c.content_id, c.organization_id, c.document_id, c.version_id,
                       c.chunk_index, c.embedding, c.text, c.source_type,
                       c.source_location_json, d.owner_id, d.display_filename,
                       d.visibility, c.embedding_model
@@ -32,6 +32,7 @@ def reindex(*, organization_id: str | None = None) -> int:
             owner_id=int(row["owner_id"]),
             document_id=int(row["document_id"]),
             version_id=int(row["version_id"]),
+            content_id=int(row["content_id"]),
             chunk_id=int(row["id"]),
             chunk_index=int(row["chunk_index"]),
             vector=json.loads(row["embedding"]),
@@ -54,7 +55,8 @@ def reindex(*, organization_id: str | None = None) -> int:
     with get_connection() as connection:
         connection.executemany(
             """UPDATE chunks SET vector_point_id = ?, embedding_model = ?,
-                   embedding_dimension = ?
+                   embedding_dimension = ?, indexing_status = 'completed',
+                   qdrant_indexed_at = CURRENT_TIMESTAMP
                WHERE id = ? AND organization_id = ?""",
             [
                 (

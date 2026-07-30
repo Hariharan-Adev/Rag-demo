@@ -156,18 +156,25 @@ function mapDocument(row: DocumentRecord): PolicyDocument {
     collectionId: row.collection_id,
     collectionName: row.collection_name,
     relativePath: row.relative_path,
+    visibility: row.visibility,
+    processingStatus: row.status,
+    currentVersionId: row.current_version_id,
+    currentVersionNumber: row.current_version_number,
   }
 }
 
 function sourceScore(source: ChatSource) {
-  const score = source.score <= 1 ? source.score * 100 : source.score
-  return Math.max(0, Math.min(100, Math.round(score)))
+  return source.retrieval_score ?? 0
 }
 
 function mapSource(source: ChatSource, index: number): RetrievedDocument {
+  const locationData = source.source_location ?? {}
   const location = [
-    source.sheet_name ? `Sheet: ${source.sheet_name}` : null,
-    source.row_number ? `Row: ${source.row_number}` : null,
+    locationData.page_start ? `Page: ${locationData.page_start}` : null,
+    (locationData.slide_start || locationData.slide_number) ? `Slide: ${locationData.slide_start || locationData.slide_number}` : null,
+    locationData.sheet_name ? `Sheet: ${locationData.sheet_name}` : null,
+    locationData.cell_range ? `Cells: ${locationData.cell_range}` : null,
+    locationData.row_start ? `Row: ${locationData.row_start}` : null,
   ].filter(Boolean).join(' · ')
   return {
     id: source.document_id ? String(source.document_id) : source.filename,

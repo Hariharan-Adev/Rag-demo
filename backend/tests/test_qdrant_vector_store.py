@@ -22,6 +22,7 @@ class QdrantVectorStoreTests(unittest.TestCase):
                 owner_id=owner,
                 document_id=document,
                 version_id=version,
+                content_id=version,
                 chunk_id=index,
                 chunk_index=0,
                 vector=vector,
@@ -51,6 +52,15 @@ class QdrantVectorStoreTests(unittest.TestCase):
             limit=10,
         )
         self.assertEqual([result["text"] for result in results], ["current"])
+        self.assertEqual(results[0]["content_id"], 100)
+        self.assertEqual(store.search(
+            [-1.0] + [0.0] * 383,
+            organization_id="org-a",
+            user_id=1,
+            current_version_ids=[100],
+            limit=10,
+            score_threshold=0.35,
+        ), [])
         store.set_document_deleted("org-a", 10, True)
         self.assertEqual(store.search(
             vector,
@@ -73,6 +83,7 @@ class QdrantVectorStoreTests(unittest.TestCase):
                 owner_id=99,
                 document_id=11,
                 version_id=102,
+                content_id=102,
                 chunk_id=10,
                 chunk_index=0,
                 vector=vector,
@@ -87,6 +98,7 @@ class QdrantVectorStoreTests(unittest.TestCase):
                 owner_id=99,
                 document_id=12,
                 version_id=103,
+                content_id=103,
                 chunk_id=11,
                 chunk_index=0,
                 vector=vector,

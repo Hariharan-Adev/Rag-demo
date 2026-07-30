@@ -9,6 +9,8 @@ from fastapi import HTTPException
 
 from app import database
 from app.services import vector_search
+from app.services import vector_store
+from app.services.vector_store import VectorPoint, get_vector_store, reset_vector_store_for_tests
 from app.services.folder_uploads import record_batch_result, sanitize_relative_path, validate_upload_context
 
 
@@ -17,7 +19,10 @@ class FolderUploadTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.database_patch = patch.object(database, "DATABASE_PATH", Path(self.temporary.name) / "folder.db")
         self.database_patch.start()
+        self.qdrant_patch = patch.object(vector_store.settings, "qdrant_local_path", "")
+        self.qdrant_patch.start()
         database.initialize_database()
+        reset_vector_store_for_tests()
         with database.get_connection() as connection:
             connection.executemany(
                 "INSERT INTO users (id, email, password_hash) VALUES (?, ?, 'hash')",
@@ -28,6 +33,7 @@ class FolderUploadTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.database_patch.stop()
+        self.qdrant_patch.stop()
         self.temporary.cleanup()
 
     def test_relative_path_is_metadata_safe(self) -> None:
@@ -72,12 +78,46 @@ class FolderUploadTests(unittest.TestCase):
                     "INSERT INTO document_contents (id, owner_id, file_hash, normalized_content_hash, extracted_text, processing_status) VALUES (?, ?, ?, ?, ?, 'completed')",
                     (content_id, owner_id, f"file-{content_id}", f"content-{content_id}", text),
                 )
-                connection.execute(
+                document_cursor = connection.execute(
                     "INSERT INTO documents (owner_id, original_filename, display_filename, stored_filename, file_hash, content_id, collection_id) VALUES (?, ?, ?, '', ?, ?, ?)",
                     (owner_id, f"{content_id}.txt", f"{content_id}.txt", f"file-{content_id}", content_id, collection_id),
                 )
-                connection.execute("INSERT INTO chunks (content_id, chunk_index, text, embedding) VALUES (?, 0, ?, '[1.0, 0.0]')", (content_id, text))
-        with patch.object(vector_search, "create_embeddings", return_value=[[1.0, 0.0]]):
+                document_id = int(document_cursor.lastrowid)
+                version_cursor = connection.execute(
+                    """INSERT INTO document_versions
+                       (organization_id, document_id, version_number, content_id,
+                        stored_filename, file_hash, status, created_by)
+                       VALUES (?, ?, 1, ?, '', ?, 'completed', ?)""",
+                    (database.DEFAULT_ORGANIZATION_ID, document_id, content_id, f"file-{content_id}", owner_id),
+                )
+                version_id = int(version_cursor.lastrowid)
+                connection.execute(
+                    "UPDATE documents SET current_version_id = ? WHERE id = ?",
+                    (version_id, document_id),
+                )
+                chunk_cursor = connection.execute(
+                    """INSERT INTO chunks
+                       (content_id, chunk_index, text, embedding, document_id,
+                        version_id, source_type)
+                       VALUES (?, 0, ?, ?, ?, ?, 'text')""",
+                    (content_id, text, str([1.0] + [0.0] * 383), document_id, version_id),
+                )
+                get_vector_store().upsert([VectorPoint(
+                    organization_id=database.DEFAULT_ORGANIZATION_ID,
+                    owner_id=owner_id,
+                    document_id=document_id,
+                    version_id=version_id,
+                    content_id=content_id,
+                    chunk_id=int(chunk_cursor.lastrowid),
+                    chunk_index=0,
+                    vector=[1.0] + [0.0] * 383,
+                    text=text,
+                    filename=f"{content_id}.txt",
+                    visibility="private",
+                    source_type="text",
+                    source_location={},
+                )])
+        with patch.object(vector_search, "create_embeddings", return_value=[[1.0] + [0.0] * 383]):
             results = vector_search.search_chunks("finance", 1, 10, collection_id=10)
         self.assertEqual([result["content"] for result in results], ["owned finance"])
 

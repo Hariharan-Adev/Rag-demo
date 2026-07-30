@@ -1,5 +1,6 @@
 """RAG orchestration: retrieve context and generate an answer."""
 
+from app.config import settings
 from app.services.groq_client import generate_answer
 from app.services.vector_search import search_chunks
 from app.services.workbook_analysis import (
@@ -17,9 +18,10 @@ def answer_question(
     client_ip: str = "",
     collection_id: int | None = None,
     document_id: int | None = None,
+    version_id: int | None = None,
 ) -> dict[str, object]:
     """Route calculations to structured rows and details to semantic retrieval."""
-    if is_analytical_question(question) and has_structured_workbook(
+    if version_id is None and is_analytical_question(question) and has_structured_workbook(
         user_id,
         collection_id,
         document_id,
@@ -47,10 +49,16 @@ def answer_question(
     sources = search_chunks(
         question,
         owner_id=user_id,
-        limit=3,
+        limit=max(
+            settings.rag_retrieval_limit,
+            settings.rag_final_context_limit,
+        ),
         collection_id=collection_id,
         document_id=document_id,
+        version_id=version_id,
+        min_score=settings.rag_min_score,
     )
+    sources = sources[:settings.rag_final_context_limit]
 
     if not sources:
         log_audit_event(
@@ -68,8 +76,8 @@ def answer_question(
     context = "\n\n".join(
         (
             f"<source filename=\"{source['filename']}\" "
-            f"sheet=\"{source.get('sheet_name') or ''}\" "
-            f"row=\"{source.get('row_number') or ''}\">\n"
+            f"source_type=\"{source.get('source_type') or 'text'}\" "
+            f"location=\"{source.get('source_location') or {}}\">\n"
             f"{source['content']}\n"
             "</source>"
         )
@@ -123,10 +131,16 @@ Question:
         "sources": [
             {
                 "document_id": source["document_id"],
+                "version_id": source["version_id"],
                 "filename": source["filename"],
-                "sheet_name": source.get("sheet_name"),
-                "row_number": source.get("row_number"),
-                "score": source["score"],
+                "text": source["content"],
+                "source_type": source.get("source_type", "text"),
+                "source_location": source.get("source_location", {}),
+                "location": {
+                    "source_type": source.get("source_type", "text"),
+                    **source.get("source_location", {}),
+                },
+                "retrieval_score": source["score"],
             }
             for source in sources
         ],

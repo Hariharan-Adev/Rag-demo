@@ -17,6 +17,7 @@ class VectorPoint:
     owner_id: int
     document_id: int
     version_id: int
+    content_id: int
     chunk_id: int
     chunk_index: int
     vector: list[float]
@@ -57,6 +58,7 @@ class VectorStore(ABC):
         current_version_ids: list[int],
         limit: int,
         document_id: int | None = None,
+        score_threshold: float | None = None,
     ) -> list[dict[str, object]]: ...
 
     @abstractmethod
@@ -100,8 +102,19 @@ class QdrantVectorStore(VectorStore):
         from qdrant_client import QdrantClient, models
 
         self.models = models
+        requested_mode = settings.qdrant_mode.strip().lower()
+        if requested_mode not in {"auto", "local", "remote", "memory"}:
+            raise RuntimeError(
+                "QDRANT_MODE must be auto, local, remote, or memory."
+            )
+        local_path = settings.qdrant_path or settings.qdrant_local_path
+        mode = requested_mode
+        if mode == "auto":
+            mode = "remote" if settings.qdrant_url else (
+                "local" if local_path else "memory"
+            )
         if settings.app_environment == "production":
-            if not settings.qdrant_url.startswith("https://"):
+            if mode != "remote" or not settings.qdrant_url.startswith("https://"):
                 raise RuntimeError(
                     "Production Qdrant must use an HTTPS endpoint."
                 )
@@ -109,20 +122,22 @@ class QdrantVectorStore(VectorStore):
                 raise RuntimeError(
                     "Production Qdrant requires API-key authentication."
                 )
-        if settings.qdrant_url:
+        if mode == "remote":
+            if not settings.qdrant_url:
+                raise RuntimeError("QDRANT_URL is required in remote mode.")
             self.client = QdrantClient(
                 url=settings.qdrant_url,
                 api_key=settings.qdrant_api_key or None,
                 timeout=15,
             )
-            mode = "remote"
-        elif settings.qdrant_local_path:
-            self.client = QdrantClient(path=settings.qdrant_local_path)
-            mode = "local"
+        elif mode == "local":
+            if not local_path:
+                raise RuntimeError("QDRANT_PATH is required in local mode.")
+            self.client = QdrantClient(path=local_path)
         else:
             self.client = QdrantClient(location=":memory:")
-            mode = "memory"
         self.mode = mode
+        self.local_path = local_path
         self.collection = settings.qdrant_collection
         collections = {
             item.name for item in self.client.get_collections().collections
@@ -143,6 +158,26 @@ class QdrantVectorStore(VectorStore):
                 raise RuntimeError(
                     "Qdrant embedding dimension does not match EMBEDDING_DIMENSION."
                 )
+        if self.mode == "remote":
+            collection = self.client.get_collection(self.collection)
+            payload_schema = collection.payload_schema or {}
+            filter_indexes = {
+                "organization_id": models.PayloadSchemaType.KEYWORD,
+                "owner_id": models.PayloadSchemaType.INTEGER,
+                "document_id": models.PayloadSchemaType.INTEGER,
+                "document_version_id": models.PayloadSchemaType.INTEGER,
+                "content_id": models.PayloadSchemaType.INTEGER,
+                "visibility": models.PayloadSchemaType.KEYWORD,
+                "is_deleted": models.PayloadSchemaType.BOOL,
+            }
+            for field_name, field_schema in filter_indexes.items():
+                if field_name not in payload_schema:
+                    self.client.create_payload_index(
+                        collection_name=self.collection,
+                        field_name=field_name,
+                        field_schema=field_schema,
+                        wait=True,
+                    )
         if self.mode == "local":
             self.client.close()
             self.client = None
@@ -152,7 +187,7 @@ class QdrantVectorStore(VectorStore):
             return self.client, False
         from qdrant_client import QdrantClient
 
-        return QdrantClient(path=settings.qdrant_local_path), True
+        return QdrantClient(path=self.local_path), True
 
     def upsert(self, points: list[VectorPoint]) -> None:
         if not points:
@@ -174,6 +209,7 @@ class QdrantVectorStore(VectorStore):
                         "document_id": point.document_id,
                         "document_version_id": point.version_id,
                         "version_id": point.version_id,
+                        "content_id": point.content_id,
                         "chunk_id": point.chunk_id,
                         "chunk_index": point.chunk_index,
                         "text": point.text,
@@ -219,6 +255,7 @@ class QdrantVectorStore(VectorStore):
         current_version_ids: list[int],
         limit: int,
         document_id: int | None = None,
+        score_threshold: float | None = None,
     ) -> list[dict[str, object]]:
         if not current_version_ids:
             return []
@@ -262,6 +299,8 @@ class QdrantVectorStore(VectorStore):
                 query_filter=query_filter,
                 limit=limit,
                 with_payload=True,
+                with_vectors=False,
+                score_threshold=score_threshold,
             )
         finally:
             if should_close:

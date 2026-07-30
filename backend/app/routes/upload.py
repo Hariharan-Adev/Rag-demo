@@ -21,6 +21,8 @@ from app.services.chunking import chunk_text
 from app.services.document_loader import DocumentParseError, SUPPORTED_EXTENSIONS, extract_text
 from app.services.embeddings import create_embeddings
 from app.services.folder_uploads import record_batch_result, sanitize_relative_path, validate_upload_context
+from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text
+from app.services.vector_store import VectorPoint, get_vector_store
 from app.services.workbooks import WorkbookData, extract_workbook, workbook_chunks, workbook_text
 from app.services.zip_archives import ArchiveValidationError, extract_member, inspect_archive, temporary_archive_directory
 from app.utils.audit import log_audit_event
@@ -33,7 +35,7 @@ from app.utils.file_validation import validate_file_signature
 from app.utils.rate_limit import enforce_request_limit
 from app.utils.security import SecurityValidationError, validate_chunks, validate_extracted_text
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+router = APIRouter(prefix="/documents", tags=["documents-legacy"])
 
 ALLOWED_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
 CONTENT_WAIT_SECONDS = 30.0
@@ -160,32 +162,150 @@ def _insert_document(
 ) -> tuple[int, str]:
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        user = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ?", (owner_id,)
+        ).fetchone()
+        if user is None:
+            raise ValueError("Upload owner does not exist.")
+        organization_id = str(user["organization_id"])
         display_filename = generate_unique_display_filename(connection, owner_id, original_filename)
         cursor = connection.execute(
             """
             INSERT INTO documents
                 (owner_id, original_filename, display_filename, stored_filename,
                 file_hash, content_id, is_duplicate_content, collection_id,
-                upload_batch_id, relative_path, processing_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')
+                upload_batch_id, relative_path, processing_status, organization_id,
+                visibility)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, 'private')
             """,
             (owner_id, original_filename, display_filename, stored_filename,
              file_hash, content_id, int(duplicate), collection_id, upload_batch_id,
-             relative_path),
+             relative_path, organization_id),
         )
-        return int(cursor.lastrowid), display_filename
+        document_id = int(cursor.lastrowid)
+        version_cursor = connection.execute(
+            """INSERT INTO document_versions
+               (organization_id, document_id, version_number, content_id,
+                stored_filename, file_hash, status, created_by, completed_at)
+               VALUES (?, ?, 1, ?, ?, ?, 'completed', ?, CURRENT_TIMESTAMP)""",
+            (
+                organization_id, document_id, content_id, stored_filename,
+                file_hash, owner_id,
+            ),
+        )
+        version_id = int(version_cursor.lastrowid)
+        existing_chunks = connection.execute(
+            """SELECT chunk_index, text, embedding, sheet_name, row_number, version_id,
+                      source_type, source_location_json
+               FROM chunks WHERE content_id = ? ORDER BY chunk_index""",
+            (content_id,),
+        ).fetchall()
+        if existing_chunks and existing_chunks[0]["version_id"] is not None:
+            for row in existing_chunks:
+                connection.execute(
+                    """INSERT OR IGNORE INTO chunks
+                       (content_id, chunk_index, text, embedding, sheet_name, row_number,
+                        organization_id, document_id, version_id, source_type,
+                        source_location_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        content_id, row["chunk_index"], row["text"], row["embedding"],
+                        row["sheet_name"], row["row_number"], organization_id,
+                        document_id, version_id, row["source_type"] or "text",
+                        row["source_location_json"] or "{}",
+                    ),
+                )
+        else:
+            connection.execute(
+                """UPDATE chunks SET organization_id = ?, document_id = ?,
+                   version_id = ?, source_type = COALESCE(source_type, 'text')
+                   WHERE content_id = ? AND version_id IS NULL""",
+                (organization_id, document_id, version_id, content_id),
+            )
+        connection.execute(
+            "UPDATE documents SET current_version_id = ? WHERE id = ?",
+            (version_id, document_id),
+        )
+        provenance_rows = connection.execute(
+            """SELECT id, sheet_name, row_number, source_location_json
+               FROM chunks WHERE document_id = ? AND version_id = ?""",
+            (document_id, version_id),
+        ).fetchall()
+        for provenance in provenance_rows:
+            if provenance["sheet_name"] and (
+                not provenance["source_location_json"]
+                or provenance["source_location_json"] == "{}"
+            ):
+                location = {
+                    "sheet_name": provenance["sheet_name"],
+                    "row_start": provenance["row_number"],
+                    "row_end": provenance["row_number"],
+                }
+                connection.execute(
+                    """UPDATE chunks SET source_type = 'excel',
+                       source_location_json = ? WHERE id = ?""",
+                    (dumps(location), provenance["id"]),
+                )
+    with get_connection() as connection:
+        rows = connection.execute(
+            """SELECT id, chunk_index, text, embedding, source_type,
+                      source_location_json
+               FROM chunks WHERE document_id = ? AND version_id = ?
+               ORDER BY chunk_index""",
+            (document_id, version_id),
+        ).fetchall()
+    if rows and all(
+        not row["embedding"]
+        or len(loads(row["embedding"])) == settings.embedding_dimension
+        for row in rows
+    ):
+        points = [
+            VectorPoint(
+                organization_id=organization_id,
+                owner_id=owner_id,
+                document_id=document_id,
+                version_id=version_id,
+                content_id=content_id,
+                chunk_id=int(row["id"]),
+                chunk_index=int(row["chunk_index"]),
+                vector=loads(row["embedding"]),
+                text=str(row["text"]),
+                filename=display_filename,
+                visibility="private",
+                source_type=str(row["source_type"] or "text"),
+                source_location=loads(row["source_location_json"] or "{}"),
+            )
+            for row in rows
+            if row["embedding"]
+        ]
+        get_vector_store().upsert(points)
+        with get_connection() as connection:
+            connection.executemany(
+                """UPDATE chunks
+                   SET vector_point_id = ?, indexing_status = 'completed',
+                       qdrant_indexed_at = CURRENT_TIMESTAMP
+                   WHERE id = ? AND organization_id = ?""",
+                [
+                    (point.point_id, point.chunk_id, point.organization_id)
+                    for point in points
+                ],
+            )
+    return document_id, display_filename
 
 
 def _claim_content(owner_id: int, file_hash: str, content_hash: str, text: str) -> tuple[int, bool, str]:
     """Atomically claim normalized content; uniqueness protects concurrent uploads."""
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        organization_id = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ?", (owner_id,)
+        ).fetchone()["organization_id"]
         existing = connection.execute(
             """
             SELECT id, processing_status FROM document_contents
-            WHERE owner_id = ? AND normalized_content_hash = ?
+            WHERE organization_id = ? AND owner_id = ? AND normalized_content_hash = ?
             """,
-            (owner_id, content_hash),
+            (organization_id, owner_id, content_hash),
         ).fetchone()
         if existing is not None:
             if existing["processing_status"] == "failed":
@@ -203,19 +323,21 @@ def _claim_content(owner_id: int, file_hash: str, content_hash: str, text: str) 
             cursor = connection.execute(
                 """
                 INSERT INTO document_contents
-                    (owner_id, file_hash, normalized_content_hash, extracted_text, processing_status)
-                VALUES (?, ?, ?, ?, 'processing')
+                    (owner_id, organization_id, file_hash, normalized_content_hash,
+                     extracted_text, processing_status)
+                VALUES (?, ?, ?, ?, ?, 'processing')
                 """,
-                (owner_id, file_hash, content_hash, text),
+                (owner_id, organization_id, file_hash, content_hash, text),
             )
             return int(cursor.lastrowid), True, "processing"
         except IntegrityError:
             existing = connection.execute(
                 """
                 SELECT id, processing_status FROM document_contents
-                WHERE owner_id = ? AND normalized_content_hash = ?
+                WHERE organization_id = ? AND owner_id = ?
+                  AND normalized_content_hash = ?
                 """,
-                (owner_id, content_hash),
+                (organization_id, owner_id, content_hash),
             ).fetchone()
             if existing is None:
                 raise
@@ -322,6 +444,7 @@ async def _process_document_upload(
             workbook_data = extract_workbook(
                 saved_path,
                 include_hidden=settings.include_hidden_worksheets,
+                include_very_hidden=settings.include_very_hidden_worksheets,
             )
             extracted_text = workbook_text(workbook_data, original_filename)
         else:
@@ -354,7 +477,12 @@ async def _process_document_upload(
     if should_process:
         try:
             if workbook_data is None:
-                chunk_records = [(chunk, None, None) for chunk in chunk_text(normalized_text)]
+                text_chunks = (
+                    chunk_image_text(normalized_text)
+                    if extension in IMAGE_EXTENSIONS
+                    else chunk_text(normalized_text)
+                )
+                chunk_records = [(chunk, None, None) for chunk in text_chunks]
             else:
                 chunk_records = workbook_chunks(workbook_data, original_filename)
             chunk_values = [record[0] for record in chunk_records]
@@ -454,7 +582,7 @@ def upload_config(current_user: dict[str, object] = Depends(get_current_user)) -
     }
 
 
-@router.post("/upload")
+@router.post("/upload-legacy")
 async def upload_document(
     request: Request,
     file: UploadFile = File(...),

@@ -23,6 +23,7 @@ type FolderInputAttributes = InputHTMLAttributes<HTMLInputElement> & { webkitdir
 
 interface UploadItem {
   id: string
+  idempotencyKey: string
   file: File
   relativePath: string
   validation: Validation
@@ -30,6 +31,7 @@ interface UploadItem {
   result?: UploadResponse
   archiveResult?: ZipUploadResponse
   error?: string
+  retryable?: boolean
 }
 
 const defaultConfig: UploadConfig = {
@@ -96,7 +98,9 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
       else if (file.size > (isArchive ? maxZipBytes : maxBytes)) validation = 'Too large'
       else if (knownNames.has(file.name.toLowerCase())) validation = 'Duplicate candidate'
       return {
-        id: crypto.randomUUID(), file, relativePath, validation,
+        id: crypto.randomUUID(),
+        idempotencyKey: crypto.randomUUID(),
+        file, relativePath, validation,
         status: validation === 'Unsupported' || validation === 'Too large' || validation === 'Empty' ? 'skipped' as const : 'pending' as const,
       }
     })
@@ -158,13 +162,18 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
           }, 250)
           try {
             if (extension(item.file) === '.zip' && mode === 'files') {
-              const archiveResult = await uploadZipArchive(item.file, { collectionId, signal: controller.signal })
+              const archiveResult = await uploadZipArchive(item.file, {
+                collectionId,
+                signal: controller.signal,
+                idempotencyKey: `archive:${item.idempotencyKey}`,
+              })
               setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', archiveResult } : current))
             } else {
               const result = await uploadDocument(item.file, {
                 collectionId, batchId: activeBatchId,
                 relativePath: mode === 'folder' ? item.relativePath : undefined,
                 signal: controller.signal,
+                idempotencyKey: `document:${item.idempotencyKey}`,
               })
               setItems(previous => previous.map(current => current.id === item.id ? { ...current, status: 'completed', result } : current))
             }
@@ -175,6 +184,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
               ...current,
               status: aborted ? 'cancelled' : error instanceof ApiError && error.status === 409 ? 'skipped' : 'failed',
               error: message,
+              retryable: error instanceof ApiError ? error.retryable : undefined,
             } : current))
           } finally {
             window.clearTimeout(processingTimer)
@@ -208,8 +218,8 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
   }
 
   const retryFailed = () => {
-    const failed = items.filter(item => item.status === 'failed')
-    setItems(previous => previous.map(item => item.status === 'failed' ? { ...item, status: 'pending', error: undefined } : item))
+    const failed = items.filter(item => item.status === 'failed' && item.retryable !== false)
+    setItems(previous => previous.map(item => item.status === 'failed' && item.retryable !== false ? { ...item, status: 'pending', error: undefined, retryable: undefined } : item))
     window.setTimeout(() => void runUploads(failed.map(item => ({ ...item, status: 'pending' })), false), 0)
   }
 
@@ -252,7 +262,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
           <div className="mt-3 max-h-64 overflow-auto rounded-xl border border-slate-200">
             <table className="w-full min-w-[680px] text-left text-[10px]">
               <thead className="sticky top-0 bg-slate-50 text-slate-500"><tr><th className="p-2">File</th><th className="p-2">Relative path</th><th className="p-2">Type</th><th className="p-2">Size</th><th className="p-2">Validation</th><th className="p-2">Status</th></tr></thead>
-              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
+              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.result?.content_reused ? 'restored' : item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
             </table>
           </div>
 
@@ -271,7 +281,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
 
       <div className="mt-5 flex flex-wrap justify-end gap-2">
         {uploading ? <Button variant="secondary" onClick={() => void cancel()}><X size={15} />Cancel upload</Button> : <Button variant="secondary" onClick={close}>Close</Button>}
-        {!uploading && summary.failed > 0 && <Button variant="secondary" onClick={retryFailed}><RotateCcw size={15} />Retry failed</Button>}
+        {!uploading && items.some(item => item.status === 'failed' && item.retryable !== false) && <Button variant="secondary" onClick={retryFailed}><RotateCcw size={15} />Retry failed</Button>}
         <Button onClick={() => void runUploads(readyItems)} disabled={!readyItems.length || uploading}>{uploading ? 'Processing...' : mode === 'folder' ? 'Upload folder' : 'Upload files'}</Button>
       </div>
     </Modal>

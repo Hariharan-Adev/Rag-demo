@@ -4,3 +4,448 @@
 - Change summary: added safe all-sheet Excel extraction, structured owner-scoped sheet/row storage, row-level semantic chunks, deterministic cross-sheet calculations and lists, dynamic schema/alias matching with clarification, sheet/document scope, and sheet/row citations.
 - Reason: arbitrary business workbooks must be queried across all tabs without employee-specific assumptions or top-K-based calculations.
 - Test result: `python -m unittest discover -s tests -v` passed all 51 tests; `npm run build` passed with only Vite's existing non-fatal large-chunk warning.
+## 2026-07-24 — Tenant-aware asynchronous RAG architecture
+
+- Added organization-scoped JWT context, `member`/`organization_admin` roles, centralized private/organization/direct-share ACL predicates, safe 404 denials, and document share/visibility APIs.
+- Added `202 Accepted` document, version, folder-file, image, and ZIP ingestion endpoints backed by durable idempotent jobs; the standalone worker now claims jobs atomically, recovers stale locks, batches embeddings, retries with exponential backoff and jitter, records safe terminal errors, supports cancellation/retry, and fans ZIP jobs into child document jobs.
+- Replaced application-side JSON-vector scanning with a Qdrant provider abstraction, deterministic point IDs, tenant/ACL/current-version/deletion filters, health validation, payload updates for lifecycle changes, and a safe full/tenant reindex command.
+- Added format-aware provenance for PDF pages, PowerPoint slides/shapes/notes, Word sections/paragraphs/tables, Excel sheets/rows/columns/cells/tables/formulas/hidden sheets, CSV rows, text lines, and OCR/vision image chunks.
+- Added version list/detail/make-current APIs, soft delete/restore, admin-gated hard purge, archive progress results, request/job correlation IDs, structured JSON logs, readiness and metrics endpoints, organization-scoped rate/quota keys, token/cost caps, and audit events for sensitive transitions.
+- Preserved the legacy synchronous upload and image interfaces as compatibility endpoints while the React client uses the queued APIs.
+- Validation: all 61 Python 3.12 backend tests pass, including the new tenant/job/version/ACL/archive/lifecycle and real Qdrant-filter contracts; `npm run build` passes with only Vite's existing non-fatal large-chunk warning.
+
+## 2026-07-27 14:31:12 +05:30 — Version-aware duplicate, storage, and security hardening
+
+- Change summary: made `/documents/upload` and `/ingestion-jobs/{id}` the canonical `202` asynchronous APIs; enforced same-name versioning and explicit identical-version rules; constrained normalized-content reuse to readable documents within one organization while retaining distinct chunks/vector points; added opaque organization-scoped storage keys, Office archive inspection, parser limits, production Qdrant TLS/auth checks, tenant denial logs, and per-tenant stage/lifecycle metrics.
+- Files changed: `backend/app/config.py`, `backend/app/main.py`, `backend/app/routes/ingestion.py`, `backend/app/routes/upload.py`, `backend/app/routes/documents.py`, `backend/app/routes/health.py`, `backend/app/services/document_access.py`, `backend/app/services/ingestion_jobs.py`, `backend/app/services/source_extraction.py`, `backend/app/services/storage.py`, `backend/app/services/vector_store.py`, `backend/app/utils/file_validation.py`, `backend/.env.example`, `backend/README.md`, `docker-compose.yml`, and backend tests.
+- Reason: close the remaining production requirements for duplicate/version semantics, storage isolation, bounded parsing, authenticated vector infrastructure, safe job control, and measurable ingestion stages.
+- Security impact: prevents cross-organization content reuse and storage traversal, preserves safe 404 IDOR behavior, rejects suspicious Office containers, binds development Qdrant locally, and requires HTTPS plus API authentication in production.
+- Migration impact: adds data-preserving job metric columns through migration `006_ingestion_metrics`; startup now rolls back when foreign-key or tenant ownership validation fails.
+- Tests: focused schema, full queued lifecycle, and tenant-safe duplicate/version/storage tests pass; complete regression results are recorded in the final verification entry.
+
+## 2026-07-27 14:43:47 +05:30 — Final verification
+
+- Files verified: complete backend application and test suite, canonical OpenAPI route set, frontend TypeScript application, production bundle, and repository diff whitespace.
+- Reason: production handoff gate for the multi-tenant document architecture continuation.
+- Test result: all 71 Python 3.12 backend tests passed in 399.774 seconds; after adding hard production parser termination, its four security tests plus the focused worker retry regression also passed. Python compilation passed for every changed backend module; OpenAPI contains all canonical upload/version/job routes; `npm run build` passed with 2,284 modules transformed and only Vite's existing non-fatal large-chunk warning; `git diff --check` reported no whitespace errors (only Windows CRLF conversion notices).
+- Migration/security result: legacy migration preservation, tenant ACL/IDOR denial, duplicate/version/reuse isolation, retry recovery, Office/ZIP defenses, Qdrant tenant filters, organization storage partitions, canonical safe-not-found job access, and operational metrics are covered by passing tests.
+
+## 2026-07-27 15:20:46 +05:30 — Soft-delete upgrade repair
+
+- Change summary: added lifecycle repair migration `007` so upgraded databases that recorded migration `004` before its cascade-attribution columns existed are repaired from the actual table schema.
+- Files changed: `backend/app/database.py`, `backend/tests/test_multitenant_architecture.py`.
+- Reason: live soft-delete requests returned HTTP 500 because `document_versions`, `document_contents`, and `chunks` lacked `deleted_with_document` despite the older migration ledger entry.
+- Migration impact: additive, idempotent, and data preserving; each missing column is added with a zero default, and the migration self-heals even if its own ledger entry exists but the physical schema is incomplete.
+- Security impact: restores transactional soft delete/restore behavior without weakening tenant or ownership checks.
+- Tests: the partial-upgrade repair regression and full queued lifecycle/delete/restore integration test both pass.
+
+## 2026-07-30 - Production investigation: deleted documents cannot be re-uploaded
+
+Investigation only. No backend fix was implemented.
+
+### Confirmed root cause
+
+The canonical asynchronous upload accepts the replacement with HTTP 202, but the
+worker fails after extraction and embedding and before chunk/vector indexing.
+
+1. `backend/app/routes/documents.py:448-525` soft-deletes the document, versions,
+   chunks, and orphaned content. It intentionally retains all rows and stored files.
+2. `backend/app/database.py:332-333` has the unconditional unique index
+   `idx_document_contents_owner_content_hash` on
+   `(owner_id, normalized_content_hash)`. Soft-deleted rows remain covered by it.
+3. During re-upload, `backend/app/routes/ingestion.py:143-151` ignores the deleted
+   logical document and creates a new document and placeholder content row.
+4. The worker's reuse query at
+   `backend/app/services/ingestion_jobs.py:617-647` correctly excludes deleted
+   content, versions, and documents.
+5. The worker assigns the extracted normalized hash to the new placeholder at
+   `backend/app/services/ingestion_jobs.py:664-668`. SQLite rejects this update
+   because the deleted content row still owns that hash under the unconditional
+   unique index.
+
+The exact reproduced exception is:
+
+`sqlite3.IntegrityError: UNIQUE constraint failed: document_contents.owner_id, document_contents.normalized_content_hash`
+
+The failure is content-based, not filename-based. Different bytes that normalize
+to the same extracted text fail as well.
+
+### Complete upload lifecycle
+
+1. `queue_document_upload` in `backend/app/routes/ingestion.py:66-278` authenticates
+   the user, rate-limits, sanitizes the filename, validates type/signature and size,
+   reads the upload, calculates the SHA-256 file hash, and validates collection and
+   folder context.
+2. A fresh opaque filename and organization-partitioned storage key are created.
+   The file is written before the SQL transaction.
+3. A `BEGIN IMMEDIATE` transaction resolves an explicit document or an active
+   same-owner/same-name document. Deleted documents are excluded.
+4. For an active same-name document, an active same-file-hash version is rejected
+   with HTTP 409 unless the explicit version endpoint is used.
+5. A placeholder `document_contents` row, a new logical `documents` row when
+   needed, an immutable `document_versions` row, and an `ingestion_jobs` row are
+   committed together. A queueing exception removes the newly stored file.
+6. The worker claims the job using compare-and-set state transitions, verifies the
+   stored file hash/signature, extracts structured chunks, normalizes text, and
+   creates embeddings.
+7. In one SQLite transaction the worker either reuses readable active content or
+   updates the placeholder content, replaces SQL chunks, and stores workbook
+   metadata. The confirmed failure occurs at the placeholder update, before new
+   chunks are inserted.
+8. A later step stores deterministic point IDs on chunks and upserts Qdrant points.
+9. A final SQLite transaction marks the version/job complete and changes
+   `documents.current_version_id`. Search cannot use the new version before this.
+
+No exception is silently swallowed. `process_job` logs the traceback at
+`backend/app/services/ingestion_jobs.py:850-858`, classifies the SQLite integrity
+failure as terminal `internal_processing_error`, and stores only the safe public
+message `Document processing failed.` The frontend therefore receives a safe but
+non-diagnostic error after polling.
+
+### Complete delete lifecycle
+
+Soft delete (`DELETE /documents/{id}`):
+
+- Requires tenant-scoped manage permission.
+- Calls Qdrant first and sets `deleted` and `is_deleted` payload fields to `true`;
+  it does not remove vectors.
+- In one SQLite `BEGIN IMMEDIATE` transaction, sets deletion attribution on
+  `documents`, every active `document_versions` row, and every active `chunks` row;
+  cancels queued/retry jobs; soft-deletes content no longer referenced by a live
+  version/document; and cancels queued versions.
+- Retains physical files, SQL embeddings, vector point IDs, workbook metadata,
+  audit events, permissions, and ingestion history.
+- Returns `file_deleted: false` and explicitly reports retention.
+
+Restore clears lifecycle fields only for successfully completed versions and their
+cascade-deleted chunks/content, then marks Qdrant payloads active.
+
+Hard delete (`DELETE /documents/{id}/hard`) is disabled by default and admin-only.
+It physically deletes Qdrant points, chunks, jobs, permissions, versions, the
+document, unreferenced content (with cascading workbook metadata), and finally
+local stored files.
+
+### Transaction and failure integrity
+
+The SQLite portions of soft delete use a transaction, but the full delete is not
+atomic across Qdrant and SQLite:
+
+- Qdrant is updated before SQLite.
+- A handled SQLite exception attempts a compensating Qdrant update.
+- There is no durable outbox, retry, or reconciliation job for vector lifecycle
+  changes.
+- A process crash between Qdrant and SQLite can leave an active SQL document hidden
+  in Qdrant. A failed compensation can also leave inconsistent state.
+- Hard delete has larger partial-failure windows because Qdrant deletion precedes
+  SQL deletion and file deletion follows the SQL commit.
+
+Upload is staged rather than globally atomic. SQL chunk persistence commits before
+Qdrant upsert so retry can resume. This permits recoverable SQL chunks without
+vectors after a transient vector failure and possible vectors for an unactivated
+version if final SQL activation fails. The confirmed uniqueness failure is
+transactional: the placeholder/hash update rolls back and no chunks or vectors are
+created for that failed version.
+
+### Duplicate detection findings
+
+- Transport retry detection: caller-provided idempotency key, scoped by
+  organization.
+- Same logical document detection: case-insensitive original/display filename,
+  scoped to the authenticated organization and owner, active documents only.
+- Identical active version detection: raw file SHA-256 within that logical
+  document, excluding deleted/cancelled versions.
+- Cross-filename content reuse: normalized extracted-text SHA-256, limited to
+  completed, active content referenced by an active readable document in the same
+  organization. Readability is owner, organization visibility, or organization
+  admin. It does not cross organizations.
+- The intended active-only reuse predicate is correct. The database uniqueness
+  rule is not lifecycle-aware and contradicts it.
+- Stored filename is random and is not used for duplicate detection.
+
+### Reproduction results
+
+All tests used isolated temporary databases, the real API/worker state machine,
+the real schema, a fake vector provider, deterministic embeddings, valid preflight
+signatures, and deterministic extraction. No production rows were modified.
+
+| After successful soft delete | Upload HTTP | Worker result |
+| --- | ---: | --- |
+| Same filename, same content | 202 | Failed: `internal_processing_error` |
+| Same filename, different content | 202 | Completed |
+| Different filename, same content | 202 | Failed: `internal_processing_error` |
+| Different filename, different content | 202 | Completed |
+| Different bytes, same normalized text | 202 | Failed: `internal_processing_error` |
+| Same TXT | 202 | Failed |
+| Same PDF | 202 | Failed |
+| Same DOCX | 202 | Failed |
+| Same XLSX | 202 | Failed |
+| Same PPTX | 202 | Failed |
+| Same PNG/image | 202 | Failed |
+
+The format matrix isolates lifecycle/persistence behavior; parser correctness was
+not under test. The failure is format-independent because all formats converge on
+the same normalized-hash update.
+
+### Logging findings
+
+- Worker tracebacks contain the exact SQLite exception and job correlation ID.
+- Persisted jobs expose only `internal_processing_error` and
+  `Document processing failed.`, which is safe but not operationally specific.
+- The inspected local database has 8 failed ingestion jobs with that generic code.
+  Six have a raw file hash matching a deleted same-owner document; the currently
+  non-deleted failed record matches both the name and bytes of a deleted document.
+- Historical API logs also contain a separate `deleted_with_document` missing-column
+  delete failure. Current schema includes the repaired columns and later logs show
+  successful deletes, so it is not the current re-upload cause.
+- Vector lifecycle failures are logged only through request exceptions. There is
+  no persisted lifecycle-operation state, retry count, or reconciliation result.
+
+### Storage and vector findings
+
+- Storage is local filesystem storage under an opaque organization partition;
+  no object-storage implementation is present.
+- Soft delete deliberately retains files. In the inspected environment all 31
+  version rows had a physical file; this includes all 29 versions belonging to
+  deleted documents and all 8 failed versions.
+- A worker failure does not remove the accepted upload, so every failed re-upload
+  consumes another stored object.
+- Regular upload writes directly to its final opaque key. Queue transaction failure
+  removes it. ZIP extraction uses a self-cleaning server-controlled temporary
+  directory.
+- Soft delete does not remove vectors; it marks payloads deleted. Unit/integration
+  vector contracts verify deleted points are excluded and can be restored.
+- The local Qdrant endpoint was unavailable during the investigation, so actual
+  point payload state could not be verified without making an assumption. SQL
+  retains vector IDs for 906 deleted chunks.
+- There is no vector-deletion retry for soft delete. Hard delete uses physical
+  Qdrant deletion with no retry/reconciliation record.
+
+### Additional issues discovered
+
+1. `initialize_database` calls `_create_indexes` before ledgered migrations on
+   every startup (`backend/app/database.py:944-953`). `_create_indexes` recreates
+   the obsolete unique index `idx_chunks_content_chunk_index` on
+   `(content_id, chunk_index)`, while migration 002 replaced it with
+   `(content_id, version_id, chunk_index)`. The inspected database contains both.
+   After a restart, active cross-filename content reuse can therefore collide when
+   creating the new version's chunks. Fresh one-start tests do not detect this.
+2. Failed initial uploads leave visible logical documents with a failed version,
+   pending placeholder content, and retained files. Repeated retry in the UI cannot
+   succeed for this terminal constraint violation and can accumulate records/files
+   when the user starts fresh upload actions.
+3. Re-uploading a deleted filename receives a suffixed display filename because
+   `idx_documents_owner_display_filename` also includes deleted rows and the name
+   generator intentionally considers all rows. It does not cause the reported
+   failure, but it is a lifecycle/UX side effect.
+4. Workbook metadata has no independent soft-delete columns. It remains reachable
+   through retained soft-deleted content; this is retained data, not a broken
+   foreign-key orphan.
+
+### Recommended production fix (not implemented)
+
+Preferred policy: keep historical soft-deleted content restorable, but make active
+content identity lifecycle-aware and tenant-aware.
+
+1. Add an idempotent migration that drops
+   `idx_document_contents_owner_content_hash` and creates an active-only partial
+   unique index using the chosen ownership policy, preferably
+   `(organization_id, owner_id, normalized_content_hash) WHERE deleted_at IS NULL`.
+   If content reuse is intended at organization scope rather than owner scope,
+   align both the unique key and authorization/reuse query to that explicit policy.
+2. In the same migration, permanently remove
+   `idx_chunks_content_chunk_index`; stop `_create_indexes` from recreating it; and
+   retain only the version-aware uniqueness rule.
+3. Keep the worker reuse query active-only. Add explicit handling for the narrow
+   uniqueness race: re-read the winning active content under the same tenant/ACL
+   policy or return a stable duplicate-conflict code. Do not expose hashes, SQL,
+   storage paths, or cross-tenant existence.
+4. Add regression tests that initialize the same database twice and cover
+   delete/re-upload, normalized-equivalent bytes, active content reuse, different
+   users/organizations, restore after replacement upload, concurrent uploads, all
+   supported format routes, and hard-delete cleanup.
+5. Introduce a durable outbox/reconciliation state for Qdrant lifecycle changes,
+   with bounded retries and alerting. Search must continue to enforce SQL
+   active/current-version predicates as defense in depth.
+6. Add a stable safe public code such as `content_identity_conflict` only if the
+   condition remains possible after the migration. Keep detailed SQLite/provider
+   text server-side.
+7. Plan a cleanup migration/job for pre-existing failed placeholder
+   documents/content/files only after establishing retention and audit policy.
+   Do not delete historical or customer data automatically.
+
+Risks and compatibility:
+
+- A partial unique index is supported by SQLite and preserves soft-deleted history,
+  restore, audit, and search exclusion.
+- Restore can conflict if a replacement active content row now owns the same
+  identity. The restore endpoint needs a defined conflict policy (reject restore,
+  merge references, or retire the replacement); it must not silently reactivate
+  two active identities.
+- Existing active duplicate rows must be audited before creating the new index.
+- Search behavior should be unchanged because only completed active current
+  versions are retrieved. Reindexing is not required for the hash-index migration.
+- Removing the obsolete chunk index restores the documented per-version chunk and
+  deterministic-point design; it may expose previously blocked reuse paths, so
+  concurrency and ACL regression tests are mandatory.
+- API shape can remain backward compatible: upload still returns 202 and job
+  polling remains the completion contract.
+
+### Verification performed
+
+- Isolated delete/re-upload matrix: 11 scenarios completed and reproduced the
+  expected content-dependent failure/success split.
+- Exact server traceback captured for every same-normalized-content failure.
+- Existing focused regressions passed:
+  `tests.test_qdrant_vector_store` and
+  `MultitenantArchitectureTests.test_duplicate_versioning_reuse_and_storage_are_tenant_safe`
+  (2 tests, 26.347 seconds).
+- `PRAGMA integrity_check` and `PRAGMA foreign_key_check` passed on the inspected
+  database.
+- `git diff --check` passed for all three investigation reports.
+
+### Files inspected
+
+- Backend lifecycle: `backend/app/routes/ingestion.py`,
+  `backend/app/services/ingestion_jobs.py`, `backend/app/routes/documents.py`,
+  `backend/app/services/document_access.py`, `backend/app/worker.py`.
+- Persistence/storage/vector: `backend/app/database.py`,
+  `backend/app/services/storage.py`, `backend/app/services/vector_store.py`,
+  `backend/app/services/vector_search.py`, `backend/app/services/zip_archives.py`.
+- Validation/extraction: `backend/app/utils/document_content.py`,
+  `backend/app/utils/file_validation.py`,
+  `backend/app/services/source_extraction.py`,
+  `backend/app/services/document_loader.py`.
+- Logging/configuration: `backend/app/utils/observability.py`,
+  `backend/app/utils/audit.py`, `backend/app/config.py`, `backend/app/main.py`,
+  `backend/README.md`, root `README.md`.
+- Tests: `backend/tests/test_multitenant_architecture.py`,
+  `backend/tests/test_document_duplicates.py`,
+  `backend/tests/test_qdrant_vector_store.py`,
+  `backend/tests/test_document_parsers.py`,
+  `backend/tests/test_image_upload.py`.
+- Runtime evidence: read-only SQLite inspection of `backend/data/rag_new.db`,
+  storage existence/count checks under `backend/data/uploads`, and backend API/
+  worker logs under `backend/data`. No document text, secret, token, or hash value
+  was copied into this report.
+- Frontend files are listed in `changes/changes_frontend`.
+- `Rag-demo` is a Git submodule and was not treated as the root production source.
+
+## 2026-07-30 11:38:13 +05:30 — Deleted-document re-upload fix
+
+### Summary and root cause addressed
+
+- Files modified: `backend/app/services/ingestion_jobs.py`,
+  `backend/app/routes/ingestion.py`, `backend/app/routes/documents.py`, and
+  `backend/tests/test_multitenant_architecture.py`.
+- Re-upload failed after extraction, before chunk creation and vector indexing,
+  because the worker tried to assign a deleted row's normalized hash to a new
+  active placeholder while SQLite still enforced unconditional owner/hash
+  uniqueness.
+- The worker now resolves normalized content identity before embedding generation.
+  Active identical content is rejected with `DOCUMENT_ALREADY_EXISTS`; compatible
+  deleted content is deterministically selected by lowest content ID and safely
+  reused; incompatible historical content follows normal ingestion.
+
+### Implementation details
+
+- Added one owner- and organization-scoped duplicate resolver with explicit
+  `active_duplicate`, `active_reuse`, `deleted_reuse`, `deleted_rebuild`, and
+  `new` outcomes.
+- Deleted chunks are reused only when chunk count, ordered text, source type,
+  embedding model, dimension, and stored vector shape are compatible.
+- A deleted canonical content row is reactivated in the same `BEGIN IMMEDIATE`
+  transaction that links the new version, removes its unused placeholder, and
+  creates version-scoped chunks. Historical versions, chunks, files, audit rows,
+  and workbook metadata remain intact.
+- Reused embeddings receive new deterministic point IDs for the new document and
+  version. Qdrant upserts are idempotent. Missing points are rebuilt on retry from
+  persisted chunks without extraction or embedding regeneration.
+- Missing or incompatible embeddings rebuild only the embedding/vector layer.
+  A completed version is not exposed until vector upsert succeeds.
+- Successful deleted-content reuse records `document.reupload.reused` and returns
+  a safe result message. Active duplicate failures return
+  `DOCUMENT_ALREADY_EXISTS`, are terminal, and retire the unused queued
+  document/version/content placeholder without deleting history.
+- Job reads, retry, and cancellation are strictly owner-scoped. Restore resolves
+  identity using the document owner's scope and rejects a conflict instead of
+  creating two active canonical rows.
+- Failure logs include job, owner, document, version, stage, and safe error class;
+  document text, hashes, SQL, paths, tokens, and provider internals are not
+  returned to clients.
+
+### Security and transaction considerations
+
+- All content resolution and job operations use server-derived owner and
+  organization identifiers and parameterized values. Client hashes are never
+  trusted.
+- Existing upload validation, parser limits, normalized-text calculation, and
+  safety scanning remain in the canonical worker path.
+- `BEGIN IMMEDIATE`, the active-only unique index, and explicit integrity-error
+  classification provide the race boundary for simultaneous identical uploads.
+- SQLite and Qdrant cannot share a transaction; durable processing state plus
+  deterministic point IDs makes vector upsert retry-safe.
+
+### Tests and verification
+
+- Added regression coverage for delete/re-upload with the same and different
+  names, active duplicates, different-content versioning, cross-user isolation,
+  embedding/chunk reuse, missing-embedding rebuild, missing-vector recovery,
+  repeated job execution, restart-safe indexes, migration conflicts, search, and
+  chat citations.
+- Added a TXT/PDF/DOCX/XLSX/PPTX/PNG lifecycle matrix. Existing parser tests
+  continue to verify format-specific parsing and source provenance.
+- Full backend result:
+  `.venv312\Scripts\python.exe -m unittest discover -s tests -v` —
+  82 tests passed in 271.224 seconds after the final owner-scope change.
+- Search returned only the replacement active document, chat cited that document,
+  active duplicate rejection remained terminal, and valid reuse did not call the
+  embedding generator.
+
+### Rollback notes and remaining risk
+
+- Application rollback requires rolling back these worker/route changes together
+  with the database index migration. Restore the pre-deployment database backup
+  before starting the older application because the older startup code recreates
+  obsolete indexes.
+- Do not automatically delete retained files, historical content, or audit rows.
+- Qdrant remains an external system without a transactional outbox. Retry-safe
+  upserts cover ingestion failures, but delete/restore reconciliation should
+  eventually receive durable operational tracking.
+
+## 2026-07-30 12:13:31 +05:30 — Qdrant mode and configurable retrieval policy
+
+- Files modified: `backend/app/config.py`,
+  `backend/app/services/vector_store.py`,
+  `backend/app/services/vector_search.py`, `backend/app/services/rag_service.py`,
+  `backend/.env.example`, `backend/README.md`, and `backend/tests/test_chat.py`.
+- Existing architecture confirmed: `qdrant-client==1.18.0` was already pinned;
+  ingestion stores extracted chunks and provenance in SQLite; one Qdrant
+  collection stores embeddings and searchable payloads; and vector queries
+  enforce organization, owner/visibility, deletion, and current-version filters.
+- Added backward-compatible `QDRANT_MODE` selection with `auto`, `local`,
+  `remote`, and `memory`. `QDRANT_PATH` is the preferred persistent local path;
+  `QDRANT_LOCAL_PATH` remains supported. Production continues to require remote
+  Qdrant over HTTPS with an API key.
+- Remote collections now create idempotent payload indexes for
+  `organization_id`, `owner_id`, `document_id`, `document_version_id`,
+  `visibility`, and `is_deleted`, matching the multitenant query predicates.
+- Added validated `RAG_RETRIEVAL_LIMIT`, `RAG_FINAL_CONTEXT_LIMIT`, and
+  `RAG_MIN_SCORE` settings. Chat retrieves 15 candidates by default, removes
+  results below 0.35, and sends at most 5 chunks to the LLM.
+- No reranker was added because it is optional and no evaluated reranking model
+  or corpus benchmark was supplied. The extension point remains between
+  candidate retrieval and final context slicing.
+- `EMBEDDING_DIMENSION` remains configuration-driven. Collection startup and
+  every upsert reject vectors that do not match it; no dimension was newly
+  hard-coded.
+- Security: tenant/ACL filtering stays inside the Qdrant query, and the
+  application also obtains authorized current version IDs from SQLite before
+  vector search.
+- Verification: full backend command
+  `.venv312\Scripts\python.exe -m unittest discover -s tests -v` passed all
+  83 tests in 220.783 seconds. The new test verifies the 15-candidate,
+  score-threshold, 5-context contract. Python compilation and
+  `git diff --check` passed.
+- Rollback: revert the seven files above and remove the new environment values.
+  No SQLite or Qdrant data migration is required; payload indexes may remain
+  safely because they do not change point data or query semantics.

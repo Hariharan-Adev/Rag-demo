@@ -20,6 +20,7 @@ class SearchRequest(BaseModel):
     limit: int = Field(default=3, ge=1, le=10)
     collection_id: int | None = Field(default=None, gt=0)
     document_id: int | None = Field(default=None, gt=0)
+    version_id: int | None = Field(default=None, gt=0)
 
 
 @router.post("")
@@ -59,14 +60,29 @@ def search_documents(
         {
             "chunk_id": result["chunk_id"],
             "document_id": result["document_id"],
+            "version_id": result["version_id"],
             "filename": result["filename"],
             "referencing_filenames": result["referencing_filenames"],
             "sheet_name": result["sheet_name"],
             "row_number": result["row_number"],
-            "score": result["score"],
+            "source_type": result["source_type"],
+            "source_location": result["source_location"],
+            "location": {
+                "source_type": result["source_type"],
+                **result["source_location"],
+            },
+            "retrieval_score": result["score"],
+            "text": result["content"],
             "preview": make_preview(str(result["content"])),
         }
-        for result in search_chunks(query, int(current_user["id"]), request.limit, request.collection_id, request.document_id)
+        for result in search_chunks(
+            query,
+            int(current_user["id"]),
+            request.limit,
+            request.collection_id,
+            request.document_id,
+            version_id=request.version_id,
+        )
     ]
 
     log_audit_event(

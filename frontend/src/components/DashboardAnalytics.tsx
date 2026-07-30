@@ -4,15 +4,15 @@ import { useApp } from '../context/AppContext'
 import { Card } from './ui/Card'
 
 export default function DashboardAnalytics() {
-  const { documents, messages, confidence, recentQuestions, setSidebarOpen } = useApp()
+  const { documents, messages, retrievedDocuments, recentQuestions, setSidebarOpen } = useApp()
   const questionCount = messages.filter(message => message.role === 'user').length
   const cards = [
     ['Indexed Documents', documents.length, BookOpen, 'text-blue-600 bg-blue-50'],
     ['Questions Asked', questionCount, MessageSquareText, 'text-purple-600 bg-purple-50'],
     ['Documents Uploaded', documents.length, FileUp, 'text-amber-600 bg-amber-50'],
-    ['Latest Source Score', `${confidence || 0}%`, TrendingUp, 'text-emerald-600 bg-emerald-50'],
+    ['Sources in Latest Answer', retrievedDocuments.length, TrendingUp, 'text-emerald-600 bg-emerald-50'],
   ] as const
-  const bars = [20, 45, 35, 70, 55, 80, Math.max(12, confidence)]
+  const bars = [20, 45, 35, 70, 55, 80, Math.max(12, Math.min(100, retrievedDocuments.length * 12))]
 
   return (
     <motion.section initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} className="min-w-0 flex-1 overflow-y-auto bg-[#f8fafc] p-5 sm:p-7">

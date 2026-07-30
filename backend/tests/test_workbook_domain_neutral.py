@@ -17,6 +17,8 @@ from starlette.requests import Request
 from app import database
 from app.routes import upload
 from app.services import vector_search
+from app.services import vector_store
+from app.services.vector_store import reset_vector_store_for_tests
 from app.services.workbook_analysis import analyze_workbook_question
 
 
@@ -52,6 +54,7 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.upload_path = root / "uploads"
         self.stack = ExitStack()
         self.stack.enter_context(patch.object(database, "DATABASE_PATH", self.database_path))
+        self.stack.enter_context(patch.object(vector_store.settings, "qdrant_local_path", ""))
         self.stack.enter_context(patch.object(upload, "UPLOAD_DIRECTORY", self.upload_path))
         self.stack.enter_context(patch.object(upload, "enforce_request_limit", lambda *args, **kwargs: None))
         self.stack.enter_context(patch.object(upload, "log_audit_event", lambda **kwargs: None))
@@ -60,12 +63,14 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
                 upload,
                 "create_embeddings",
                 lambda chunks: [
-                    [1.0, 0.0] if "FINAL_ONLY" in chunk else [0.0, 1.0]
+                    ([1.0, 0.0] if "FINAL_ONLY" in chunk else [0.0, 1.0])
+                    + [0.0] * 382
                     for chunk in chunks
                 ],
             )
         )
         database.initialize_database()
+        reset_vector_store_for_tests()
         with database.get_connection() as connection:
             connection.executemany(
                 "INSERT INTO users (id, email, password_hash) VALUES (?, ?, 'hash')",
@@ -176,7 +181,7 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
             ],
             "projects.xlsx",
         )
-        with patch.object(vector_search, "create_embeddings", return_value=[[1.0, 0.0]]):
+        with patch.object(vector_search, "create_embeddings", return_value=[[1.0, 0.0] + [0.0] * 382]):
             matches = vector_search.search_chunks(
                 "FINAL_ONLY",
                 owner_id=1,

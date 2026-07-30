@@ -32,6 +32,9 @@ def enforce_request_limit(
 
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        organization_id = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()["organization_id"]
 
         for scope in scopes:
             row = connection.execute(
@@ -39,8 +42,9 @@ def enforce_request_limit(
                 SELECT request_count
                 FROM rate_limit_windows
                 WHERE scope = ? AND endpoint = ? AND window_start = ?
+                  AND organization_id = ?
                 """,
-                (scope, endpoint, window_start),
+                (scope, endpoint, window_start, organization_id),
             ).fetchone()
 
             if row is not None and row["request_count"] >= maximum:
@@ -52,12 +56,12 @@ def enforce_request_limit(
                 connection.execute(
                     """
                     INSERT INTO rate_limit_windows
-                        (scope, endpoint, window_start, request_count)
-                    VALUES (?, ?, ?, 1)
-                    ON CONFLICT(scope, endpoint, window_start)
+                        (scope, endpoint, window_start, request_count, organization_id)
+                    VALUES (?, ?, ?, 1, ?)
+                    ON CONFLICT(organization_id, scope, endpoint, window_start)
                     DO UPDATE SET request_count = request_count + 1
                     """,
-                    (scope, endpoint, window_start),
+                    (scope, endpoint, window_start, organization_id),
                 )
 
     if blocked:
@@ -82,26 +86,39 @@ def reserve_groq_call(user_id: int, client_ip: str = "") -> None:
 
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        organization_id = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()["organization_id"]
 
         row = connection.execute(
             """
-            SELECT request_count FROM llm_usage
-            WHERE user_id = ? AND usage_date = ?
+            SELECT request_count, prompt_tokens, completion_tokens FROM llm_usage
+            WHERE user_id = ? AND usage_date = ? AND organization_id = ?
             """,
-            (user_id, usage_date),
+            (user_id, usage_date, organization_id),
         ).fetchone()
 
-        if row is not None and row["request_count"] >= settings.groq_calls_per_day:
-            blocked = True
+        if row is not None:
+            token_total = int(row["prompt_tokens"]) + int(row["completion_tokens"])
+            estimated_cost = (
+                int(row["prompt_tokens"]) * settings.groq_prompt_cost_per_million
+                + int(row["completion_tokens"]) * settings.groq_completion_cost_per_million
+            ) / 1_000_000
+            blocked = (
+                int(row["request_count"]) >= settings.groq_calls_per_day
+                or token_total >= settings.groq_daily_token_budget
+                or estimated_cost >= settings.groq_daily_cost_cap_usd
+            )
         else:
             connection.execute(
                 """
-                INSERT INTO llm_usage (user_id, usage_date, request_count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(user_id, usage_date)
+                INSERT INTO llm_usage
+                    (user_id, usage_date, request_count, organization_id)
+                VALUES (?, ?, 1, ?)
+                ON CONFLICT(organization_id, user_id, usage_date)
                 DO UPDATE SET request_count = request_count + 1
                 """,
-                (user_id, usage_date),
+                (user_id, usage_date, organization_id),
             )
 
     if blocked:
@@ -128,13 +145,19 @@ def record_groq_tokens(
     usage_date = datetime.now(timezone.utc).date().isoformat()
 
     with get_connection() as connection:
+        organization_id = connection.execute(
+            "SELECT organization_id FROM users WHERE id = ?", (user_id,)
+        ).fetchone()["organization_id"]
         connection.execute(
             """
             UPDATE llm_usage
             SET
                 prompt_tokens = prompt_tokens + ?,
                 completion_tokens = completion_tokens + ?
-            WHERE user_id = ? AND usage_date = ?
+            WHERE organization_id = ? AND user_id = ? AND usage_date = ?
             """,
-            (prompt_tokens, completion_tokens, user_id, usage_date),
+            (
+                prompt_tokens, completion_tokens, organization_id,
+                user_id, usage_date,
+            ),
         )

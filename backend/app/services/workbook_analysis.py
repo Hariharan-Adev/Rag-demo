@@ -10,6 +10,7 @@ from html import escape
 import re
 
 from app.database import get_connection
+from app.services.document_access import READABLE_DOCUMENT_SQL
 
 
 ANALYTICAL_PATTERNS = (
@@ -110,17 +111,28 @@ def _load_scopes(
     document_id: int | None,
 ) -> list[WorkbookScope]:
     with get_connection() as connection:
+        user = connection.execute(
+            "SELECT organization_id, role FROM users WHERE id = ? AND deleted_at IS NULL",
+            (owner_id,),
+        ).fetchone()
+        if user is None:
+            return []
         documents = connection.execute(
-            """
+            f"""
             SELECT DISTINCT d.id, d.display_filename, d.content_id
             FROM documents d
             JOIN workbook_sheets ws ON ws.content_id = d.content_id
-            WHERE d.owner_id = ? AND ws.owner_id = ?
+            WHERE {READABLE_DOCUMENT_SQL}
+              AND ws.organization_id = ?
               AND (? IS NULL OR d.collection_id = ?)
               AND (? IS NULL OR d.id = ?)
             ORDER BY d.id
             """,
-            (owner_id, owner_id, collection_id, collection_id, document_id, document_id),
+            (
+                user["organization_id"], owner_id, owner_id,
+                user["organization_id"],
+                collection_id, collection_id, document_id, document_id,
+            ),
         ).fetchall()
         scopes: list[WorkbookScope] = []
         for document in documents:
@@ -128,10 +140,10 @@ def _load_scopes(
                 """
                 SELECT id, name
                 FROM workbook_sheets
-                WHERE content_id = ? AND owner_id = ? AND status = 'processed'
+                WHERE content_id = ? AND organization_id = ? AND status = 'processed'
                 ORDER BY sheet_index
                 """,
-                (document["content_id"], owner_id),
+                (document["content_id"], user["organization_id"]),
             ).fetchall()
             rows: list[RowRecord] = []
             for sheet in sheets:
@@ -139,10 +151,10 @@ def _load_scopes(
                     """
                     SELECT row_number, values_json
                     FROM workbook_rows
-                    WHERE sheet_id = ? AND content_id = ? AND owner_id = ?
+                    WHERE sheet_id = ? AND content_id = ? AND organization_id = ?
                     ORDER BY row_number
                     """,
-                    (sheet["id"], document["content_id"], owner_id),
+                    (sheet["id"], document["content_id"], user["organization_id"]),
                 ).fetchall()
                 rows.extend(
                     RowRecord(
@@ -290,9 +302,16 @@ def _sources(scope: WorkbookScope, sheets: list[str], rows: list[RowRecord] | No
         {
             "document_id": scope.document_id,
             "filename": scope.filename,
+            "source_type": "excel",
+            "source_location": {
+                "sheet_name": sheet,
+                "row_start": row_lookup.get(sheet),
+                "row_end": row_lookup.get(sheet),
+            },
+            # Deprecated response aliases retained for older clients.
             "sheet_name": sheet,
             "row_number": row_lookup.get(sheet),
-            "score": 1.0,
+            "retrieval_score": None,
         }
         for sheet in sheets
     ]

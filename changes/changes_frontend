@@ -15,3 +15,99 @@
 - Change summary: chat requests can include a selected document ID; chat sources accept document, worksheet, and row metadata; source cards display sheet and row citations and open the cited uploaded document by ID.
 - Reason: workbook answers need visible tab-level evidence and must remain within the selected workbook boundary.
 - Test result: `npm run build` passed TypeScript checking and the Vite production build; Vite reported its existing non-fatal large-chunk warning.
+## 2026-07-24 — Queued ingestion, versions, restoration, and structured citations
+
+- Switched individual, folder-file, image, and ZIP uploads to the asynchronous `/api` job endpoints with idempotency keys, polling, terminal failure details, automatic failed-job retry, cancellation-aware UI state, and ZIP child-job progress.
+- Added document version history, current-version state, new-version upload, and make-current controls to the document preview.
+- Added a recently deleted section and restore action to the document library; regular delete now reflects server-side soft deletion.
+- Updated source contracts and cards to display structured page, slide, sheet, cell, and row locations.
+- Renamed score language to “retrieval similarity” and explicitly states that vector similarity is not factual confidence.
+- Preserved the existing visual system and upload concurrency controls.
+
+## 2026-07-27 14:31:12 +05:30 — Canonical asynchronous API compatibility
+
+- Change summary: no visual behavior changed; the existing job-aware client continues to use supported `/api` compatibility aliases while the backend now also exposes canonical unprefixed asynchronous upload, version, and ingestion-job endpoints.
+- Files changed: no additional frontend files in this continuation.
+- Reason: retain the shipped queued upload/version UX while stabilizing the public API contract.
+- Migration/security impact: none in the browser; tenant identity and ACL decisions remain server-resolved.
+- Tests: TypeScript and production-build results are recorded in the final verification entry.
+
+## 2026-07-27 14:43:47 +05:30 — Final frontend verification
+
+- Files verified: complete TypeScript source tree and production Vite bundle.
+- Reason: ensure backend contract hardening did not regress queued upload, job polling, version history, restoration, or structured citations.
+- Test result: `npm run build` passed TypeScript project compilation and the Vite production build; 2,284 modules transformed. The only notice is the existing non-fatal bundle chunk-size warning.
+- Migration/security result: no client migration required; organization, ownership, visibility, and ACL values remain server-authoritative.
+
+## 2026-07-30 - Deleted-document re-upload frontend investigation
+
+Investigation only. No frontend fix was implemented.
+
+### Findings
+
+- `frontend/src/services/api.ts:246-277` creates a fresh idempotency key per upload
+  action, submits to `/api/documents/upload`, polls the ingestion job, and converts
+  a failed job into an `ApiError`.
+- The fresh-key behavior is correct and prevents re-selecting a deleted file from
+  replaying the old completed job.
+- The queue request returns HTTP 202. The actual failure is asynchronous in the
+  backend worker, so it is not available in the initial upload response.
+- The backend returns only `internal_processing_error` and
+  `Document processing failed.` for the confirmed SQLite failure.
+- `frontend/src/components/UploadDocumentsModal.tsx:150-190` displays that safe
+  generic message, marks the item failed, and offers Retry Failed.
+- Retrying starts another upload action. Because the database constraint is
+  deterministic and terminal, retry cannot resolve it and may add another failed
+  document/version/content row and retained stored file.
+- HTTP 409 is treated as skipped/duplicate, but this incident is reported as a
+  polled HTTP-422-style `ApiError`, so the UI correctly labels it failed rather
+  than duplicate.
+- Delete calls `DELETE /documents/{id}` and refreshes the library. The recently
+  deleted list exposes restore. No frontend cache or filename check blocks
+  re-upload.
+- Error parsing for immediate API failures expects a string `detail`; job failures
+  use the separate structured job error path and are handled.
+
+### Frontend impact of the recommended backend fix
+
+- No API shape change is required. Upload can remain 202 plus polling.
+- On successful backend correction, same-content re-upload should complete and the
+  existing UI will show success.
+- If a stable lifecycle conflict code is introduced, map it to an actionable,
+  non-sensitive message and do not expose content hashes, deleted-document IDs,
+  owner existence, SQL text, or storage keys.
+- Disable or relabel automatic retry for terminal non-retryable job codes. Retry
+  should remain available for explicitly transient dependency failures.
+- Add an end-to-end UI test for delete, re-select the same file, polling completion,
+  and library refresh.
+
+### Files inspected
+
+- `frontend/src/services/api.ts`
+- `frontend/src/components/UploadDocumentsModal.tsx`
+- `frontend/src/components/LibraryModal.tsx`
+- `frontend/src/components/DocumentDeleteModal.tsx`
+- `frontend/src/context/AppContext.tsx`
+- `frontend/src/types/index.ts`
+
+## 2026-07-30 11:38:13 +05:30 — Re-upload status and structured errors
+
+- Files modified: `frontend/src/services/api.ts` and
+  `frontend/src/components/UploadDocumentsModal.tsx`.
+- The API client now parses safe structured `detail` objects and preserves
+  `code` and `retryable` on `ApiError`. Polled job failures use the same fields;
+  raw database/provider errors are never rendered.
+- Completed deleted-content reuse uses the backend result message and
+  `content_reused` flag. The upload table labels that result `restored`.
+- `DOCUMENT_ALREADY_EXISTS` displays the backend's clear safe message and is not
+  offered as a retryable upload. Retry Failed remains available for transient or
+  unspecified failures.
+- Polling, cancellation, upload concurrency, and the existing visual design are
+  unchanged.
+- Security: the client receives no normalized hash, deleted-document identity,
+  internal path, SQL, stack trace, or vector-provider detail.
+- Verification: `npm run build` passed TypeScript compilation and the production
+  Vite build with 2,284 modules transformed. The existing non-fatal bundle
+  chunk-size warning remains.
+- Rollback: revert both frontend files together; no browser data migration or
+  persisted-state cleanup is required.
