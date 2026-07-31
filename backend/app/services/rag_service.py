@@ -1,12 +1,14 @@
 """RAG orchestration: retrieve context and generate an answer."""
 
 from app.config import settings
+from app.prompts.rag_prompt import UNAVAILABLE_ANSWER
 from app.services.groq_client import generate_answer
 from app.services.vector_search import search_chunks
 from app.services.workbook_analysis import (
     analyze_workbook_question,
     has_structured_workbook,
     is_analytical_question,
+    is_structured_lookup_question,
 )
 from app.utils.audit import log_audit_event
 from app.utils.rate_limit import record_groq_tokens, reserve_groq_call
@@ -21,10 +23,21 @@ def answer_question(
     version_id: int | None = None,
 ) -> dict[str, object]:
     """Route calculations to structured rows and details to semantic retrieval."""
-    if version_id is None and is_analytical_question(question) and has_structured_workbook(
-        user_id,
-        collection_id,
-        document_id,
+    structured_available = (
+        version_id is None
+        and has_structured_workbook(user_id, collection_id, document_id)
+    )
+    structured_lookup = (
+        structured_available
+        and is_structured_lookup_question(
+            question,
+            user_id,
+            collection_id,
+            document_id,
+        )
+    )
+    if structured_available and (
+        is_analytical_question(question) or structured_lookup
     ):
         result = analyze_workbook_question(
             question,
@@ -32,16 +45,30 @@ def answer_question(
             collection_id=collection_id,
             document_id=document_id,
         )
+        question_type = str(result.get("question_type") or "analytical")
+        if (
+            question_type == "structured_lookup"
+            and result.get("matched_row_count") == 0
+        ):
+            audit_outcome = "structured_no_match"
+        elif question_type == "structured_lookup":
+            audit_outcome = "structured_lookup"
+        elif question_type == "clarification":
+            audit_outcome = "structured_clarification"
+        else:
+            audit_outcome = "structured_analysis"
         log_audit_event(
             event_type="chat.request",
             endpoint="chat",
-            outcome="structured_analysis",
+            outcome=audit_outcome,
             user_id=user_id,
             client_ip=client_ip,
             metadata={
                 "question_type": result.get("question_type"),
                 "document_id": document_id,
                 "collection_id": collection_id,
+                "matched_document_count": result.get("matched_document_count"),
+                "matched_row_count": result.get("matched_row_count"),
             },
         )
         return result
@@ -69,8 +96,9 @@ def answer_question(
             client_ip=client_ip,
         )
         return {
-            "answer": "No relevant document content was found.",
+            "answer": UNAVAILABLE_ANSWER,
             "sources": [],
+            "grounded": False,
         }
 
     context = "\n\n".join(
@@ -113,6 +141,26 @@ Question:
         int(answer_result["prompt_tokens"]),
         int(answer_result["completion_tokens"]),
     )
+    answer = str(answer_result["answer"]).strip()
+    if answer == UNAVAILABLE_ANSWER:
+        log_audit_event(
+            event_type="chat.request",
+            endpoint="chat",
+            outcome="insufficient_context",
+            user_id=user_id,
+            client_ip=client_ip,
+            metadata={
+                "prompt_tokens": int(answer_result["prompt_tokens"]),
+                "completion_tokens": int(answer_result["completion_tokens"]),
+            },
+        )
+        return {
+            "answer": UNAVAILABLE_ANSWER,
+            "question_type": "retrieval",
+            "grounded": False,
+            "sources": [],
+        }
+
     log_audit_event(
         event_type="chat.request",
         endpoint="chat",
@@ -126,8 +174,9 @@ Question:
     )
 
     return {
-        "answer": answer_result["answer"],
+        "answer": answer,
         "question_type": "retrieval",
+        "grounded": True,
         "sources": [
             {
                 "document_id": source["document_id"],

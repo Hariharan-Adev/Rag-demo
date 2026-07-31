@@ -47,11 +47,14 @@ class Settings(BaseSettings):
     ingestion_backoff_base_seconds: float = 2.0
     ingestion_backoff_max_seconds: float = 3600.0
     ingestion_pipeline_version: str = "v1"
+    vector_store: str = ""
     vector_store_provider: str = "qdrant"
+    vector_store_rollback_dual_write: bool = False
     qdrant_url: str = ""
     qdrant_api_key: str = ""
     qdrant_collection: str = "rag_chunks"
     qdrant_mode: str = "auto"
+    qdrant_prefer_grpc: bool = False
     qdrant_path: str = ""
     qdrant_local_path: str = "data/qdrant"
     embedding_dimension: int = 384

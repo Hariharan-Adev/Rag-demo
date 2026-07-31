@@ -124,6 +124,7 @@ export interface ChatSource {
 
 export interface ChatResponse {
   answer: string
+  grounded: boolean
   sources: ChatSource[]
 }
 

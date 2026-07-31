@@ -22,7 +22,11 @@ from app.database import UPLOAD_DIRECTORY, get_connection
 from app.services.embeddings import create_embeddings
 from app.services.document_loader import DocumentParseError
 from app.services.source_extraction import extract_source_chunks, extract_source_metadata
-from app.services.vector_store import VectorPoint, get_vector_store
+from app.services.vector_store import (
+    VectorPoint,
+    get_vector_store,
+    make_vector_point_id,
+)
 from app.utils.audit import log_audit_event
 from app.utils.document_content import normalize_extracted_text
 from app.utils.document_content import generate_unique_display_filename
@@ -34,6 +38,11 @@ from app.services.zip_archives import (
     temporary_archive_directory,
 )
 from app.services.folder_uploads import record_batch_result
+from app.services.structured_ingestion import (
+    StructuredDocumentContext,
+    ingest_structured_csv,
+    replace_workbook_content,
+)
 from app.services.workbooks import extract_workbook
 from app.utils.security import validate_chunks, validate_extracted_text
 from app.utils.observability import log_event
@@ -211,8 +220,8 @@ def _matching_content_chunks(
     ).fetchall()
     for version in versions:
         rows = connection.execute(
-            f"""SELECT text, embedding, source_type, source_location_json,
-                      embedding_model, embedding_dimension
+            f"""SELECT text, source_type, source_location_json,
+                      vector_point_id, embedding_model, embedding_dimension
                FROM chunks
                WHERE content_id = ? AND version_id = ? AND organization_id = ?
                  AND deleted_at {lifecycle}
@@ -235,20 +244,12 @@ def _matching_content_chunks(
 
 
 def _embeddings_are_compatible(rows: tuple[sqlite3.Row, ...]) -> bool:
-    for row in rows:
-        if (
-            row["embedding_model"] != settings.embedding_model_version
-            or int(row["embedding_dimension"] or 0) != settings.embedding_dimension
-            or not row["embedding"]
-        ):
-            return False
-        try:
-            vector = json.loads(row["embedding"])
-        except (TypeError, json.JSONDecodeError):
-            return False
-        if not isinstance(vector, list) or len(vector) != settings.embedding_dimension:
-            return False
-    return bool(rows)
+    return bool(rows) and all(
+        row["embedding_model"] == settings.embedding_model_version
+        and int(row["embedding_dimension"] or 0) == settings.embedding_dimension
+        and bool(row["vector_point_id"])
+        for row in rows
+    )
 
 
 def _resolve_content(
@@ -655,70 +656,36 @@ def _insert_version_chunks(
     job,
     content_id: int,
     source_chunks,
-    embeddings: list[list[float]],
 ) -> list[int]:
     connection.execute(
         "DELETE FROM chunks WHERE version_id = ? AND organization_id = ?",
         (job["version_id"], job["organization_id"]),
     )
     chunk_ids: list[int] = []
-    for index, (source, embedding) in enumerate(zip(source_chunks, embeddings)):
+    for index, source in enumerate(source_chunks):
+        point_id = make_vector_point_id(
+            str(job["organization_id"]),
+            int(job["version_id"]),
+            index,
+            settings.embedding_model_version,
+        )
         cursor = connection.execute(
             """INSERT INTO chunks
                (content_id, chunk_index, text, embedding, organization_id,
                 document_id, version_id, source_type, source_location_json,
-                embedding_model, embedding_dimension)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                vector_point_id, embedding_model, embedding_dimension,
+                indexing_status)
+               VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')""",
             (
-                content_id, index, source.text, json.dumps(embedding),
+                content_id, index, source.text,
                 job["organization_id"], job["document_id"], job["version_id"],
                 source.source_type, json.dumps(source.location),
-                settings.embedding_model_version, len(embedding),
+                point_id, settings.embedding_model_version,
+                settings.embedding_dimension,
             ),
         )
         chunk_ids.append(int(cursor.lastrowid))
     return chunk_ids
-
-
-def _replace_workbook_content(
-    connection: sqlite3.Connection,
-    *,
-    job,
-    content_id: int,
-    workbook,
-) -> None:
-    if workbook is None:
-        return
-    connection.execute(
-        "DELETE FROM workbook_sheets WHERE content_id = ?", (content_id,)
-    )
-    for sheet_index, sheet in enumerate(workbook.sheets):
-        sheet_cursor = connection.execute(
-            """INSERT INTO workbook_sheets
-               (content_id, owner_id, organization_id, sheet_index,
-                name, visibility, status, header_row, headers_json,
-                processing_error)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                content_id, job["owner_id"], job["organization_id"],
-                sheet_index, sheet.name, sheet.state, sheet.status,
-                sheet.header_row, json.dumps(sheet.headers), sheet.error,
-            ),
-        )
-        connection.executemany(
-            """INSERT INTO workbook_rows
-               (sheet_id, content_id, owner_id, organization_id,
-                row_number, values_json)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [
-                (
-                    sheet_cursor.lastrowid, content_id, job["owner_id"],
-                    job["organization_id"], row.row_number,
-                    json.dumps(row.values),
-                )
-                for row in sheet.rows
-            ],
-        )
 
 
 def _resume_existing_chunks(job) -> bool:
@@ -727,7 +694,7 @@ def _resume_existing_chunks(job) -> bool:
         return False
     with get_connection() as connection:
         rows = connection.execute(
-            """SELECT id, content_id, chunk_index, text, embedding, source_type,
+            """SELECT id, content_id, chunk_index, text, source_type,
                       source_location_json, vector_point_id, embedding_model,
                       embedding_dimension
                FROM chunks
@@ -737,16 +704,20 @@ def _resume_existing_chunks(job) -> bool:
             (job["organization_id"], job["document_id"], job["version_id"]),
         ).fetchall()
     if not rows or any(
-        not row["embedding"]
+        not row["vector_point_id"]
         or row["embedding_model"] != settings.embedding_model_version
         or int(row["embedding_dimension"] or 0) != settings.embedding_dimension
         for row in rows
     ):
         return False
+    point_ids = [str(row["vector_point_id"]) for row in rows]
+    stored_vectors = get_vector_store().get_vectors(point_ids)
+    if not all(point_id in stored_vectors for point_id in point_ids):
+        return False
     points: list[VectorPoint] = []
     try:
-        for row in rows:
-            vector = json.loads(row["embedding"])
+        for row, point_id in zip(rows, point_ids):
+            vector = stored_vectors[point_id]
             if len(vector) != settings.embedding_dimension:
                 return False
             points.append(VectorPoint(
@@ -765,11 +736,10 @@ def _resume_existing_chunks(job) -> bool:
                 source_location=json.loads(row["source_location_json"] or "{}"),
                 embedding_model=settings.embedding_model_version,
             ))
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError):
         return False
 
     store = get_vector_store()
-    point_ids = [point.point_id for point in points]
     if not store.contains_points(point_ids):
         store.upsert_chunks(points)
     with get_connection() as connection:
@@ -781,6 +751,19 @@ def _resume_existing_chunks(job) -> bool:
         ).fetchone()
         if version is None:
             return False
+        if settings.vector_store_rollback_dual_write:
+            connection.executemany(
+                """UPDATE chunks SET embedding = ?
+                   WHERE id = ? AND organization_id = ?""",
+                [
+                    (
+                        json.dumps(stored_vectors[point_id]),
+                        int(row["id"]),
+                        job["organization_id"],
+                    )
+                    for row, point_id in zip(rows, point_ids)
+                ],
+            )
         connection.execute(
             """UPDATE chunks
                SET indexing_status = 'completed',
@@ -798,6 +781,15 @@ def _resume_existing_chunks(job) -> bool:
                    failure_reason = NULL
                WHERE id = ? AND organization_id = ?""",
             (job["version_id"], job["organization_id"]),
+        )
+        connection.execute(
+            """UPDATE document_contents SET processing_status = 'completed'
+               WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+            (
+                version["content_id"],
+                job["organization_id"],
+                job["owner_id"],
+            ),
         )
         connection.execute(
             """UPDATE documents
@@ -900,6 +892,7 @@ def process_job(job_id: str) -> None:
         reused_deleted_content = False
         embeddings: list[list[float]] = []
         chunk_ids: list[int] = []
+        reusable_point_ids: list[str] = []
         with get_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             version = connection.execute(
@@ -936,21 +929,11 @@ def process_job(job_id: str) -> None:
                         """UPDATE document_contents
                            SET deleted_at = NULL, deleted_by = NULL,
                                deleted_with_document = 0,
-                               processing_status = 'completed'
+                               processing_status = 'processing'
                            WHERE id = ? AND organization_id = ? AND owner_id = ?""",
                         (content_id, job["organization_id"], job["owner_id"]),
                     )
                     reused_deleted_content = True
-                connection.execute(
-                    """UPDATE document_versions
-                       SET content_id = ?, normalized_content_hash = ?,
-                           source_metadata_json = ?
-                       WHERE id = ? AND organization_id = ?""",
-                    (
-                        content_id, normalized_hash, json.dumps(source_metadata),
-                        job["version_id"], job["organization_id"],
-                    ),
-                )
                 connection.execute(
                     """UPDATE documents SET content_id = ?
                        WHERE id = ? AND organization_id = ? AND owner_id = ?""",
@@ -960,6 +943,12 @@ def process_job(job_id: str) -> None:
                     ),
                 )
                 connection.execute(
+                    """UPDATE document_versions
+                       SET content_id = ?
+                       WHERE id = ? AND organization_id = ?""",
+                    (content_id, job["version_id"], job["organization_id"]),
+                )
+                connection.execute(
                     """DELETE FROM document_contents
                        WHERE id = ? AND organization_id = ? AND owner_id = ?""",
                     (
@@ -967,34 +956,74 @@ def process_job(job_id: str) -> None:
                         job["owner_id"],
                     ),
                 )
-                if resolution.reusable_chunks:
-                    embeddings = [
-                        json.loads(row["embedding"])
-                        for row in resolution.reusable_chunks
-                    ]
-                    chunk_ids = _insert_version_chunks(
+            try:
+                connection.execute(
+                    """UPDATE document_contents SET extracted_text = ?,
+                       normalized_content_hash = ?, processing_status = 'processing'
+                       WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+                    (
+                        extracted_text, normalized_hash, content_id,
+                        job["organization_id"], job["owner_id"],
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise IngestionPolicyError(
+                    "DOCUMENT_ALREADY_EXISTS",
+                    "An identical active document already exists.",
+                ) from error
+            connection.execute(
+                """UPDATE document_versions
+                   SET content_id = ?, normalized_content_hash = ?,
+                       source_metadata_json = ?, extraction_status = 'completed',
+                       indexing_status = 'queued'
+                   WHERE id = ? AND organization_id = ?""",
+                (
+                    content_id, normalized_hash, json.dumps(source_metadata),
+                    job["version_id"], job["organization_id"],
+                ),
+            )
+            chunk_ids = _insert_version_chunks(
+                connection,
+                job=job,
+                content_id=content_id,
+                source_chunks=source_chunks,
+            )
+            if not reused_deleted_content:
+                structured_context = StructuredDocumentContext(
+                    document_id=int(job["document_id"]),
+                    version_id=int(job["version_id"]),
+                    content_id=content_id,
+                    owner_id=int(job["owner_id"]),
+                    organization_id=str(job["organization_id"]),
+                )
+                if path.suffix.lower() == ".csv":
+                    ingest_structured_csv(
                         connection,
-                        job=job,
-                        content_id=content_id,
-                        source_chunks=source_chunks,
-                        embeddings=embeddings,
+                        context=structured_context,
+                        validated_path=path,
                     )
-                    connection.execute(
-                        """UPDATE ingestion_jobs SET result_json = ?,
-                           updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
-                        (
-                            json.dumps({
-                                "content_reused": True,
-                                "reused_deleted_content": reused_deleted_content,
-                                "message": (
-                                    "Deleted document content was re-uploaded successfully."
-                                    if reused_deleted_content
-                                    else "Document version reused existing indexed content."
-                                ),
-                            }),
-                            job_id,
-                        ),
+                elif workbook is not None:
+                    replace_workbook_content(
+                        connection,
+                        context=structured_context,
+                        workbook=workbook,
                     )
+            reusable_point_ids = [
+                str(row["vector_point_id"])
+                for row in resolution.reusable_chunks
+            ]
+
+        if reusable_point_ids:
+            stored_vectors = get_vector_store().get_vectors(reusable_point_ids)
+            if all(point_id in stored_vectors for point_id in reusable_point_ids):
+                candidate_embeddings = [
+                    stored_vectors[point_id] for point_id in reusable_point_ids
+                ]
+                if all(
+                    len(vector) == settings.embedding_dimension
+                    for vector in candidate_embeddings
+                ):
+                    embeddings = candidate_embeddings
                     reused_existing_content = True
 
         if not reused_existing_content:
@@ -1007,72 +1036,6 @@ def process_job(job_id: str) -> None:
             if len(embeddings) != len(source_chunks):
                 raise RuntimeError("Embedding count did not match extracted chunks.")
             embedding_duration_ms = (perf_counter() - embedding_started) * 1000
-            failure_stage = "chunk_persistence"
-            with get_connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                version = connection.execute(
-                    """SELECT content_id FROM document_versions
-                       WHERE id = ? AND organization_id = ? AND document_id = ?""",
-                    (job["version_id"], job["organization_id"], job["document_id"]),
-                ).fetchone()
-                if version is None or version["content_id"] is None:
-                    raise IngestionPolicyError(
-                        "DOCUMENT_REUPLOAD_FAILED",
-                        "The deleted document could not be restored.",
-                    )
-                content_id = int(version["content_id"])
-                resolution = _resolve_content(
-                    connection,
-                    job=job,
-                    placeholder_content_id=content_id,
-                    normalized_hash=normalized_hash,
-                    source_chunks=source_chunks,
-                    allow_active_reuse=allow_active_content_reuse,
-                )
-                if resolution.mode == "active_duplicate":
-                    raise IngestionPolicyError(
-                        "DOCUMENT_ALREADY_EXISTS",
-                        "An identical active document already exists.",
-                    )
-                try:
-                    connection.execute(
-                        """UPDATE document_contents SET extracted_text = ?,
-                           normalized_content_hash = ?,
-                           processing_status = 'completed'
-                           WHERE id = ? AND organization_id = ? AND owner_id = ?""",
-                        (
-                            extracted_text, normalized_hash, content_id,
-                            job["organization_id"], job["owner_id"],
-                        ),
-                    )
-                except sqlite3.IntegrityError as error:
-                    raise IngestionPolicyError(
-                        "DOCUMENT_ALREADY_EXISTS",
-                        "An identical active document already exists.",
-                    ) from error
-                connection.execute(
-                    """UPDATE document_versions
-                       SET normalized_content_hash = ?, source_metadata_json = ?
-                       WHERE id = ? AND organization_id = ?""",
-                    (
-                        normalized_hash, json.dumps(source_metadata),
-                        job["version_id"], job["organization_id"],
-                    ),
-                )
-                chunk_ids = _insert_version_chunks(
-                    connection,
-                    job=job,
-                    content_id=content_id,
-                    source_chunks=source_chunks,
-                    embeddings=embeddings,
-                )
-                if not reused_deleted_content:
-                    _replace_workbook_content(
-                        connection,
-                        job=job,
-                        content_id=content_id,
-                        workbook=workbook,
-                    )
             with get_connection() as connection:
                 connection.execute(
                     """UPDATE ingestion_jobs SET embedding_duration_ms = ?,
@@ -1157,6 +1120,19 @@ def process_job(job_id: str) -> None:
         failure_stage = "finalization"
         with get_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if settings.vector_store_rollback_dual_write:
+                connection.executemany(
+                    """UPDATE chunks SET embedding = ?
+                       WHERE id = ? AND organization_id = ?""",
+                    [
+                        (
+                            json.dumps(embeddings[index]),
+                            chunk_ids[index],
+                            job["organization_id"],
+                        )
+                        for index in range(len(chunk_ids))
+                    ],
+                )
             connection.execute(
                 """UPDATE chunks
                    SET indexing_status = 'completed',
@@ -1177,6 +1153,11 @@ def process_job(job_id: str) -> None:
                    failure_reason = NULL, source_metadata_json = ?
                    WHERE id = ?""",
                 (normalized_hash, json.dumps(source_metadata), job["version_id"]),
+            )
+            connection.execute(
+                """UPDATE document_contents SET processing_status = 'completed'
+                   WHERE id = ? AND organization_id = ? AND owner_id = ?""",
+                (content_id, job["organization_id"], job["owner_id"]),
             )
             connection.execute(
                 """UPDATE documents SET current_version_id = ?,

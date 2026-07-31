@@ -449,3 +449,813 @@ Risks and compatibility:
 - Rollback: revert the seven files above and remove the new environment values.
   No SQLite or Qdrant data migration is required; payload indexes may remain
   safely because they do not change point data or query semantics.
+
+## 2026-07-30 12:25:40 +05:30 — Chunk-to-Qdrant synchronization contract
+
+- Files modified: `backend/app/database.py`,
+  `backend/app/services/vector_store.py`,
+  `backend/app/services/vector_search.py`,
+  `backend/app/services/ingestion_jobs.py`, `backend/app/reindex.py`,
+  `backend/app/routes/upload.py`, `backend/README.md`,
+  `backend/tests/test_qdrant_vector_store.py`,
+  `backend/tests/test_multitenant_architecture.py`, and
+  `backend/tests/test_folder_uploads.py`.
+- Integrated the attached Qdrant service requirements into the existing
+  `VectorStore`/`QdrantVectorStore` abstraction. A separate global-client
+  `qdrant_store.py` was not added because it would duplicate collection
+  initialization, bypass production transport checks, and split lifecycle logic.
+- Added `content_id` to every Qdrant point payload and its remote payload index.
+  Existing structured `source_location` continues to carry page, slide, sheet,
+  cell, and row provenance without duplicating format-specific fields.
+- Pushed `RAG_MIN_SCORE` into Qdrant's `score_threshold` while retaining the
+  application-side threshold as defense against provider implementations that do
+  not support server-side filtering.
+- Retained deterministic UUIDv5 point IDs instead of generating UUIDv4 during
+  every chunk insertion. The ID is stable for organization, version, chunk index,
+  and embedding model, is persisted in SQLite, and makes retries overwrite the
+  same Qdrant point.
+- Canonical ingestion marks chunks `pending` before upsert, `failed` after a
+  provider failure, and `completed` with `qdrant_indexed_at` only after confirmed
+  upsert. Retry recovery and full reindex update the same synchronization fields.
+- Security remains organization- and ACL-filtered in Qdrant, with authorized
+  current-version IDs calculated from SQLite before search.
+- Verification: full backend suite passed 83 tests in 311.538 seconds. Focused
+  tests verified payload `content_id`, server-side threshold exclusion, schema,
+  failure status, retry completion timestamps, and restored-document search.
+  Python compilation and `git diff --check` passed.
+- Rollback: revert the service and ingestion changes together with migration 009.
+  Restore the pre-deployment SQLite backup before running older code if strict
+  schema rollback is required. Qdrant points remain compatible because point IDs
+  and existing payload fields were not changed.
+
+## 2026-07-30 12:52:50 +05:30 — Canonical Qdrant ingestion and grounded retrieval
+
+- Files modified: `backend/app/services/ingestion_jobs.py`,
+  `backend/app/services/vector_store.py`,
+  `backend/app/services/vector_search.py`, `backend/app/services/rag_service.py`,
+  `backend/app/prompts/rag_prompt.py`, `backend/app/reindex.py`,
+  `backend/README.md`, `backend/tests/test_multitenant_architecture.py`,
+  `backend/tests/test_qdrant_vector_store.py`, and
+  `backend/tests/test_chat.py`.
+- Canonical `/api/documents/upload` ingestion now extracts and validates content,
+  writes authoritative chunk text plus deterministic point IDs with `pending`
+  status to SQLite, and commits that transaction before embedding generation.
+  Embeddings are generated in configured-size batches, upserted to Qdrant, and
+  chunks are marked `completed` with `qdrant_indexed_at` only after the provider
+  confirms the write.
+- New canonical chunks deliberately keep `chunks.embedding` null. Historical
+  JSON embeddings remain readable for backward compatibility, and the reindex
+  command regenerates missing vectors from authoritative SQLite text.
+- Qdrant payloads no longer duplicate complete chunk text. Search receives
+  `chunk_id`, preserves Qdrant ranking, and hydrates text, filename, and source
+  metadata from SQLite under a second organization, document ACL, active-row,
+  and searchable-version check. A test corrupts vector-side text and confirms it
+  cannot override the SQLite source of truth.
+- Retry behavior is deterministic and loss-safe. Fully written Qdrant vectors
+  are retrieved by point ID and finalized without re-embedding. A missing or
+  partial Qdrant write causes extraction and batch embedding to run again, then
+  idempotently overwrites the same UUIDv5 point IDs. Both chunks and
+  `document_contents` are finalized together after interrupted indexing.
+- Retrieval applies `RAG_MIN_SCORE` in Qdrant and repeats the threshold check in
+  application code. No reranker is enabled, so there is no post-reranker stage;
+  a future reranker must add its own evaluated relevance threshold.
+- When no authorized candidate survives, chat returns exactly
+  `The requested information is not available in the uploaded documents.` with
+  `sources: []` and `grounded: false`, without reserving or calling the LLM.
+  The system prompt independently prohibits missing-fact inference, general
+  knowledge, and invented values, names, dates, totals, tables, or citations.
+- Security: vector queries retain organization and owner/visibility payload
+  filters; SQLite hydration rechecks tenant, ACL-derived document/version IDs,
+  active document state, and active chunk state. No document text, vector, path,
+  secret, or provider exception is added to logs.
+- Compatibility: the frontend already uses the canonical asynchronous endpoint,
+  so no frontend change was required. The explicitly named
+  `/documents/upload-legacy` compatibility endpoint retains its historical
+  synchronous SQLite-vector behavior and is not part of this canonical worker
+  migration.
+- Verification: the complete backend suite passed all 85 tests in 289.334
+  seconds. Coverage includes pre-embedding commit visibility, null SQLite
+  embeddings, Qdrant payload minimization and vector recovery, provider-failure
+  retries, deleted-content re-upload, authoritative hydration, score thresholds,
+  and the no-context/no-LLM branch.
+- Rollback: revert the application and test files in this entry together. No
+  destructive data conversion occurred; historical embedding JSON remains
+  intact, and Qdrant point IDs and collection dimensions are unchanged.
+
+## 2026-07-30 13:11:04 +05:30 — One-time SQLite vector cutover command
+
+- Added `backend/scripts/migrate_vectors_to_qdrant.py` and the scripts package.
+  The command is read-only unless `--apply` is explicitly supplied and emits a
+  content-free JSON report suitable for deployment evidence.
+- Selection is limited to active chunks whose document content and completed
+  current version are also active. An optional `--organization-id` supports a
+  controlled tenant-by-tenant rollout.
+- Legacy SQLite vectors are reused only when the JSON is a finite numeric list
+  whose recorded model and dimension match current settings. Invalid, missing,
+  stale-model, or wrong-dimension vectors are regenerated from authoritative
+  SQLite chunk text in configured embedding batches.
+- Every point receives the existing deterministic UUIDv5 ID contract. The
+  command preflights ID ownership, never clears Qdrant, performs idempotent
+  batch upserts, verifies every expected point and vector dimension, then runs
+  tenant-, owner/visibility-, document-, and version-filtered smoke queries.
+- SQLite IDs are assigned with `pending` state before provider writes. Rows move
+  to `completed` with `qdrant_indexed_at` only after all point verification and
+  smoke queries succeed. Any generation, upsert, verification, or query failure
+  marks the selected rows `failed` and leaves the command safe to rerun.
+- The script does not delete or rewrite `chunks.embedding`; the JSON remains
+  available through at least one validated release and rollback exercise.
+  Runtime ingestion and retrieval no longer read it. Transitional migration and
+  reindex utilities retain backward-compatible read support.
+- Added configurable `QDRANT_PREFER_GRPC`. It defaults to false so existing
+  HTTPS-only deployments remain compatible; production operators can enable it
+  only when a protected remote gRPC endpoint is available.
+- Updated `backend/README.md` and `.env.example` with local embedded Qdrant,
+  authenticated remote Qdrant, coordinated backup, dry-run/apply commands,
+  rollback retention, network exposure, secret handling, authenticated identity,
+  and component-responsibility guidance.
+- Added `backend/tests/test_vector_migration.py`. Tests confirm dry-run behavior,
+  valid-vector reuse, invalid-vector regeneration, stable IDs, exact point
+  verification, smoke search, completion timing, failure recording, and
+  preservation of both valid and invalid legacy JSON.
+- Verification: all 87 backend tests passed in 225.658 seconds. Focused migration
+  and Qdrant tests passed, Python compilation succeeded, and
+  `git diff --check` reported no whitespace errors.
+- The command was not run with `--apply` against the workspace database or any
+  production Qdrant instance. Deployment execution requires a coordinated
+  backup and maintenance window.
+- Rollback: keep the SQLite vector column and coordinated SQLite/Qdrant/object
+  backups. Revert application code and restore the matched backups if validation
+  fails. Column removal belongs to a later, separately tested schema release.
+
+## 2026-07-30 14:38:01 +05:30 — Qdrant rollout verification and rollback controls
+
+- Files added: `backend/tests/test_qdrant_integration.py`,
+  `backend/scripts/check_vector_consistency.py`, and
+  `backend/scripts/compare_vector_retrieval.py`.
+- Files updated: `backend/app/config.py`,
+  `backend/app/services/vector_store.py`,
+  `backend/app/services/ingestion_jobs.py`, `backend/app/routes/health.py`,
+  `backend/.env.example`, `backend/README.md`,
+  `backend/tests/test_qdrant_vector_store.py`, and
+  `backend/tests/test_vector_migration.py`.
+- `/health` now verifies SQLite and the selected vector provider. With Qdrant
+  active it returns the requested `healthy`/`connected` response.
+  `/health/ready` retains detailed provider status; Qdrant health now includes
+  collection, point count, configured vector size, and actual payload-index
+  names.
+- Added the temporary `VECTOR_STORE=qdrant|sqlite` rollout flag while retaining
+  `VECTOR_STORE_PROVIDER` as an alias. `SQLiteVectorStore` implements retained
+  JSON-vector upsert, cosine search, deterministic ID lookup, lifecycle-safe SQL
+  filtering, reconciliation, and health reporting.
+- Added `VECTOR_STORE_ROLLBACK_DUAL_WRITE`. When explicitly enabled, a successful
+  Qdrant ingestion stores a rollback vector in SQLite only after Qdrant confirms
+  the upsert. It is also populated during interrupted-finalization recovery.
+  Default code behavior remains false; `.env.example` enables it for the
+  validation release and documents later removal.
+- Both Qdrant and SQLite providers derive identity from backend-authenticated
+  user state. SQLite fallback search repeats organization, owner/visibility,
+  active-document, active-chunk, and allowed-current-version predicates. The
+  frontend chat schema has no `owner_id` or `organization_id` override.
+- The read-only consistency command compares active completed current-version
+  SQLite IDs with active vector-store IDs. It reports exact missing/unexpected
+  IDs, unique content-chunk count, and duplicate content-point count without
+  exposing text.
+- The comparison command requires 20–30 JSONL questions and records expected
+  chunk, SQLite/Qdrant top chunk, score, correctness, and response time to CSV.
+  It validates that the supplied user belongs to the requested organization
+  before reading any retrieval scope.
+
+### Isolated startup and Phoenix results
+
+- Started the FastAPI lifespan against an isolated SQLite database and real
+  in-memory Qdrant client. This avoided deleting or opening the workspace's
+  persistent Qdrant directory.
+- Confirmed collection creation, configured vector size, successful `/health`,
+  SQLite document/content/chunk rows, deterministic point IDs, matching Qdrant
+  IDs, and completed ingestion.
+- The Phoenix manager question retrieved the chunk containing Anitha. The phone
+  question returned the exact unavailable-information response and the test
+  proved the LLM was not called.
+- A private User A document was returned to User A and excluded for User B.
+  The same isolation remained valid after switching to SQLite rollback.
+- Soft deletion marked SQLite state, excluded the document from retrieval, and
+  retained its audit event.
+- Deleted-content re-upload reused the prior vector values without calling the
+  embedding generator and retained the same number of active points. Retrying a
+  completed ingestion updated deterministic IDs without increasing total point
+  count.
+- Qdrant search outage returned a safe 502 without provider details. Wrong
+  dimensions were rejected. Embedding/provider failures, worker recovery, and
+  retry scheduling remain covered by the broader suite. A partial migration
+  batch failure was rerun successfully with stable IDs.
+- Existing automated format coverage passed for TXT, PDF, DOCX, XLSX, PPTX, and
+  image/OCR parsing, including page, slide, sheet/cell/row, and OCR provenance.
+  Workbook tests process all 13 supplied tabs, which is stronger than the
+  requested three-sheet check.
+
+### Unverified production gates and discrepancies
+
+- No authenticated remote Qdrant URL/API key was configured. Remote collection
+  creation and payload-index creation remain implemented, but actual server or
+  Cloud connectivity, effective remote indexes, networking, backups, and
+  restart persistence were not verified. Embedded Qdrant explicitly does not
+  implement effective payload indexes.
+- The canonical async endpoint still treats an active same-content upload under
+  a different filename as `DOCUMENT_ALREADY_EXISTS`. The requested Case C
+  expects a second document reference with no additional content-scoped points.
+  Current deterministic IDs are version-scoped by prior design, so changing this
+  requires a deliberate shared-point/reference redesign across ingestion,
+  deletion, ACL filtering, and hydration. It was not silently changed here.
+- The 20–30-question quality comparison was not run because no curated question
+  file and expected source IDs were supplied. The new command is ready, but
+  Qdrant should not be declared production-primary until its result is reviewed.
+- No coordinated SQLite/Qdrant/object-storage backup or production feature-flag
+  switch was performed. The workspace database and persistent Qdrant directory
+  were not mutated.
+- Verification: all 98 backend tests passed in 298.704 seconds; the 14 focused
+  Qdrant/migration tests passed in 107.828 seconds. CLI help, Python compilation,
+  and whitespace validation passed.
+
+## 2026-07-30 15:30 +05:30 — CSV range retrieval and citation consistency
+
+### Confirmed root cause
+
+The investigation confirmed two related defects before the fix:
+
+1. `Show all equipment priced between ₹50,000 and ₹200,000.` is an exhaustive
+   structured filter, but `is_analytical_question()` returned false. It did not
+   recognize `show all`, `between … and …`, or `from … to …`. CSV ingestion also
+   omitted `workbook_sheets` and `workbook_rows`, so the request used semantic
+   top-K retrieval rather than deterministic row filtering.
+2. When retrieval returned any source, `rag_service.answer_question()` called
+   the LLM and unconditionally returned those sources with `grounded=true`.
+   This also happened when the LLM returned the exact unavailable-information
+   sentinel. The frontend then rendered every returned source without checking
+   `grounded`.
+
+The exact contradictory-response component was
+`backend/app/services/rag_service.py`, `answer_question()` (the post-LLM return
+path, currently near line 118). The wrong query route originated in
+`backend/app/services/workbook_analysis.py`, `is_analytical_question()` (line
+63), and `backend/app/services/ingestion_jobs.py`, `_extract_bundle_child()` /
+`_extract_bundle()` (lines 62/96), which limited structured extraction to
+XLS/XLSX.
+
+### End-to-end trace and evidence
+
+- `AppContext.sendMessage()` sends the question and optional collection/document
+  scope. `routes/chat.py` derives the user from authentication; the client
+  cannot override owner or organization.
+- Before the fix the classifier returned false. RAG requested 15 Qdrant
+  candidates, applied score threshold 0.35, and retained at most 5.
+- Qdrant applies threshold plus tenant/ACL/current-version/deletion filters.
+  `vector_search.py` repeats the score check, validates payload identity against
+  SQLite, and hydrates authoritative text/provenance. Discarded chunks do not
+  reach the response. There is no reranker in this path.
+- `source_extraction._csv()` created one chunk per physical row. The seven-row
+  fixture stored the header as row 1 and data separately. Row 5 was
+  `Irrigation Pump<TAB>75000<TAB>Irrigation`; the header was not attached to
+  that chunk. Filename and `row_start=row_end=5` were retained.
+- A controlled pre-fix trace supplied this hydrated row-5 candidate at score
+  0.61. One candidate passed threshold and reached the prompt. The exact prompt
+  contained that single source. The LLM path executed and returned the
+  unavailable sentinel. The final pre-fix JSON still contained the row-5 source
+  and `grounded=true`, reproducing the reported UI.
+- With no candidates, the backend already short-circuited before the LLM. The
+  incident was the distinct context-present/LLM-insufficient path.
+- React mapped `response.sources` unconditionally and attached the first source
+  to the message. Previous retrieval-panel state also remained until a success,
+  which could show stale side-panel state after an API error; the reproduced
+  row-5 citation itself came from the same backend response.
+
+Workspace logs contained no matching production request or Qdrant result.
+Therefore no production vector ID, raw pre-threshold count, or production score
+is claimed. The 0.61 value is controlled reproduction evidence. Persistent logs
+were not changed to include raw payloads, prompts, or document text because
+they can expose tenant data; restricted diagnostics should use opaque IDs,
+scores, and provenance with text disabled or redacted.
+
+### Fix
+
+- `workbooks.py` safely parses CSV using UTF-8 BOM handling and dialect
+  detection, then reuses the existing typed header/row model.
+- `ingestion_jobs.py` persists CSV structured sheets/rows alongside semantic
+  chunks. Qdrant IDs, ACLs, ownership, soft deletion, and duplicate reuse are
+  unchanged.
+- `workbook_analysis.py` recognizes explicit ranges, dynamically resolves the
+  numeric column (including price aliases), parses grouped currency values as
+  `Decimal`, applies an inclusive full-row filter, and cites selected row bounds.
+- `rag_prompt.py` defines one canonical unavailable sentinel.
+- `rag_service.py` enforces: unavailable answer implies `sources=[]` and
+  `grounded=false`, logging `insufficient_context` rather than `success`.
+- No threshold was lowered. Free-text retrieval stays on Qdrant; exhaustive
+  tabular ranges use authoritative SQLite rows.
+
+### Files inspected and modified
+
+- Frontend: `frontend/src/services/api.ts`,
+  `frontend/src/context/AppContext.tsx`, chat/source rendering types.
+- API/prompt: `backend/app/routes/chat.py`,
+  `backend/app/services/rag_service.py`,
+  `backend/app/prompts/rag_prompt.py`.
+- Retrieval/config: `backend/app/services/vector_search.py`,
+  `backend/app/services/vector_store.py`, `backend/app/config.py`.
+- Ingestion/data: `backend/app/services/ingestion_jobs.py`,
+  `backend/app/services/source_extraction.py`,
+  `backend/app/services/workbooks.py`, `backend/app/database.py`.
+- Analysis/tests: `backend/app/services/workbook_analysis.py`; chat, Qdrant,
+  workbook, parser/PDF, duplicate, multitenant, upload, and lifecycle tests.
+
+### Validation and risk
+
+- 6 chat tests passed, including no-LLM with no context and
+  context-present/unavailable response consistency.
+- 7 workbook tests passed in 78.775 seconds. XLSX returned Power Tiller,
+  Irrigation Pump, and the inclusive ₹200,000 Harvester row, excluded ₹45,000,
+  ₹210,000, and ₹550,000, and cited rows 4–6.
+- 11 in-memory-Qdrant lifecycle tests passed in 65.280 seconds. Queued CSV
+  ingestion stored seven semantic chunks plus structured rows, bypassed the LLM
+  for the range, returned the same three rows, and cited CSV rows 4–6. Relevant
+  retrieval, unknown/no-source, two-user isolation, soft delete,
+  deleted-content reuse, idempotency, provider failure, and SQLite rollback
+  also passed.
+- Parser/PDF and duplicate/isolation modules printed `Ran 31 tests … OK` in
+  172.369 seconds; the command wrapper timed out during interpreter cleanup
+  after the test result.
+- Frontend TypeScript/Vite production build passed (2,284 modules); the existing
+  large-bundle warning remains.
+- Monolithic discovery exceeded the command budget because the Windows
+  integration suite takes over five minutes. A new monolithic pass is not
+  claimed; affected modules were run separately.
+- Existing CSV documents require controlled reindex/re-upload for structured
+  rows. Ambiguous numeric columns still request clarification. Rollback is
+  application-only and does not alter `VECTOR_STORE` rollback capability.
+
+## 2026-07-30 16:00 +05:30 — Structured indexing migration 010
+
+### Files changed
+
+- `backend/app/database.py`
+- `backend/app/services/workbooks.py`
+- `backend/app/services/ingestion_jobs.py`
+- `backend/tests/test_structured_index_migration.py`
+- `backend/tests/test_multitenant_architecture.py`
+- `backend/tests/test_qdrant_integration.py`
+
+### Change summary
+
+- Added content-scoped structured indexing status, parser version, completion
+  timestamp, and bounded error storage through migration
+  `010_structured_csv_indexing`.
+- Legacy content defaults to pending and is never marked completed by migration
+  inference. This provides a safe candidate state for the future CSV backfill.
+- Production structured workbook writes mark the content completed with parser
+  version `structured-workbook-v1` inside the existing workbook transaction.
+- Added a single partial retry index for active pending/failed content.
+- Added a reusable single-line, 500-character sanitizer for safe public
+  structured-index errors. Raw exceptions, paths, SQL, document content, and
+  provider details must not be stored.
+- Existing soft deletion, owner/organization isolation, duplicate-content
+  uniqueness, document/content IDs, chunks, embeddings, and Qdrant state are
+  unchanged.
+
+### Verification
+
+- 9 relevant database and CSV integration tests passed in 66.563 seconds.
+- Focused production CSV status verification passed in 9.700 seconds.
+- 4 duplicate-content, owner-isolation, and soft-delete regressions passed in
+  20.612 seconds.
+- Python compilation and `git diff --check` passed.
+- No workspace or production database migration was executed; tests used
+  isolated SQLite databases.
+
+## 2026-07-30 16:10 +05:30 — Reusable structured CSV ingestion service
+
+### Files changed
+
+- `backend/app/services/structured_ingestion.py` (new)
+- `backend/app/services/ingestion_jobs.py`
+- `backend/tests/test_structured_index_migration.py`
+
+### Change summary
+
+- Added `StructuredDocumentContext` and `ingest_structured_csv()` as the single
+  reusable entry point for normal CSV ingestion and the future legacy backfill.
+- The service validates the exact document, version, content, owner, and
+  organization relationship against active SQLite rows. It also verifies the
+  supplied path matches the version's traversal-safe storage key, repeats the
+  stored-file hash/signature checks, and calls the existing
+  `workbooks.extract_workbook()` parser.
+- Moved sheet/row replacement into `replace_workbook_content()`. Cell values
+  remain stored in the existing `workbook_rows.values_json` representation; no
+  second CSV parser or parallel schema was introduced.
+- Both persistence functions require an existing caller transaction and never
+  begin, commit, or roll it back. Delete-and-reinsert replacement is therefore
+  atomic and safe for retrying incomplete structured data.
+- The normal queued CSV worker now uses this service. XLS/XLSX retain their
+  existing extraction behavior and use the same context-validated persistence
+  function.
+- The service creates no documents or content records and does not import or
+  call embeddings or the vector store. Existing chunks, point IDs, Qdrant
+  vectors, duplicate relationships, and soft-delete behavior are unchanged.
+
+### Verification
+
+- 4 structured migration/service tests passed in 20.431 seconds, including
+  caller-transaction enforcement, incomplete-row replacement, tenant fields,
+  status stamping, and confirmation that no chunks were created.
+- The normal queued CSV range test and XLSX structured range test both passed
+  in 18.874 seconds.
+- Python compilation and `git diff --check` passed; only existing CRLF
+  conversion warnings were emitted.
+- No database migration or schema change was added by this refactor, so
+  `changes/changes_db` was not updated.
+
+## 2026-07-30 16:25 +05:30 — Single-document CSV structured reindex
+
+### Files changed
+
+- `backend/app/services/structured_ingestion.py`
+- `backend/tests/test_structured_csv_reindex.py` (new)
+
+### Change summary
+
+- Added `reindex_existing_csv_document()` for one existing document at a time.
+  Its owner- and organization-scoped lookup validates the document, current
+  version, and content relationship without disclosing cross-tenant records.
+- Deleted documents, versions, or content are returned as `skipped_deleted`.
+  Non-CSV versions are rejected before any structured state is changed.
+- The service resolves only the current version's authoritative storage key
+  beneath the upload root. The shared ingestion service then verifies the exact
+  resolved path, stored hash, and file signature before using the production
+  CSV parser.
+- One `BEGIN IMMEDIATE` transaction covers each document. Status is set to
+  `processing` before parsing; successful sheet/row replacement and the
+  `completed` state commit together.
+- A savepoint protects structured records during the attempt. On failure,
+  sheet/row changes are rolled back, a sanitized bounded `failed` message is
+  committed, and the document remains safe to retry. Previously committed
+  structured data is preserved when a retry fails.
+- Replacement remains content-scoped and idempotent, preserving the existing
+  document/content IDs and tenant fields. The service has no embedding or
+  vector-store calls, so chunks and Qdrant points are unchanged.
+
+### Verification
+
+- All 7 requested reindex tests passed in 58.186 seconds: success, deleted
+  skip, non-CSV rejection, missing stored file, parser rollback, idempotent
+  rerun, and unchanged Qdrant point count/no vector or embedding access.
+- All 4 structured migration/shared-service tests passed in the focused
+  regression command.
+- The broader CSV and XLSX integration checks could not start their ingestion
+  assertions because this environment does not have the optional
+  `qdrant-client` package installed (`ModuleNotFoundError`). This occurred
+  during vector-store construction, outside the reindex path; no pass is
+  claimed for those two checks.
+- Python compilation and `git diff --check` passed. The diff check emitted only
+  the repository's existing LF-to-CRLF conversion warnings.
+- No database schema change was required, so `changes/changes_db` was not
+  updated for this change.
+
+## 2026-07-30 17:04 +05:30 — Structured CSV reindex CLI
+
+### Files changed
+
+- `backend/scripts/reindex_structured_csv.py` (new)
+- `backend/tests/test_reindex_structured_csv_script.py` (new)
+
+### Change summary
+
+- Added a batch CLI that scans only active current document/version/content
+  relationships whose authoritative stored key ends in `.csv`.
+- The script delegates every write attempt to
+  `reindex_existing_csv_document()`; it does not accept file paths or duplicate
+  parsing, persistence, transaction, embedding, or Qdrant logic.
+- Positive document/owner IDs, bounded batch sizes, and conservative
+  organization IDs are validated by `argparse`. Invalid arguments exit with
+  code 2 before database access.
+- Default selection skips current-version completed records, failed records,
+  and records already processing. `--retry-failed` admits failed records;
+  `--force` admits all matching active CSV records, including completed or
+  processing records.
+- Dry-run uses SQLite URI read-only mode plus `PRAGMA query_only`; it does not
+  initialize/migrate the database or call the reindex service.
+- Per-document failures emit only the document ID and a generic message, then
+  processing continues. Filenames, paths, CSV content, cell values, and raw
+  exception details are not logged.
+- The final JSON summary reports `scanned`, `eligible`, `completed`, `skipped`,
+  `failed`, `rows_indexed`, and `duration`. Exit code 0 means no document
+  failures, 1 means one or more document failures, 2 means invalid CLI usage,
+  and 3 means the configured database could not be safely accessed.
+- `--version` prints both CLI version `1.0` and the current structured index
+  version (`structured-workbook-v1`).
+
+### Command examples
+
+Run these commands from the `backend` directory:
+
+```text
+python -m scripts.reindex_structured_csv --dry-run
+python -m scripts.reindex_structured_csv --batch-size 100
+python -m scripts.reindex_structured_csv --retry-failed --batch-size 50
+python -m scripts.reindex_structured_csv --document-id 42 --owner-id 10 --organization-id org-a
+python -m scripts.reindex_structured_csv --document-id 42 --owner-id 10 --organization-id org-a --force
+python -m scripts.reindex_structured_csv --version
+```
+
+### Verification
+
+- All 4 focused CLI tests passed in 0.074 seconds, covering query-only
+  read-only dry-run behavior, no service call during dry-run, current-version
+  skip logic, retry/force eligibility, continuation after failure, and row
+  totals.
+- Help and version output completed successfully using the documented module
+  invocation.
+- Python compilation and `git diff --check` passed. The diff check emitted only
+  the repository's existing LF-to-CRLF conversion warnings.
+- No database schema change was required, so `changes/changes_db` was not
+  updated.
+
+## 2026-07-30 17:08 +05:30 — Structured CSV CLI dry-run coverage
+
+### Files changed
+
+- `backend/tests/test_reindex_structured_csv_script.py`
+
+### Test coverage
+
+- Added isolated integration fixtures for active pending CSVs, a completed CSV
+  at the current structured index version, a soft-deleted CSV, a non-CSV
+  document, two owners, and two organizations.
+- Tests patch `DATABASE_PATH` and `UPLOAD_DIRECTORY` to a temporary directory.
+  They never open the production SQLite database or a persistent Qdrant path.
+- A complete before/after snapshot confirms dry-run does not change structured
+  statuses, versions, timestamps, or errors and creates no workbook sheets or
+  rows. The current schema stores cell values inside
+  `workbook_rows.values_json`; the test also counts `workbook_cells` when that
+  table exists, preserving coverage if a dedicated cell table is added later.
+- The reindex write service is guarded with an immediate assertion failure.
+  The vector-store accessor is also guarded and verified as never called, and
+  fake existing point state plus all upsert/delete mutation counters remain
+  unchanged.
+- The unfiltered dry-run scans four active CSV documents: three are eligible
+  and the current-version completed document is skipped. The soft-deleted CSV
+  and active non-CSV document are excluded from the scan.
+- Owner and organization filters return only their matching tenant records;
+  a mismatched owner/organization pair returns zero records.
+- Invalid document IDs, owner IDs, organization IDs, and batch sizes exit with
+  argparse code 2 before database or reindex-service access.
+
+### Verification
+
+- All 7 structured CSV CLI tests passed in 16.390 seconds, including the three
+  new isolated database-backed dry-run tests.
+- `git diff --check` passed with only the repository's existing LF-to-CRLF
+  conversion warnings.
+
+## 2026-07-30 17:12 +05:30 — CSV reindex idempotency and retry coverage
+
+### Files changed
+
+- `backend/tests/test_reindex_structured_csv_script.py`
+
+### Test coverage
+
+- Added an isolated end-to-end CLI lifecycle test using a temporary SQLite
+  database, temporary upload directory, and a validated stored legacy CSV.
+- The initial default run completes with one logical workbook, one sheet, two
+  rows, and four cell values. The current schema represents the logical
+  workbook by its content-scoped sheets and stores cells in row JSON.
+- A second default run scans the document but skips it because its completed
+  structured index version matches `STRUCTURED_INDEX_VERSION`. Record counts
+  remain unchanged.
+- `--force` reprocesses the current-version document through the production
+  service. Atomic replacement leaves all workbook/sheet/row/cell counts
+  unchanged, proving no duplication.
+- Changing the stored structured index version to an older value makes the
+  document eligible without `--force`. Reindex completes and restores the
+  current version without duplicating records.
+- A temporary SQLite trigger aborts insertion of a structured row after
+  replacement has started. The service reports one failure, the savepoint
+  restores the prior sheets and rows, and content status becomes `failed`.
+- The persisted error is the bounded, single-line generic message
+  `Structured CSV reindexing failed.`; injected database details are not
+  exposed.
+- After removing the test trigger, `--retry-failed` completes successfully and
+  restores `completed`, the current structured index version, and a null error.
+- Qdrant access is blocked for the entire lifecycle. The vector-store accessor
+  is never called and the fake point count remains one at all seven
+  checkpoints, covering initial, repeat, force, version upgrade, failure, and
+  retry behavior.
+
+### Verification
+
+- The new lifecycle test passed independently in 6.553 seconds.
+- The complete focused CLI and one-document reindex suite passed all 15 tests
+  in 90.071 seconds.
+- `git diff --check` passed with only the repository's existing LF-to-CRLF
+  conversion warnings.
+
+## 2026-07-30 17:17 +05:30 — Shared-content legacy CSV reindex coverage
+
+### Files changed
+
+- `backend/tests/test_reindex_structured_csv_script.py`
+
+### Duplicate-policy finding
+
+- No schema or ownership conflict was found. The existing partial unique index
+  permits one active `document_contents` identity per owner and normalized
+  content hash. Multiple legacy document/version references can safely point
+  to that same content identity.
+- Structured workbook sheets and rows are intentionally content-scoped and
+  carry the content owner's `owner_id` and `organization_id`; they are not
+  duplicated per document reference. No schema redesign was made.
+- Existing upload policy remains unchanged: a new identical active upload is
+  terminal unless the approved ingestion path explicitly reuses an existing
+  content identity. Reindexing does not participate in duplicate resolution.
+
+### Test coverage
+
+- Added two active legacy CSV document/version references with identical files,
+  one shared active content row, and the existing duplicate marker on the
+  second document.
+- The first CLI pass processes both legacy references but converges on one
+  logical workbook, one sheet, two rows, and four cell values. The
+  `document_contents` count and both existing chunk/vector point IDs remain
+  unchanged.
+- The next default pass skips both current-version references. A later forced
+  pass also replaces the shared structured data without duplication.
+- The test soft-deletes one document, its version, and its document-scoped
+  chunk, then runs the production orphan-content cleanup rule. The other
+  document/version remains active and valid, so the shared content and
+  structured data remain active and queryable.
+- A separate same-hash content/document/version fixture that was already
+  soft-deleted remains deleted through every default and forced reindex pass;
+  it is never reactivated.
+- Workbook sheets and rows retain exactly `(owner_id=10,
+  organization_id='org-a')`, matching the shared content and both document
+  references.
+- Qdrant access is blocked during reindex. The accessor is never called, the
+  fake point count remains two, and SQLite vector point IDs are unchanged.
+
+### Verification
+
+- The new shared-content integration test passed independently in 4.557
+  seconds.
+- The focused CLI, reindex service, duplicate-version, deleted-content reuse,
+  and cross-user isolation suite passed all 19 tests in 92.074 seconds.
+- `git diff --check` passed with only the repository's existing LF-to-CRLF
+  conversion warnings.
+- No database or application schema files were changed.
+
+## 2026-07-30 17:22 +05:30 — Legacy CSV reindex retrieval coverage
+
+### Files changed
+
+- `backend/tests/test_legacy_csv_reindex_retrieval.py` (new)
+
+### Test coverage
+
+- Added an isolated legacy CSV with an active document/content/version and no
+  initial workbook sheets or rows. The fixture uses a temporary SQLite
+  database and upload directory.
+- Before reindex, `has_structured_workbook()` is false and the analytical range
+  question cannot enter deterministic structured filtering. With no semantic
+  result, the request returns the standard ungrounded unavailable response.
+- The production single-document reindex service creates one structured CSV
+  sheet and all seven source rows without accessing Qdrant.
+- The exact question `Show all equipment priced between ₹50,000 and
+  ₹200,000.` is asked twice. Both responses are identical, semantic retrieval
+  and the LLM are explicitly prohibited, and the structured result contains
+  exactly four matches.
+- Boundary Sprayer at ₹50,000 and Harvester at ₹200,000 prove that both range
+  boundaries are inclusive. Power Tiller and Irrigation Pump are also
+  returned. Seed Drill, Agricultural Drone, and Tractor are excluded.
+- The single CSV citation identifies the correct document/display filename,
+  stored CSV sheet name, and matching source rows 3 through 6.
+- The matching response is grounded. An unavailable warranty question returns
+  exactly `The requested information is not available in the uploaded
+  documents.`, with `sources=[]` and `grounded=false`.
+- A second owner in the same organization and a user in another organization
+  cannot access the private workbook. Both receive the same ungrounded
+  unavailable response with no sources.
+
+### Verification
+
+- The new integration test passed independently in 3.778 seconds.
+- The complete focused legacy retrieval, CLI reindex, and single-document
+  reindex suite passed all 17 tests in 47.528 seconds.
+- `git diff --check` passed with only the repository's existing LF-to-CRLF
+  conversion warnings.
+
+## 2026-07-30 17:48 +05:30 — Complete CSV structured reindex validation
+
+### Isolation
+
+- Validation used
+  `.validation/csv_structured_full_20260730_1725` for count instrumentation.
+  Backend tests used their own temporary SQLite databases, upload directories,
+  and in-memory/guarded Qdrant stores.
+- `QDRANT_PATH` and `QDRANT_LOCAL_PATH` were set to the temporary validation
+  Qdrant directory for every backend command. Production SQLite and persistent
+  Qdrant data were not opened.
+- The temporary validation directory was verified, removed recursively after
+  final counts, and confirmed absent.
+
+### Exact validation commands
+
+Run from `backend` unless another directory is shown:
+
+```text
+python -m pip install qdrant-client==1.18.0
+python -m pip install pypdf==5.9.0
+python -m unittest tests.test_structured_index_migration -v
+python -m unittest tests.test_structured_csv_reindex tests.test_reindex_structured_csv_script tests.test_legacy_csv_reindex_retrieval -v
+python -m unittest tests.test_document_parsers tests.test_workbook_domain_neutral -v
+python -m unittest tests.test_chat -v
+python -m unittest tests.test_qdrant_vector_store tests.test_qdrant_integration tests.test_vector_migration -v
+python -m unittest tests.test_document_duplicates tests.test_multitenant_architecture -v
+python -m compileall -f app scripts tests
+```
+
+Run from `frontend`:
+
+```text
+npm run build
+```
+
+Run from the repository root:
+
+```text
+git diff --check
+```
+
+Each backend validation command also set:
+
+```text
+QDRANT_PATH=.validation/csv_structured_full_20260730_1725/qdrant
+QDRANT_LOCAL_PATH=.validation/csv_structured_full_20260730_1725/qdrant
+PYTHONUNBUFFERED=1
+```
+
+### Results and runtimes
+
+- Database migration: 4 passed, 0 failed, 0 skipped; 25.405 seconds.
+- CSV structured ingestion/reindex/retrieval: 17 passed, 0 failed, 0 skipped;
+  64.805 seconds.
+- Parser/XLSX/workbook: 20 passed, 0 failed, 0 skipped; 73.967 seconds.
+- Chat policy: 6 passed, 0 failed, 0 skipped; 5.021 seconds.
+- Qdrant lifecycle/vector migration: 15 passed, 0 failed, 0 skipped; 123.238
+  seconds.
+- Duplicate, soft-delete, two-user, ACL, and tenant isolation: 33 passed,
+  0 failed, 0 skipped; 316.901 seconds.
+- Final backend result: 95 passed, 0 failed, 0 skipped. Passing backend command
+  runtime totaled 609.337 seconds.
+- The first parser/workbook attempt reported 19 passes and one import error
+  because the declared `pypdf` dependency was absent. After installing the
+  pinned `pypdf==5.9.0`, the complete 20-test category passed. The failed
+  attempt took 49.307 seconds and is not hidden or counted as a product-test
+  failure.
+- Python compilation passed in 4.836 seconds.
+- Frontend production build was required because frontend source is modified.
+  It passed in 52.361 seconds: TypeScript and Vite transformed 2,284 modules.
+- `git diff --check` passed in 0.827 seconds with only existing LF-to-CRLF
+  conversion warnings.
+- Final successful validation runtime including compilation, frontend build,
+  and diff check was 667.361 seconds. Including the dependency-related failed
+  parser attempt, command runtime was 716.668 seconds.
+
+### Point and row counts
+
+- Isolated Qdrant count instrumentation: 0 collections/0 points before;
+  2 collections/20 points after lifecycle validation. Final collections were
+  `rag_chunks` with 15 points and `test_contract` with 5 points.
+- CSV structured reindex-specific invariants remained unchanged at every
+  assertion: empty case 0→0 points, retry case 1→1 point, and shared-content
+  case 2→2 points. Reindex never called the Qdrant accessor.
+- Isolated sentinel SQLite counts remained zero before and after for
+  `documents`, `document_contents`, `document_versions`, `workbook_sheets`,
+  `workbook_rows`, and `chunks`, confirming test isolation.
+- The end-to-end legacy CSV fixture retained 1 document, 1 content, and
+  1 version; structured rows changed from 0 sheets/0 rows to 1 sheet/7 rows,
+  while chunks remained 0.
+- The retry/idempotency fixture remained at 1 logical workbook, 1 sheet,
+  2 rows, and 4 stored cell values across rerun, force, failure rollback, and
+  retry.
+- The shared-content fixture retained 2 content identities, one content-scoped
+  workbook, 1 sheet, 2 rows, and 4 cell values; reindex created no content or
+  vector records.
+
+### Non-failing findings
+
+- `qdrant-client==1.18.0` and `pypdf==5.9.0` were present in requirements but
+  missing from the Python environment; both exact pinned versions were
+  installed for validation.
+- Some suites emitted existing SQLite `ResourceWarning` messages for unclosed
+  connections.
+- FastAPI emitted the existing TestClient/httpx deprecation warning.
+- Worker warm-up logged that `sentence_transformers` was unavailable. Relevant
+  tests injected deterministic embeddings and all assertions passed.
+- Vite emitted the existing advisory that the 660.18 kB JavaScript chunk
+  exceeds 500 kB. The production build still completed successfully.

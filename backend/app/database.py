@@ -13,6 +13,18 @@ from app.utils.document_content import normalize_extracted_text
 DATABASE_PATH = Path(__file__).resolve().parent.parent / "data" / "rag_new.db"
 UPLOAD_DIRECTORY = DATABASE_PATH.parent / "uploads"
 DEFAULT_ORGANIZATION_ID = "00000000-0000-4000-8000-000000000001"
+STRUCTURED_INDEX_ERROR_MAX_LENGTH = 500
+
+
+def sanitize_structured_index_error(message: object) -> str:
+    """Normalize a safe public error before storing it in SQLite."""
+    printable = "".join(
+        character if character.isprintable() else " "
+        for character in str(message)
+    )
+    normalized = " ".join(printable.split())
+    fallback = "Structured document indexing failed."
+    return (normalized or fallback)[:STRUCTURED_INDEX_ERROR_MAX_LENGTH]
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -994,6 +1006,60 @@ def _migrate_chunk_vector_sync_v9(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_structured_csv_indexing_v10(
+    connection: sqlite3.Connection,
+) -> None:
+    """Track content-scoped structured indexing without inferring legacy success."""
+    if not _table_exists(connection, "document_contents"):
+        raise RuntimeError(
+            "Migration 010 cannot run; document_contents does not exist."
+        )
+    _add_column(
+        connection,
+        "document_contents",
+        "structured_index_status",
+        (
+            "TEXT NOT NULL DEFAULT 'pending' "
+            "CHECK (structured_index_status IN "
+            "('pending','processing','completed','failed'))"
+        ),
+    )
+    _add_column(
+        connection,
+        "document_contents",
+        "structured_index_version",
+        "TEXT CHECK (structured_index_version IS NULL OR "
+        "length(structured_index_version) <= 100)",
+    )
+    _add_column(
+        connection,
+        "document_contents",
+        "structured_indexed_at",
+        "TEXT",
+    )
+    _add_column(
+        connection,
+        "document_contents",
+        "structured_index_error",
+        (
+            "TEXT CHECK (structured_index_error IS NULL OR "
+            f"length(structured_index_error) <= {STRUCTURED_INDEX_ERROR_MAX_LENGTH})"
+        ),
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_contents_structured_retry
+           ON document_contents(
+               organization_id, structured_index_status, id
+           )
+           WHERE deleted_at IS NULL
+             AND structured_index_status IN ('pending','failed')"""
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('010_structured_csv_indexing')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1065,6 +1131,7 @@ def initialize_database() -> None:
             _migrate_lifecycle_repair_v7(connection)
             _migrate_active_content_indexes_v8(connection)
             _migrate_chunk_vector_sync_v9(connection)
+            _migrate_structured_csv_indexing_v10(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

@@ -71,17 +71,21 @@ Run the durable worker separately:
 
 The worker claims jobs with compare-and-set updates, recovers stale locks, uses
 bounded exponential retry with jitter for transient dependency failures only,
-and performs extraction, normalization, duplicate detection, chunking, embedding,
-Qdrant indexing, and final activation. Validation, corrupt-file, and unsupported
-content failures are terminal on the first attempt. API responses contain stable
-error codes and safe messages; full exception details remain in worker logs.
+and performs extraction, normalization, duplicate detection, and chunking. It
+commits authoritative chunk text and `pending` vector state to SQLite before
+generating embeddings in bounded batches, upserts vectors to Qdrant, and marks
+the chunks indexed only after Qdrant confirms the write. Validation, corrupt-file,
+and unsupported content failures are terminal on the first attempt. API responses
+contain stable error codes and safe messages; full exception details remain in
+worker logs.
 
 Each version job has a deterministic key built from organization, version, job
 type, and pipeline version. Request idempotency is tracked separately. A unique
 database constraint and compare-and-set claim prevent concurrent processing of
-the same version. If a worker stops after committing chunks, the next attempt
-reuses their persisted embeddings, verifies deterministic Qdrant point IDs,
-upserts missing points, and finalizes without extracting again.
+the same version. SQLite does not store embedding JSON for newly ingested
+canonical chunks. A retry reuses vectors already confirmed in Qdrant; if the
+provider never accepted them, it regenerates embeddings from committed,
+authoritative SQLite text and upserts the same deterministic point IDs.
 Use `GET /ingestion-jobs/{job_id}`, `POST /ingestion-jobs/{job_id}/retry`, and
 `POST /ingestion-jobs/{job_id}/cancel` for canonical job control. The `/api/jobs`
 forms remain compatibility aliases. Every ownership or tenant denial returns the
@@ -114,11 +118,14 @@ Workbook-level metadata includes sheet counts/names, visible and processed
 sheets, detected tables, and non-empty-row totals. Source-specific location
 schemas are validated before chunks can be indexed.
 
-Qdrant payloads use `organization_id`, `document_id`,
+Qdrant payloads use `organization_id`, `document_id`, `content_id`,
 `document_version_id`, `owner_id`, `visibility`, `is_deleted`, `chunk_id`,
 `chunk_index`, `source_type`, `source_location`, `embedding_model`, and
-`embedding_dimension`. Tenant, deletion, current/explicit version, and
-private/organization ACL filters are part of the vector query itself.
+`embedding_dimension`. Complete chunk text is intentionally absent: retrieval
+uses the returned `chunk_id` to load current authoritative text and source
+metadata from SQLite. Tenant, deletion, current/explicit version, and
+private/organization ACL filters are part of the vector query itself and are
+revalidated during SQLite hydration.
 
 ## Qdrant and configuration
 
@@ -146,12 +153,39 @@ requires `remote`, HTTPS, and an API key. The application uses one collection an
 creates remote payload indexes for organization, owner, document, version,
 visibility, and deletion filters.
 
+`QDRANT_PREFER_GRPC=true` enables gRPC for a remote deployment that exposes a
+protected gRPC endpoint. Keep it false when only the HTTPS REST endpoint is
+available. Never expose Qdrant's HTTP or gRPC ports publicly without
+authentication, firewall/private-network restrictions, and transport encryption.
+Store the API key in environment configuration supplied by a secrets manager;
+never commit it.
+
+During the validation release, `VECTOR_STORE=qdrant` is the primary provider and
+`VECTOR_STORE=sqlite` is the explicit rollback provider. The older
+`VECTOR_STORE_PROVIDER` name remains a compatibility alias.
+`VECTOR_STORE_ROLLBACK_DUAL_WRITE=true` retains newly generated vectors in
+`chunks.embedding` only after Qdrant confirms its upsert, allowing documents
+created during the rollout to participate in a tested SQLite rollback. Disable
+dual-write after cutover approval and remove the column only in the later,
+separately tested schema release.
+
 `EMBEDDING_DIMENSION` must match `EMBEDDING_MODEL_VERSION`; startup rejects a
 Qdrant collection with a different vector size. Chat retrieves
 `RAG_RETRIEVAL_LIMIT` candidates, removes results below `RAG_MIN_SCORE`, and sends
 at most `RAG_FINAL_CONTEXT_LIMIT` chunks to the LLM. Defaults are 15, 0.35, and 5.
+The threshold is applied by Qdrant and again after retrieval. When no authorized
+chunk survives, chat returns a deterministic ungrounded response without calling
+the LLM. The RAG prompt also forbids general knowledge and unsupported inference.
 No reranker is enabled; add one only with an evaluated model and corpus-specific
-quality tests.
+quality tests, including a separate post-rerank relevance threshold.
+
+Each chunk has a globally unique `vector_point_id`, per-chunk
+`indexing_status`, and `qdrant_indexed_at` confirmation timestamp in SQLite.
+Point IDs are deterministic UUIDv5 values derived from organization, version,
+chunk index, and embedding model. This is intentionally stronger for retries than
+generating a new UUIDv4 on each attempt: repeating a job updates the same Qdrant
+point. Migration `009_chunk_vector_sync` adds the synchronization columns and
+partial unique index without replacing historical IDs.
 
 `GET /health/ready` checks SQLite and Qdrant. `GET /metrics` exposes per-tenant
 document/job gauges plus retries, terminal failures, chunks created, vector
@@ -159,6 +193,118 @@ upsert failures, lifecycle counts, and average extraction/embedding/indexing
 durations. Structured logs correlate request, organization, user, job, document,
 and version identifiers without document content or storage paths.
 `python -m app.reindex` backfills vector payloads after migrating existing data.
+It can read historical SQLite embedding JSON for backward compatibility and
+regenerates vectors from chunk text when that legacy value is absent.
+
+Spreadsheet row labels and vectors can be upgraded independently with the
+tenant-safe spreadsheet reindex command. Review candidates first:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.reindex_spreadsheets --dry-run
+```
+
+Then process active CSV, XLSX, and XLS current versions in bounded batches:
+
+```powershell
+.\venv\Scripts\python.exe -m scripts.reindex_spreadsheets --batch-size 100
+```
+
+Use `--document-id`, `--owner-id`, or `--organization-id` to narrow a rollout,
+`--retry-failed` for recorded failures, and `--force` only for a deliberate
+repeat. The command preserves document/version IDs, replaces labeled vectors
+under their stable point IDs, and restores the previous vector payloads if the
+database update fails.
+
+## One-time SQLite vector migration
+
+Stop API and worker processes before migrating an embedded local Qdrant store.
+Back up SQLite, uploaded objects, and Qdrant from the same maintenance window so
+their document versions remain aligned. For a remote deployment, use provider
+snapshots or an equivalent coordinated backup.
+
+Run the read-only preflight from `backend`:
+
+```powershell
+.\.venv312\Scripts\python.exe -m scripts.migrate_vectors_to_qdrant
+```
+
+Review its JSON counts, then apply:
+
+```powershell
+.\.venv312\Scripts\python.exe -m scripts.migrate_vectors_to_qdrant --apply
+```
+
+Optional flags are `--organization-id`, `--upsert-batch-size`, and
+`--smoke-query-limit`. The command reads only active chunks belonging to
+completed current document versions. It reuses finite legacy vectors only when
+their model and dimension match current configuration; all others are regenerated
+in batches. It assigns deterministic UUIDv5 point IDs, performs idempotent batch
+upserts without clearing the collection, verifies every expected point and
+dimension, and runs tenant/ACL-filtered test queries. SQLite rows are marked
+complete only after all verification succeeds; failures are recorded as
+`indexing_status = 'failed'` and are safe to rerun.
+
+The migration intentionally preserves `chunks.embedding`. Runtime ingestion and
+retrieval do not depend on that JSON column; only transitional migration/reindex
+tools may read it. Keep it for at least one validated production release and
+successful rollback exercise. Remove it later through a separate backed-up
+schema migration, never as part of the vector cutover.
+
+The production responsibility boundary is:
+
+| Component | Responsibility |
+| --- | --- |
+| SQLite | Users, organizations, documents, contents, authoritative chunk text, permissions, jobs, and index state |
+| Qdrant | Embeddings, vector indexes, filtered semantic candidate retrieval |
+| Object storage | Original uploaded files |
+| Embedding model | Converts chunks and questions into compatible vectors |
+| Reranker | Optionally reorders candidates and applies an evaluated relevance threshold |
+| LLM | Answers only from approved retrieved context |
+
+Backend code derives `owner_id` and `organization_id` from authenticated user
+state; request payloads cannot choose either identity. Qdrant payload filtering
+and SQLite hydration both enforce organization and ACL boundaries.
+
+`GET /health` checks SQLite and the selected vector provider. With Qdrant active,
+the response is:
+
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "qdrant": "connected"
+}
+```
+
+`GET /health/ready` additionally returns collection mode, point count, vector
+size, and payload-index names. Embedded Qdrant persists locally but documents
+that payload indexes have no effect; server/Cloud mode creates and reports the
+tenant and ACL payload indexes used by production queries.
+
+Run the read-only active-point reconciliation from `backend`:
+
+```powershell
+.\.venv312\Scripts\python.exe -m scripts.check_vector_consistency
+```
+
+It compares active completed current-version SQLite point IDs with active vector
+store IDs, reports missing/unexpected points, and separately reports unique
+content-chunk and duplicate-content-point counts. It never returns document text.
+
+For the required 20–30-question rollout benchmark, provide a JSONL file whose
+rows contain `question` and optional `expected_chunk_id`, then run:
+
+```powershell
+.\.venv312\Scripts\python.exe -m scripts.compare_vector_retrieval `
+  --questions .\retrieval_questions.jsonl `
+  --output .\retrieval_comparison.csv `
+  --user-id 1 `
+  --organization-id YOUR_ORGANIZATION_ID
+```
+
+The output records both providers' top chunk, score, correctness, and response
+time. Stop an embedded-Qdrant API process before running this command because a
+local persistence directory cannot be opened concurrently.
 
 ## Migrations and verification
 
@@ -175,6 +321,12 @@ Run tests with:
 
 ```powershell
 .\.venv312\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+The isolated Qdrant lifecycle suite can be run independently:
+
+```powershell
+.\.venv312\Scripts\python.exe -m unittest tests.test_qdrant_integration -v
 ```
 
 Image OCR requires the Tesseract executable on `PATH`, in a standard Windows

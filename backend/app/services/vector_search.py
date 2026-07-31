@@ -1,5 +1,7 @@
 """Retrieve authorized current-version chunks through the vector-store provider."""
 
+import json
+
 from app.database import get_connection
 from app.services.document_access import READABLE_DOCUMENT_SQL
 from app.services.embeddings import create_embeddings
@@ -58,6 +60,8 @@ def search_chunks(
             ).fetchall()
     searchable_versions = [int(row["searchable_version_id"]) for row in rows]
     allowed_documents = {int(row["id"]) for row in rows}
+    if not searchable_versions:
+        return []
     if document_id is not None and document_id not in allowed_documents:
         return []
     vector = create_embeddings([query])[0]
@@ -70,21 +74,51 @@ def search_chunks(
         limit=limit,
         score_threshold=min_score,
     )
-    matches = [
-        {
-            "chunk_id": result["chunk_id"],
-            "document_id": result["document_id"],
-            "version_id": result["version_id"],
-            "filename": result["filename"],
-            "referencing_filenames": [result["filename"]],
-            "content": result["text"],
-            "source_type": result.get("source_type", "text"),
-            "source_location": result.get("source_location", {}),
-            "sheet_name": (result.get("source_location") or {}).get("sheet_name"),
-            "row_number": (result.get("source_location") or {}).get("row_start"),
-            "score": round(float(result["score"]), 4),
-        }
-        for result in results
+    ranked = [
+        result for result in results
         if min_score is None or float(result["score"]) >= min_score
     ]
+    chunk_ids = [int(result["chunk_id"]) for result in ranked]
+    if not chunk_ids:
+        return []
+    placeholders = ",".join("?" for _ in chunk_ids)
+    with get_connection() as connection:
+        chunk_rows = connection.execute(
+            f"""SELECT c.id, c.document_id, c.version_id, c.text,
+                       c.source_type, c.source_location_json,
+                       d.display_filename
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.id IN ({placeholders})
+                  AND c.organization_id = ?
+                  AND c.document_id IN ({",".join("?" for _ in allowed_documents)})
+                  AND c.version_id IN ({",".join("?" for _ in searchable_versions)})
+                  AND c.deleted_at IS NULL AND d.deleted_at IS NULL""",
+            (
+                *chunk_ids,
+                organization_id,
+                *sorted(allowed_documents),
+                *searchable_versions,
+            ),
+        ).fetchall()
+    authoritative = {int(row["id"]): row for row in chunk_rows}
+    matches: list[dict[str, object]] = []
+    for result in ranked:
+        row = authoritative.get(int(result["chunk_id"]))
+        if row is None:
+            continue
+        source_location = json.loads(row["source_location_json"] or "{}")
+        matches.append({
+            "chunk_id": int(row["id"]),
+            "document_id": int(row["document_id"]),
+            "version_id": int(row["version_id"]),
+            "filename": str(row["display_filename"]),
+            "referencing_filenames": [str(row["display_filename"])],
+            "content": str(row["text"]),
+            "source_type": str(row["source_type"] or "text"),
+            "source_location": source_location,
+            "sheet_name": source_location.get("sheet_name"),
+            "row_number": source_location.get("row_start"),
+            "score": round(float(result["score"]), 4),
+        })
     return matches

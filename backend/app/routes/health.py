@@ -12,7 +12,24 @@ router = APIRouter(tags=["operations"])
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    try:
+        with get_connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+        vector = get_vector_store().health()
+    except Exception as error:
+        raise HTTPException(
+            status_code=503,
+            detail="A required dependency is unavailable.",
+        ) from error
+    return {
+        "status": "healthy",
+        "database": "connected",
+        "qdrant": (
+            "connected"
+            if vector.get("provider") == "qdrant"
+            else "standby"
+        ),
+    }
 
 
 @router.get("/health/ready")
@@ -21,7 +38,11 @@ def readiness() -> dict[str, object]:
         with get_connection() as connection:
             connection.execute("SELECT 1").fetchone()
         vector = get_vector_store().health()
-        if settings.app_environment == "production" and vector.get("mode") != "remote":
+        if (
+            settings.app_environment == "production"
+            and vector.get("provider") == "qdrant"
+            and vector.get("mode") != "remote"
+        ):
             raise RuntimeError("Production requires a remote persistent Qdrant deployment.")
     except Exception as error:
         raise HTTPException(status_code=503, detail="A required dependency is unavailable.") from error

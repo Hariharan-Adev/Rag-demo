@@ -370,6 +370,9 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     })
     setRecentQuestions(previous => [trimmed, ...previous.filter(item => item !== trimmed)].slice(0, 8))
     setLoadingConversationId(conversationId)
+    setRetrievedDocuments([])
+    setConfidence(0)
+    setMetadata(null)
     setView('chat')
 
     try {
@@ -379,7 +382,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
         selectedCollectionId,
         Number.isFinite(selectedDocumentId) ? selectedDocumentId : null,
       )
-      const sources = response.sources.map(mapSource)
+      const sources = response.grounded ? response.sources.map(mapSource) : []
       const averageScore = sources.length
         ? Math.round(sources.reduce((total, source) => total + source.score, 0) / sources.length)
         : 0

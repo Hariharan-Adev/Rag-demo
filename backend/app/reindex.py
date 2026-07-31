@@ -7,6 +7,7 @@ import json
 
 from app.config import settings
 from app.database import get_connection, initialize_database
+from app.services.embeddings import create_embeddings
 from app.services.vector_store import VectorPoint, get_vector_store
 
 
@@ -21,11 +22,20 @@ def reindex(*, organization_id: str | None = None) -> int:
                JOIN documents d ON d.id = c.document_id
                WHERE c.deleted_at IS NULL AND d.deleted_at IS NULL
                  AND d.current_version_id = c.version_id
-                 AND c.embedding IS NOT NULL
                  AND (? IS NULL OR c.organization_id = ?)
                ORDER BY c.organization_id, c.document_id, c.chunk_index""",
             (organization_id, organization_id),
         ).fetchall()
+    vectors: list[list[float] | None] = [
+        json.loads(row["embedding"]) if row["embedding"] else None
+        for row in rows
+    ]
+    missing = [index for index, vector in enumerate(vectors) if vector is None]
+    for offset in range(0, len(missing), settings.embedding_batch_size):
+        batch_indexes = missing[offset:offset + settings.embedding_batch_size]
+        generated = create_embeddings([str(rows[index]["text"]) for index in batch_indexes])
+        for index, vector in zip(batch_indexes, generated):
+            vectors[index] = vector
     points = [
         VectorPoint(
             organization_id=str(row["organization_id"]),
@@ -35,7 +45,7 @@ def reindex(*, organization_id: str | None = None) -> int:
             content_id=int(row["content_id"]),
             chunk_id=int(row["id"]),
             chunk_index=int(row["chunk_index"]),
-            vector=json.loads(row["embedding"]),
+            vector=vectors[index] or [],
             text=str(row["text"]),
             filename=str(row["display_filename"]),
             visibility=str(row["visibility"]),
@@ -45,7 +55,7 @@ def reindex(*, organization_id: str | None = None) -> int:
                 row["embedding_model"] or settings.embedding_model_version
             ),
         )
-        for row in rows
+        for index, row in enumerate(rows)
     ]
     store = get_vector_store()
     store.clear(organization_id)

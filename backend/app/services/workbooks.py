@@ -7,10 +7,14 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from json import dumps
 from pathlib import Path
+import csv
 import math
 import re
 
 from app.services.document_loader import DocumentParseError
+
+
+STRUCTURED_INDEX_VERSION = "structured-workbook-v2"
 
 
 @dataclass
@@ -232,6 +236,34 @@ def _extract_xls(
     return WorkbookData(sheets)
 
 
+def _extract_csv(path: Path) -> WorkbookData:
+    with path.open(
+        "r",
+        encoding="utf-8-sig",
+        errors="replace",
+        newline="",
+    ) as handle:
+        sample = handle.read(8192)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample)
+        except csv.Error:
+            dialect = csv.excel
+        rows = [
+            (
+                row_number,
+                [_normalized_value(value.strip()) for value in row],
+            )
+            for row_number, row in enumerate(
+                csv.reader(handle, dialect),
+                start=1,
+            )
+        ]
+    return WorkbookData([
+        _make_sheet("CSV", "visible", rows)
+    ])
+
+
 def extract_workbook(
     path: Path,
     include_hidden: bool = True,
@@ -243,12 +275,20 @@ def extract_workbook(
             workbook = _extract_xlsx(path, include_hidden, include_very_hidden)
         elif path.suffix.lower() == ".xls":
             workbook = _extract_xls(path, include_hidden, include_very_hidden)
+        elif path.suffix.lower() == ".csv":
+            workbook = _extract_csv(path)
         else:
             raise DocumentParseError("Unsupported spreadsheet type.")
     except DocumentParseError:
         raise
     except Exception as error:
-        label = "legacy Excel workbook" if path.suffix.lower() == ".xls" else "Excel workbook"
+        label = (
+            "CSV table"
+            if path.suffix.lower() == ".csv"
+            else "legacy Excel workbook"
+            if path.suffix.lower() == ".xls"
+            else "Excel workbook"
+        )
         raise DocumentParseError(f"The {label} could not be read.") from error
     if not workbook.non_empty_sheets:
         failed = ", ".join(workbook.failed_sheets)

@@ -23,11 +23,18 @@ ANALYTICAL_PATTERNS = (
     r"\b(unique|distinct)\b",
     r"\b(summarize|summary|group|breakdown)\b.*\bby\b",
     r"\blist all\b",
+    r"\bshow all\b",
+    r"\bbetween\b.+\band\b",
+    r"\bfrom\b.+\bto\b",
+    r"\b(below|under|less than|up to|at most|above|over|greater than|at least)\b",
     r"\blist\b.*\b(pending|open|closed|overdue|active|inactive|approved|rejected)\b",
 )
 
 ALIASES = (
-    {"cost", "costs", "expense", "expenses", "amount", "spend", "spending", "price", "value"},
+    {
+        "cost", "costs", "expense", "expenses", "amount", "spend", "spending",
+        "price", "priced", "prices", "pricing", "value",
+    },
     {"employee", "employees", "staff", "person", "people", "resource", "resources", "name"},
     {"vendor", "vendors", "supplier", "suppliers"},
     {"product", "products", "item", "items", "sku", "skus"},
@@ -37,6 +44,29 @@ ALIASES = (
     {"status", "state"},
     {"customer", "customers", "client", "clients"},
 )
+
+MONTH_ALIASES = {
+    "jan": "01", "january": "01",
+    "feb": "02", "february": "02",
+    "mar": "03", "march": "03",
+    "apr": "04", "april": "04",
+    "may": "05",
+    "jun": "06", "june": "06",
+    "jul": "07", "july": "07",
+    "aug": "08", "august": "08",
+    "sep": "09", "sept": "09", "september": "09",
+    "oct": "10", "october": "10",
+    "nov": "11", "november": "11",
+    "dec": "12", "december": "12",
+}
+MONTH_LABELS = {
+    f"{month:02d}": label
+    for month, label in enumerate(
+        ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"),
+        start=1,
+    )
+}
 
 
 @dataclass
@@ -57,6 +87,19 @@ class WorkbookScope:
 def is_analytical_question(question: str) -> bool:
     normalized = " ".join(question.casefold().split())
     return any(re.search(pattern, normalized) for pattern in ANALYTICAL_PATTERNS)
+
+
+def is_structured_lookup_question(
+    question: str,
+    owner_id: int,
+    collection_id: int | None = None,
+    document_id: int | None = None,
+) -> bool:
+    """Return whether accessible structured rows can answer a direct lookup."""
+    return any(
+        _lookup_plan(scope.rows, question) is not None
+        for scope in _load_scopes(owner_id, collection_id, document_id)
+    )
 
 
 def has_structured_workbook(
@@ -83,6 +126,79 @@ def _tokens(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
+def _normalized_text(value: object) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+
+
+def _canonical_scalar(value: object) -> str:
+    normalized = _normalized_text(value)
+    return MONTH_ALIASES.get(normalized, normalized)
+
+
+def _question_mentions_value(question: str, value: object) -> bool:
+    normalized_value = _normalized_text(value)
+    if not normalized_value:
+        return False
+    normalized_question = _normalized_text(question)
+    canonical_value = MONTH_ALIASES.get(normalized_value)
+    if canonical_value is not None:
+        return any(
+            canonical == canonical_value and re.search(
+                rf"\b{re.escape(alias)}\b", normalized_question
+            )
+            for alias, canonical in MONTH_ALIASES.items()
+        )
+    return bool(re.search(
+        rf"(?:^|\s){re.escape(normalized_value)}(?:\s|$)",
+        normalized_question,
+    ))
+
+
+def _row_filters(
+    rows: list[RowRecord],
+    question: str,
+) -> dict[str, set[str]]:
+    """Find exact categorical values named by the question, grouped by column."""
+    columns = _column_values(rows)
+    filters: dict[str, set[str]] = {}
+    for header, values in columns.items():
+        matches = {
+            _canonical_scalar(value)
+            for value in values
+            if not isinstance(value, (int, float, Decimal, bool))
+            and _question_mentions_value(question, value)
+        }
+        if matches:
+            filters[header] = matches
+    normalized_question = _normalized_text(question)
+    mentioned_months = {
+        canonical
+        for alias, canonical in MONTH_ALIASES.items()
+        if re.search(rf"\b{re.escape(alias)}\b", normalized_question)
+    }
+    if mentioned_months:
+        for header in columns:
+            if _tokens(header) & {"month", "months"}:
+                filters.setdefault(header, set()).update(mentioned_months)
+    return filters
+
+
+def _apply_row_filters(
+    rows: list[RowRecord],
+    filters: dict[str, set[str]],
+) -> list[RowRecord]:
+    if not filters:
+        return rows
+    return [
+        row
+        for row in rows
+        if all(
+            _canonical_scalar(row.values.get(header)) in accepted
+            for header, accepted in filters.items()
+        )
+    ]
+
+
 def _number(value: object) -> Decimal | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -103,6 +219,96 @@ def _number(value: object) -> Decimal | None:
         return -result if negative and result > 0 else result
     except InvalidOperation:
         return None
+
+
+def _cell_number(value: object) -> Decimal | None:
+    """Parse real numeric cells without treating identifiers like RT-200 as numbers."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        return _number(value)
+    text = str(value).strip()
+    if not re.fullmatch(
+        r"[$€£₹]?\s*\(?-?\d[\d,]*(?:\.\d+)?\)?",
+        text,
+    ):
+        return None
+    return _number(text)
+
+
+def _quantity_number(value: object) -> Decimal | None:
+    """Parse query quantities, including common Indian and international units."""
+    number = _number(value)
+    if number is None:
+        return None
+    normalized = _normalized_text(value)
+    multipliers = (
+        ({"crore", "crores", "cr"}, Decimal("10000000")),
+        ({"lakh", "lakhs", "lac", "lacs", "lak", "laks"}, Decimal("100000")),
+        ({"million", "millions", "mn"}, Decimal("1000000")),
+        ({"thousand", "thousands", "k"}, Decimal("1000")),
+    )
+    tokens = set(normalized.split())
+    for aliases, multiplier in multipliers:
+        if tokens & aliases:
+            return number * multiplier
+    return number
+
+
+def _has_monetary_limit(question: str) -> bool:
+    normalized = _normalized_text(question)
+    tokens = set(normalized.split())
+    return (
+        bool(tokens & {
+            "lakh", "lakhs", "lac", "lacs", "lak", "laks",
+            "crore", "crores", "cr", "million", "millions", "mn",
+        })
+        or any(symbol in question for symbol in ("₹", "$", "€", "£"))
+    )
+
+
+def _numeric_range(question: str) -> tuple[Decimal, Decimal] | None:
+    normalized = " ".join(question.split())
+    match = re.search(
+        r"\bbetween\b(.+?)\band\b(.+?)(?:[?.!]|$)",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        match = re.search(
+            r"\bfrom\b(.+?)\bto\b(.+?)(?:[?.!]|$)",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+    if match is None:
+        return None
+    lower = _quantity_number(match.group(1))
+    upper = _quantity_number(match.group(2))
+    if lower is None or upper is None:
+        return None
+    return (min(lower, upper), max(lower, upper))
+
+
+def _numeric_bound(question: str) -> tuple[str, Decimal] | None:
+    """Parse one-sided comparisons such as below, at most, above, or at least."""
+    normalized = " ".join(question.split())
+    quantity = (
+        r"([(-]?\d[\d,.\s]*"
+        r"(?:crores?|cr|lakhs?|lacs?|laks?|millions?|mn|thousands?|k)?)"
+    )
+    patterns = (
+        ("lt", rf"\b(?:below|under|less\s+than)\b[^\d(-]*{quantity}"),
+        ("lte", rf"\b(?:up\s+to|at\s+most|no\s+more\s+than)\b[^\d(-]*{quantity}"),
+        ("gt", rf"\b(?:above|over|greater\s+than|more\s+than)\b[^\d(-]*{quantity}"),
+        ("gte", rf"\b(?:at\s+least|no\s+less\s+than)\b[^\d(-]*{quantity}"),
+    )
+    for operator, pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match is not None and (
+            value := _quantity_number(match.group(1))
+        ) is not None:
+            return operator, value
+    return None
 
 
 def _load_scopes(
@@ -244,7 +450,7 @@ def _resolve_column(
     subject = hint or question
     candidates: list[tuple[int, str]] = []
     for header, values in columns.items():
-        if numeric and not any(_number(value) is not None for value in values):
+        if numeric and not any(_cell_number(value) is not None for value in values):
             continue
         score = _column_score(header, subject)
         if score > 0:
@@ -257,6 +463,30 @@ def _resolve_column(
     if len(tied) > 1:
         return None, f"Which column should I use: {', '.join(tied)}?"
     return candidates[0][1], None
+
+
+def _lookup_plan(
+    rows: list[RowRecord],
+    question: str,
+) -> tuple[str, dict[str, set[str]]] | None:
+    """Resolve a requested output column plus one or more exact row filters."""
+    filters = _row_filters(rows, question)
+    if not filters:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for header in _column_values(rows):
+        if header in filters:
+            continue
+        score = _column_score(header, question)
+        if score > 0:
+            candidates.append((score, header))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1].casefold()))
+    top_score = candidates[0][0]
+    if sum(score == top_score for score, _ in candidates) != 1:
+        return None
+    return candidates[0][1], filters
 
 
 def _operation(question: str) -> str:
@@ -292,29 +522,241 @@ def _display(value: object) -> str:
     return escape(text, quote=False).replace("|", r"\|")
 
 
-def _sources(scope: WorkbookScope, sheets: list[str], rows: list[RowRecord] | None = None):
-    row_lookup: dict[str, int | None] = {sheet: None for sheet in sheets}
+def _records_table(
+    scope: WorkbookScope,
+    rows: list[RowRecord],
+) -> str:
+    headers: list[str] = []
+    for row in rows:
+        for header in row.values:
+            if header not in headers:
+                headers.append(header)
+    display_rows = rows[:100]
+    table_headers = [*headers, "Source"]
+    lines = [
+        "| " + " | ".join(_display(header) for header in table_headers) + " |",
+        "|" + "|".join("---" for _ in table_headers) + "|",
+    ]
+    for row in display_rows:
+        values = []
+        for header in headers:
+            value = row.values.get(header)
+            numeric = _cell_number(value)
+            values.append(
+                _format_number(numeric)
+                if numeric is not None
+                else _display("" if value is None else value)
+            )
+        source = (
+            f"{scope.filename}, row {row.row_number}"
+            if scope.filename.casefold().endswith(".csv")
+            else f"{scope.filename}, {row.sheet}, row {row.row_number}"
+        )
+        lines.append(
+            "| " + " | ".join([*values, _display(source)]) + " |"
+        )
+    if len(rows) > 100:
+        lines.append("")
+        lines.append(f"_{len(rows) - 100} additional matching rows omitted._")
+    return "\n".join(lines)
+
+
+def _column_letter(index: int) -> str:
+    output = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        output = chr(65 + remainder) + output
+    return output
+
+
+def _sources(
+    scope: WorkbookScope,
+    sheets: list[str],
+    rows: list[RowRecord] | None = None,
+    value_column: str | None = None,
+):
+    row_lookup: dict[str, list[int]] = {sheet: [] for sheet in sheets}
     for row in rows or []:
-        row_lookup.setdefault(row.sheet, row.row_number)
-        if row_lookup[row.sheet] is None:
-            row_lookup[row.sheet] = row.row_number
+        row_lookup.setdefault(row.sheet, []).append(row.row_number)
+    source_type = "csv" if scope.filename.casefold().endswith(".csv") else "excel"
+    column_index = None
+    if value_column and rows:
+        headers = list(rows[0].values)
+        if value_column in headers:
+            column_index = headers.index(value_column) + 1
     return [
         {
             "document_id": scope.document_id,
             "filename": scope.filename,
-            "source_type": "excel",
+            "source_type": source_type,
             "source_location": {
-                "sheet_name": sheet,
-                "row_start": row_lookup.get(sheet),
-                "row_end": row_lookup.get(sheet),
+                "sheet_name": "CSV" if source_type == "csv" else sheet,
+                "row_start": (
+                    min(row_lookup[sheet]) if row_lookup.get(sheet) else None
+                ),
+                "row_end": (
+                    max(row_lookup[sheet]) if row_lookup.get(sheet) else None
+                ),
+                **(
+                    {
+                        "cell_range": (
+                            f"{_column_letter(column_index)}"
+                            f"{min(row_lookup[sheet])}:"
+                            f"{_column_letter(column_index)}"
+                            f"{max(row_lookup[sheet])}"
+                        )
+                    }
+                    if column_index is not None and row_lookup.get(sheet)
+                    else {}
+                ),
             },
             # Deprecated response aliases retained for older clients.
-            "sheet_name": sheet,
-            "row_number": row_lookup.get(sheet),
+            "sheet_name": "CSV" if source_type == "csv" else sheet,
+            "row_number": (
+                min(row_lookup[sheet]) if row_lookup.get(sheet) else None
+            ),
             "retrieval_score": None,
         }
         for sheet in sheets
     ]
+
+
+def _filter_label(filters: dict[str, set[str]]) -> str:
+    return ", ".join(
+        f"{_display(header)}={_display('/'.join(
+            MONTH_LABELS.get(value, value) for value in sorted(values)
+        ))}"
+        for header, values in filters.items()
+    )
+
+
+def _structured_lookup_response(
+    scopes: list[WorkbookScope],
+    question: str,
+) -> dict[str, object] | None:
+    matches: list[tuple[WorkbookScope, RowRecord, str, dict[str, set[str]]]] = []
+    planned_scopes = 0
+    matched_filters: list[tuple[WorkbookScope, str, dict[str, set[str]]]] = []
+    for scope in scopes:
+        plan = _lookup_plan(scope.rows, question)
+        if plan is None:
+            continue
+        planned_scopes += 1
+        value_column, filters = plan
+        matched_filters.append((scope, value_column, filters))
+        for row in _apply_row_filters(scope.rows, filters):
+            value = row.values.get(value_column)
+            if value is not None and str(value).strip():
+                matches.append((scope, row, value_column, filters))
+    if not planned_scopes:
+        return None
+    if not matches:
+        sources = [
+            source
+            for scope, value_column, _ in matched_filters
+            for source in _sources(
+                scope,
+                scope.sheet_names,
+                scope.rows,
+                value_column=value_column,
+            )
+        ]
+        return {
+            "answer": "No matching structured rows were found in the accessible workbooks.",
+            "question_type": "structured_lookup",
+            "calculation_basis": (
+                f"Exhaustively checked {planned_scopes} matching workbook(s)."
+            ),
+            "sources": sources,
+            "grounded": bool(sources),
+            "matched_document_count": planned_scopes,
+            "matched_row_count": 0,
+        }
+
+    lines = [
+        "| File | Sheet | Match | Field | Value | Location |",
+        "|---|---|---|---|---:|---|",
+    ]
+    sources: list[dict[str, object]] = []
+    grouped: dict[tuple[int, str], list[RowRecord]] = defaultdict(list)
+    grouped_columns: dict[tuple[int, str], str] = {}
+    for scope, row, value_column, filters in matches:
+        key = (scope.document_id, row.sheet)
+        grouped[key].append(row)
+        grouped_columns[key] = value_column
+    operation = _operation(question)
+    if operation in {"total", "average", "maximum", "minimum"}:
+        aggregate_groups: dict[
+            tuple[int, str, str],
+            list[tuple[WorkbookScope, RowRecord]],
+        ] = defaultdict(list)
+        for scope, row, value_column, filters in matches:
+            aggregate_groups[
+                (scope.document_id, value_column, _filter_label(filters))
+            ].append((scope, row))
+        for (_, value_column, filter_text), entries in aggregate_groups.items():
+            numeric = [
+                value
+                for _, row in entries
+                if (value := _cell_number(row.values.get(value_column))) is not None
+            ]
+            if not numeric:
+                continue
+            result = {
+                "total": sum(numeric, Decimal(0)),
+                "average": sum(numeric, Decimal(0)) / len(numeric),
+                "maximum": max(numeric),
+                "minimum": min(numeric),
+            }[operation]
+            scope = entries[0][0]
+            sheets = ", ".join(sorted({row.sheet for _, row in entries}))
+            lines.append(
+                f"| {_display(scope.filename)} | {_display(sheets)} | "
+                f"{filter_text} | {_display(operation.title() + ' ' + value_column)} | "
+                f"{_format_number(result)} | {len(entries)} matching row(s) |"
+            )
+    else:
+        for scope, row, value_column, filters in matches:
+            value = _cell_number(row.values.get(value_column))
+            rendered = (
+                _format_number(value)
+                if value is not None
+                else _display(row.values.get(value_column))
+            )
+            headers = list(row.values)
+            column_index = headers.index(value_column) + 1
+            cell = f"{_column_letter(column_index)}{row.row_number}"
+            lines.append(
+                f"| {_display(scope.filename)} | {_display(row.sheet)} | "
+                f"{_filter_label(filters)} | {_display(value_column)} | "
+                f"{rendered} | row {row.row_number}, {cell} |"
+            )
+    for scope in scopes:
+        for (document_id, sheet), selected_rows in grouped.items():
+            if document_id != scope.document_id:
+                continue
+            sources.extend(_sources(
+                scope,
+                [sheet],
+                selected_rows,
+                value_column=grouped_columns[(document_id, sheet)],
+            ))
+    document_count = len({scope.document_id for scope, _, _, _ in matches})
+    return {
+        "answer": "\n".join(lines),
+        "question_type": (
+            "structured_analysis"
+            if operation in {"total", "average", "maximum", "minimum"}
+            else "structured_lookup"
+        ),
+        "calculation_basis": (
+            f"{len(matches)} matching row(s) across {document_count} workbook(s)."
+        ),
+        "sources": sources,
+        "grounded": bool(sources),
+        "matched_document_count": document_count,
+        "matched_row_count": len(matches),
+    }
 
 
 def _response(
@@ -324,11 +766,13 @@ def _response(
     basis: str,
     rows: list[RowRecord] | None = None,
 ) -> dict[str, object]:
+    sources = _sources(scope, sheets, rows)
     return {
         "answer": answer,
         "question_type": "analytical",
         "calculation_basis": basis,
-        "sources": _sources(scope, sheets, rows),
+        "sources": sources,
+        "grounded": bool(sources),
     }
 
 
@@ -339,16 +783,18 @@ def analyze_workbook_question(
     document_id: int | None = None,
 ) -> dict[str, object]:
     """Answer an analytical question without sampling vector-search results."""
-    chosen = _choose_workbook(
-        _load_scopes(owner_id, collection_id, document_id),
-        question,
-    )
+    scopes = _load_scopes(owner_id, collection_id, document_id)
+    lookup = _structured_lookup_response(scopes, question)
+    if lookup is not None:
+        return lookup
+    chosen = _choose_workbook(scopes, question)
     if chosen is None:
         return {
             "answer": "No accessible structured workbook was found in the selected scope.",
             "question_type": "analytical",
             "calculation_basis": "No owned workbook rows were available.",
             "sources": [],
+            "grounded": False,
         }
     if isinstance(chosen, str):
         return {
@@ -356,6 +802,7 @@ def analyze_workbook_question(
             "question_type": "clarification",
             "calculation_basis": "Multiple workbooks are in scope.",
             "sources": [],
+            "grounded": False,
         }
 
     scope = chosen
@@ -369,6 +816,16 @@ def analyze_workbook_question(
         )
 
     operation = _operation(question)
+    filters = _row_filters(rows, question)
+    if filters:
+        rows = _apply_row_filters(rows, filters)
+        if not rows:
+            return _response(
+                scope,
+                "No matching structured rows were found in the selected workbook.",
+                relevant_sheets,
+                f"0 rows matched {_filter_label(filters)}.",
+            )
     sheet_count = len({row.sheet for row in rows})
     scope_basis = f"{len(rows)} data rows across {sheet_count} worksheet(s)"
 
@@ -422,9 +879,9 @@ def analyze_workbook_question(
                 scope_basis,
             )
         numeric_rows = [
-            (row, _number(row.values.get(value_column)))
+            (row, _cell_number(row.values.get(value_column)))
             for row in rows
-            if _number(row.values.get(value_column)) is not None
+            if _cell_number(row.values.get(value_column)) is not None
         ]
         if not numeric_rows:
             return _response(
@@ -461,7 +918,11 @@ def analyze_workbook_question(
             labels = [
                 f"{_display(header)}: {_display(value)}"
                 for header, value in selected_row.values.items()
-                if header != value_column and value is not None and _number(value) is None
+                if (
+                    header != value_column
+                    and value is not None
+                    and _cell_number(value) is None
+                )
             ][:2]
             label = f" ({'; '.join(labels)})" if labels else ""
             basis = f"{len(numeric_rows)} valid '{value_column}' values"
@@ -510,6 +971,75 @@ def analyze_workbook_question(
         if re.search(rf"\b{word}\b", question.casefold())
     }
     selected = rows
+    range_bounds = _numeric_range(question)
+    if range_bounds is not None:
+        range_column, clarification = _resolve_column(
+            rows,
+            question,
+            numeric=True,
+        )
+        if clarification:
+            return _response(
+                scope,
+                clarification,
+                relevant_sheets,
+                scope_basis,
+            )
+        if range_column is None:
+            return _response(
+                scope,
+                "The table does not contain an identifiable numeric column for this range.",
+                relevant_sheets,
+                scope_basis,
+            )
+        lower, upper = range_bounds
+        selected = [
+            row
+            for row in rows
+            if (
+                (value := _cell_number(row.values.get(range_column))) is not None
+                and lower <= value <= upper
+            )
+        ]
+    bound = _numeric_bound(question)
+    if bound is not None:
+        bound_column, clarification = _resolve_column(
+            rows,
+            question,
+            numeric=True,
+        )
+        if bound_column is None and clarification is None and _has_monetary_limit(
+            question
+        ):
+            bound_column, clarification = _resolve_column(
+                rows,
+                "price cost amount value",
+                numeric=True,
+            )
+        if clarification:
+            return _response(scope, clarification, relevant_sheets, scope_basis)
+        if bound_column is None:
+            return _response(
+                scope,
+                "The table does not contain an identifiable numeric column for this limit.",
+                relevant_sheets,
+                scope_basis,
+            )
+        operator, threshold = bound
+        comparisons = {
+            "lt": lambda value: value < threshold,
+            "lte": lambda value: value <= threshold,
+            "gt": lambda value: value > threshold,
+            "gte": lambda value: value >= threshold,
+        }
+        selected = [
+            row
+            for row in selected
+            if (
+                (value := _cell_number(row.values.get(bound_column))) is not None
+                and comparisons[operator](value)
+            )
+        ]
     if status_words:
         if status_column is None:
             return _response(
@@ -520,23 +1050,23 @@ def analyze_workbook_question(
             )
         selected = [
             row
-            for row in rows
+            for row in selected
             if str(row.values.get(status_column, "")).strip().casefold() in status_words
         ]
-    lines = []
-    for row in selected[:100]:
-        fields = " | ".join(
-            f"{_display(header)}: {_display(value)}"
-            for header, value in row.values.items()
-            if value is not None and str(value).strip()
-        )
-        lines.append(f"- {row.sheet}, row {row.row_number}: {fields}")
-    suffix = "\n- …additional rows omitted" if len(selected) > 100 else ""
     basis = f"{len(selected)} matching rows from {scope_basis}"
     return _response(
         scope,
-        f"Matching records ({len(selected)}):\n" + "\n".join(lines) + suffix,
-        sorted({row.sheet for row in selected}),
+        (
+            f"Matching records ({len(selected)}):\n\n"
+            + _records_table(scope, selected)
+            if selected
+            else "Matching records (0): No rows satisfied the requested filters."
+        ),
+        (
+            sorted({row.sheet for row in selected})
+            if selected
+            else relevant_sheets
+        ),
         basis,
-        selected,
+        selected if selected else rows,
     )

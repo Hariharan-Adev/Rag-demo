@@ -199,6 +199,13 @@ def _xlsx(
                     )
                     if cell.value is not None
                 ]
+                header_by_column = {
+                    cell.column: str(cell.value).strip()
+                    for cell in (
+                        worksheet[header_row_number] if header_row_number else []
+                    )
+                    if cell.value is not None and str(cell.value).strip()
+                }
                 tables: list[tuple[str, tuple[int, int, int, int]]] = [
                     (table.name, range_boundaries(table.ref))
                     for table in worksheet.tables.values()
@@ -222,7 +229,8 @@ def _xlsx(
                     }
                     values = [
                         (
-                            f"{cell.coordinate}: {cell.value}"
+                            f"{header_by_column.get(cell.column, cell.coordinate)}: "
+                            f"{cell.value}"
                             + (
                                 f" (cached value: {values_sheet[cell.coordinate].value})"
                                 if cell.coordinate in formulas
@@ -243,7 +251,10 @@ def _xlsx(
                         ),
                         None,
                     )
-                    result.append(SourceChunk("\t".join(values), "excel", {
+                    result.append(SourceChunk(
+                        f"Sheet: {worksheet.title} | " + " | ".join(values),
+                        "excel",
+                        {
                         "sheet_name": worksheet.title,
                         "hidden_sheet": hidden,
                         "sheet_hidden": hidden,
@@ -259,7 +270,8 @@ def _xlsx(
                         "header_context": header_context,
                         "merged_ranges": merged_ranges,
                         "formulas": formulas,
-                    }))
+                        },
+                    ))
         finally:
             workbook.close()
             values_workbook.close()
@@ -305,6 +317,18 @@ def _xls(
                     ]
                     if header_row else []
                 )
+                header_by_column = (
+                    {
+                        column: str(
+                            sheet.cell_value(header_row - 1, column)
+                        ).strip()
+                        for column in range(sheet.ncols)
+                        if sheet.cell_value(
+                            header_row - 1, column
+                        ) not in ("", None)
+                    }
+                    if header_row else {}
+                )
                 for row_index in range(sheet.nrows):
                     populated = [
                         column for column in range(sheet.ncols)
@@ -316,8 +340,8 @@ def _xls(
                     column_start = get_column_letter(min(populated) + 1)
                     column_end = get_column_letter(max(populated) + 1)
                     result.append(SourceChunk(
-                        "\t".join(
-                            f"{get_column_letter(column + 1)}{row_number}: "
+                        f"Sheet: {sheet.name} | " + " | ".join(
+                            f"{header_by_column.get(column, get_column_letter(column + 1))}: "
                             f"{sheet.cell_value(row_index, column)}"
                             for column in populated
                         ),
@@ -389,14 +413,27 @@ def _csv(path: Path) -> list[SourceChunk]:
                 dialect = csv.Sniffer().sniff(sample)
             except csv.Error:
                 dialect = csv.excel
+            rows = [
+                (row_number, [str(value).strip() for value in row])
+                for row_number, row in enumerate(
+                    csv.reader(handle, dialect),
+                    start=1,
+                )
+                if any(str(value).strip() for value in row)
+            ]
+            headers = rows[0][1] if rows else []
             return [
                 SourceChunk(
-                    "\t".join(str(value).strip() for value in row),
+                    " | ".join(
+                        f"{(headers[index] if index < len(headers) and headers[index] else f'Column {index + 1}')}: "
+                        f"{value}"
+                        for index, value in enumerate(row)
+                        if value
+                    ),
                     "csv",
                     {"row_start": row_number, "row_end": row_number},
                 )
-                for row_number, row in enumerate(csv.reader(handle, dialect), start=1)
-                if any(str(value).strip() for value in row)
+                for row_number, row in rows
             ]
     except Exception as error:
         raise DocumentParseError("The CSV file could not be read.") from error

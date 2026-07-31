@@ -67,6 +67,13 @@ class FakeVectorStore(VectorStore):
     def contains_points(self, point_ids: list[str]) -> bool:
         return all(point_id in self.points for point_id in point_ids)
 
+    def get_vectors(self, point_ids: list[str]) -> dict[str, list[float]]:
+        return {
+            point_id: self.points[point_id].vector
+            for point_id in point_ids
+            if point_id in self.points
+        }
+
     def set_document_deleted(
         self, organization_id: str, document_id: int, deleted: bool
     ) -> None:
@@ -248,6 +255,16 @@ class MultitenantArchitectureTests(unittest.TestCase):
                 "vector_point_id", "embedding_model", "embedding_dimension",
                 "qdrant_indexed_at", "indexing_status", "deleted_at", "deleted_by",
             }.issubset(chunk_columns))
+            content_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(document_contents)"
+                )
+            }
+            self.assertTrue({
+                "structured_index_status", "structured_index_version",
+                "structured_indexed_at", "structured_index_error",
+            }.issubset(content_columns))
             job_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(ingestion_jobs)")
@@ -279,6 +296,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
             )
             self.assertIn("idx_chunks_content_version_index", indexes)
             self.assertIn("ux_chunks_vector_point_id", indexes)
+            self.assertIn("idx_contents_structured_retry", indexes)
             self.assertIsNotNone(connection.execute(
                 """SELECT 1 FROM schema_migrations
                    WHERE version = '008_active_content_indexes'"""
@@ -286,6 +304,10 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.assertIsNotNone(connection.execute(
                 """SELECT 1 FROM schema_migrations
                    WHERE version = '009_chunk_vector_sync'"""
+            ).fetchone())
+            self.assertIsNotNone(connection.execute(
+                """SELECT 1 FROM schema_migrations
+                   WHERE version = '010_structured_csv_indexing'"""
             ).fetchone())
 
     def test_active_content_index_migration_is_restart_safe(self) -> None:
@@ -692,10 +714,15 @@ class MultitenantArchitectureTests(unittest.TestCase):
         before = len(self.fake_store.points)
         ingestion_jobs.process_job(second["job_id"])
         self.assertEqual(len(self.fake_store.points), before)
+        self.fake_store.points = {
+            key: VectorPoint(**{**point.__dict__, "text": "forged vector payload"})
+            for key, point in self.fake_store.points.items()
+        }
         results = vector_search.search_chunks(
             "restorable", 10, organization_id="org-a"
         )
         self.assertEqual({row["document_id"] for row in results}, {second["document_id"]})
+        self.assertEqual(results[0]["content"], "restorable policy")
         with patch(
             "app.services.rag_service.generate_answer",
             return_value={
@@ -719,6 +746,52 @@ class MultitenantArchitectureTests(unittest.TestCase):
         self.assertEqual(
             restore_conflict.json()["detail"]["code"], "DOCUMENT_ALREADY_EXISTS"
         )
+
+    def test_pending_chunks_commit_before_embeddings_and_keep_text_authoritative(self) -> None:
+        accepted = self.upload(
+            b"authoritative sqlite chunk text", "pending-before-embedding"
+        ).json()
+
+        def embed_after_pending_commit(texts: list[str]) -> list[list[float]]:
+            with database.get_connection() as connection:
+                rows = connection.execute(
+                    """SELECT text, embedding, indexing_status
+                       FROM chunks WHERE version_id = ?""",
+                    (accepted["version_id"],),
+                ).fetchall()
+                content_status = connection.execute(
+                    """SELECT dc.processing_status
+                       FROM document_versions dv
+                       JOIN document_contents dc ON dc.id = dv.content_id
+                       WHERE dv.id = ?""",
+                    (accepted["version_id"],),
+                ).fetchone()["processing_status"]
+            self.assertEqual([row["text"] for row in rows], texts)
+            self.assertTrue(all(row["embedding"] is None for row in rows))
+            self.assertTrue(all(row["indexing_status"] == "pending" for row in rows))
+            self.assertEqual(content_status, "processing")
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
+        with patch.object(
+            ingestion_jobs,
+            "create_embeddings",
+            side_effect=embed_after_pending_commit,
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-pending-first"))
+
+        with database.get_connection() as connection:
+            row = connection.execute(
+                """SELECT c.embedding, c.indexing_status, c.qdrant_indexed_at,
+                          dc.processing_status
+                   FROM chunks c
+                   JOIN document_contents dc ON dc.id = c.content_id
+                   WHERE c.version_id = ?""",
+                (accepted["version_id"],),
+            ).fetchone()
+        self.assertIsNone(row["embedding"])
+        self.assertEqual(row["indexing_status"], "completed")
+        self.assertIsNotNone(row["qdrant_indexed_at"])
+        self.assertEqual(row["processing_status"], "completed")
 
     def test_active_duplicate_is_terminal_and_cross_user_content_is_isolated(self) -> None:
         first = self.upload(b"owner scoped content", "active-owner").json()
@@ -863,7 +936,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
                     self.assertEqual(job["status"], "completed")
                     self.assertTrue(job["result"]["reused_deleted_content"])
 
-    def test_deleted_reupload_rebuilds_missing_embeddings(self) -> None:
+    def test_deleted_reupload_uses_qdrant_when_sqlite_embedding_is_missing(self) -> None:
         first = self.upload(b"rebuild missing embedding", "missing-embedding").json()
         self.assertTrue(ingestion_jobs.run_one("worker-missing-original"))
         self.assertEqual(
@@ -897,7 +970,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
         completed = self.client.get(f"/api/jobs/{second['job_id']}").json()
         self.assertEqual(completed["status"], "completed")
         self.assertTrue(completed["result"]["reused_deleted_content"])
-        self.assertEqual(len(embedded_batches), 1)
+        self.assertEqual(embedded_batches, [])
         with database.get_connection() as connection:
             rebuilt = connection.execute(
                 """SELECT dv.content_id, c.embedding
@@ -907,9 +980,9 @@ class MultitenantArchitectureTests(unittest.TestCase):
                 (second["version_id"],),
             ).fetchone()
         self.assertEqual(rebuilt["content_id"], original_content_id)
-        self.assertIsNotNone(rebuilt["embedding"])
+        self.assertIsNone(rebuilt["embedding"])
 
-    def test_deleted_reupload_missing_vectors_resumes_without_reembedding(self) -> None:
+    def test_deleted_reupload_missing_vectors_regenerates_embeddings_safely(self) -> None:
         first = self.upload(b"vector recovery", "vector-original").json()
         self.assertTrue(ingestion_jobs.run_one("worker-vector-original"))
         self.assertEqual(
@@ -945,14 +1018,14 @@ class MultitenantArchitectureTests(unittest.TestCase):
                    WHERE id = ?""",
                 (second["job_id"],),
             )
+        regenerated: list[list[str]] = []
+
+        def regenerate(texts: list[str]) -> list[list[float]]:
+            regenerated.append(texts)
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
         with patch.object(
-            ingestion_jobs,
-            "_extract_bundle",
-            side_effect=AssertionError("retry must reuse persisted chunks"),
-        ), patch.object(
-            ingestion_jobs,
-            "create_embeddings",
-            side_effect=AssertionError("retry must not regenerate embeddings"),
+            ingestion_jobs, "create_embeddings", side_effect=regenerate
         ):
             self.assertTrue(ingestion_jobs.run_one("worker-vector-resume"))
         completed = self.client.get(f"/api/jobs/{second['job_id']}").json()
@@ -969,6 +1042,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
         point_ids = [row["vector_point_id"] for row in rows]
         self.assertTrue(all(row["indexing_status"] == "completed" for row in rows))
         self.assertTrue(all(row["qdrant_indexed_at"] for row in rows))
+        self.assertEqual(len(regenerated), 1)
         self.assertTrue(self.fake_store.contains_points(point_ids))
 
     def test_transient_vector_failure_resumes_existing_chunks_with_backoff(self) -> None:
@@ -999,15 +1073,29 @@ class MultitenantArchitectureTests(unittest.TestCase):
                    WHERE id = ?""",
                 (accepted["job_id"],),
             )
+        regenerated: list[list[str]] = []
+
+        def regenerate(texts: list[str]) -> list[list[float]]:
+            regenerated.append(texts)
+            return [[1.0] + [0.0] * 383 for _ in texts]
+
         with patch.object(
-            ingestion_jobs,
-            "extract_source_chunks",
-            side_effect=AssertionError("retry must reuse durable chunks"),
+            ingestion_jobs, "create_embeddings", side_effect=regenerate
         ):
             self.assertTrue(ingestion_jobs.run_one("worker-resume"))
         completed = self.client.get(f"/api/jobs/{accepted['job_id']}").json()
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["attempt_count"], 2)
+        self.assertEqual(len(regenerated), 1)
+        with database.get_connection() as connection:
+            chunk = connection.execute(
+                """SELECT embedding, indexing_status, qdrant_indexed_at
+                   FROM chunks WHERE document_id = ?""",
+                (accepted["document_id"],),
+            ).fetchone()
+        self.assertIsNone(chunk["embedding"])
+        self.assertEqual(chunk["indexing_status"], "completed")
+        self.assertIsNotNone(chunk["qdrant_indexed_at"])
 
     def test_archive_request_only_enqueues_and_worker_fans_out_child_jobs(self) -> None:
         output = BytesIO()

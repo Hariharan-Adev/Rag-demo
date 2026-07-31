@@ -42,7 +42,20 @@ class QdrantVectorStoreTests(unittest.TestCase):
             )
         ]
         store.upsert(points)
+        with self.assertRaisesRegex(ValueError, "dimension"):
+            store.upsert([
+                VectorPoint(
+                    **{
+                        **points[0].__dict__,
+                        "vector": [1.0, 0.0],
+                    }
+                )
+            ])
         self.assertTrue(store.contains_points([point.point_id for point in points]))
+        self.assertEqual(
+            store.get_vectors([points[0].point_id]),
+            {points[0].point_id: vector},
+        )
         results = store.search(
             vector,
             organization_id="org-a",
@@ -51,7 +64,8 @@ class QdrantVectorStoreTests(unittest.TestCase):
             document_id=10,
             limit=10,
         )
-        self.assertEqual([result["text"] for result in results], ["current"])
+        self.assertEqual([result["chunk_id"] for result in results], [1])
+        self.assertNotIn("text", results[0])
         self.assertEqual(results[0]["content_id"], 100)
         self.assertEqual(store.search(
             [-1.0] + [0.0] * 383,
@@ -117,8 +131,8 @@ class QdrantVectorStoreTests(unittest.TestCase):
             limit=10,
         )
         self.assertEqual(
-            {result["text"] for result in acl_results},
-            {"current", "organization visible"},
+            {result["document_id"] for result in acl_results},
+            {10, 12},
         )
         store.set_version_deleted("org-a", 10, 100, True)
         self.assertEqual(store.search(

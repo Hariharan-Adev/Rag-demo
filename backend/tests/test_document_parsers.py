@@ -48,6 +48,10 @@ class DocumentParserTests(unittest.TestCase):
         self.assertIn("CSV: employees", text)
         self.assertIn("Employee ID\tName\tDepartment", text)
         self.assertIn("1002\tAlice\tFinance", text)
+        chunks = extract_source_chunks(path)
+        self.assertIn("Employee ID: 1002", chunks[2].text)
+        self.assertIn("Name: Alice", chunks[2].text)
+        self.assertEqual(chunks[2].location["row_start"], 3)
 
     def test_xlsx_parser_extracts_workbook_sheets_and_cells(self):
         from openpyxl import Workbook
@@ -143,6 +147,9 @@ class DocumentParserTests(unittest.TestCase):
         workbook.close()
         chunks = extract_source_chunks(path)
         formula_row = next(chunk for chunk in chunks if "=A2*0.1" in chunk.text)
+        self.assertIn("Sheet: Revenue", formula_row.text)
+        self.assertIn("Amount: 100", formula_row.text)
+        self.assertIn("Tax: =A2*0.1", formula_row.text)
         self.assertEqual(formula_row.location["sheet_name"], "Revenue")
         self.assertEqual(formula_row.location["cell_range"], "A2:B2")
         self.assertEqual(formula_row.location["table_name"], "RevenueTable")

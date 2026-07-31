@@ -111,3 +111,18 @@ Investigation only. No frontend fix was implemented.
   chunk-size warning remains.
 - Rollback: revert both frontend files together; no browser data migration or
   persisted-state cleanup is required.
+## 2026-07-30 15:30 +05:30 — Grounding-aware citations
+
+- Root cause contribution: `ChatResponse` omitted `grounded`, while
+  `AppContext.sendMessage()` always mapped backend sources and attached the
+  first citation. This rendered the contradictory pre-fix backend JSON.
+- The response type now includes `grounded`; sources are mapped only when it is
+  true, adding a client-side defense to the canonical backend invariant.
+- Retrieval documents, confidence, and metadata clear when a request begins, so
+  an API failure cannot leave the previous response in the retrieval side panel.
+  Conversation history remains intact.
+- No client-controlled owner or organization field was added.
+- `npm run build` passed TypeScript and Vite production compilation with 2,284
+  modules. The existing non-fatal large-chunk warning remains.
+- Roll back `api.ts` and `AppContext.tsx` together with the backend response
+  invariant if the API contract is reverted.
