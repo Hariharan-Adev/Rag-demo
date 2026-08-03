@@ -52,6 +52,8 @@ class DocumentDuplicateTests(unittest.TestCase):
             patch.object(upload, "enforce_request_limit", lambda *args, **kwargs: None),
             patch.object(upload, "log_audit_event", lambda **kwargs: None),
             patch.object(documents, "log_audit_event", lambda **kwargs: None),
+            patch.object(vector_store.settings, "vector_store", "sqlite"),
+            patch.object(vector_store.settings, "vector_store_provider", "sqlite"),
             patch.object(vector_store.settings, "qdrant_local_path", ""),
             patch.object(upload, "extract_text", lambda path: path.read_text(encoding="utf-8")),
             patch.object(upload, "create_embeddings", lambda chunks: [[1.0] + [0.0] * 383 for _ in chunks]),
@@ -67,6 +69,7 @@ class DocumentDuplicateTests(unittest.TestCase):
             )
 
     def tearDown(self) -> None:
+        reset_vector_store_for_tests()
         for patcher in reversed(self.patchers):
             patcher.stop()
         self.temporary.cleanup()

@@ -292,7 +292,7 @@ class QdrantIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(
             result["answer"],
-            "The requested information is not available in the uploaded documents.",
+            "Information not available in the uploaded files.",
         )
         self.assertFalse(result["grounded"])
 

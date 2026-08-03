@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from io import BytesIO
+import queue
 import tempfile
 from unittest.mock import patch
 import zipfile
@@ -13,6 +14,7 @@ from fastapi import HTTPException
 
 from app.config import settings
 from app.services.document_loader import DocumentParseError
+from app.services import ingestion_jobs
 from app.services.ingestion_jobs import _extract_bundle
 from app.services.storage import resolve_storage_key, storage_key_for
 from app.utils.file_validation import validate_file_signature
@@ -52,12 +54,47 @@ class SecurityLimitTests(unittest.TestCase):
             resolve_storage_key("../outside.txt")
 
     def test_production_parser_timeout_terminates_isolated_process(self) -> None:
+        class TimeoutQueue:
+            def get(self, timeout):
+                raise queue.Empty()
+
+            def close(self):
+                return None
+
+        class TimeoutProcess:
+            def __init__(self, *args, **kwargs):
+                self.terminated = False
+
+            def start(self):
+                return None
+
+            def is_alive(self):
+                return not self.terminated
+
+            def terminate(self):
+                self.terminated = True
+
+            def join(self, timeout=None):
+                return None
+
+        class TimeoutContext:
+            def Queue(self, maxsize):
+                return TimeoutQueue()
+
+            def Process(self, *args, **kwargs):
+                return TimeoutProcess()
+
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "sample.txt"
             path.write_text("bounded parser input", encoding="utf-8")
             with (
                 patch.object(settings, "app_environment", "production"),
                 patch.object(settings, "parser_timeout_seconds", 0.001),
+                patch.object(
+                    ingestion_jobs.multiprocessing,
+                    "get_context",
+                    return_value=TimeoutContext(),
+                ),
                 self.assertRaises(DocumentParseError) as raised,
             ):
                 _extract_bundle(path)

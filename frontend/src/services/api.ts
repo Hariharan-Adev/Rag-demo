@@ -117,8 +117,8 @@ export interface ChatSource {
   filename: string
   text?: string
   source_type: string
-  source_location: Record<string, string | number | boolean | null>
-  location?: Record<string, string | number | boolean | null>
+  source_location: Record<string, string | number | boolean | null | Array<Record<string, number>>>
+  location?: Record<string, string | number | boolean | null | Array<Record<string, number>>>
   retrieval_score: number | null
 }
 
@@ -468,7 +468,7 @@ export async function deleteDocument(documentId: string) {
   })
 }
 
-export async function sendChatMessage(question: string, collectionId?: number | null, documentId?: number | null) {
+export async function sendChatMessage(question: string, collectionId?: number | null, documentId?: number | null, conversationId?: string | null) {
   return requestJson<ChatResponse>('/chat', {
     method: 'POST',
     headers: {
@@ -477,6 +477,7 @@ export async function sendChatMessage(question: string, collectionId?: number | 
     },
     body: JSON.stringify({
       question,
+      conversation_id: conversationId ?? null,
       collection_id: collectionId ?? null,
       document_id: documentId ?? null,
     }),

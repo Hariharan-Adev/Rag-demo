@@ -365,3 +365,140 @@ removed. Audit events are retained.
 - Python compilation passed.
 - `git diff --check` passed; only the repository's existing CRLF conversion
   warnings were reported.
+
+## Structured Workbook Chat DB State Note - 2026-07-31 15:14:23 +05:30
+
+### Database impact
+
+- No schema migration was required for the permanent wrong-document and
+  unavailable-answer fix.
+- Existing ACL, organization, document, workbook sheet, workbook row, chunk, and
+  vector tables are read through the existing owner/org-filtered access paths.
+- The fix changes selection/ranking behavior in application code only; it does
+  not rewrite uploaded files, workbook rows, chunks, Qdrant vectors, or source
+  citations already stored in SQLite.
+
+### Verification
+
+- Regression coverage confirms unrelated workbooks cannot win or be cited when
+  scoped evidence is insufficient.
+- Unavailable responses remain `grounded=false` with `sources=[]`.
+- Backend tests passed:
+  `tests.test_workbook_domain_neutral` ran 18 tests successfully, and
+  `tests.test_chat` ran 10 tests successfully.
+
+## Filename-Free Chat Selection DB Note - 2026-07-31 15:33:27 +05:30
+
+### Database impact
+
+- No schema migration was required.
+- The application now explicitly joins `document_versions` when loading
+  structured workbook scopes and when performing default vector retrieval, so
+  only completed current versions are eligible for automatic source selection.
+- Existing document, workbook, chunk, vector, owner/org ACL, and citation data
+  were not rewritten.
+
+### Verification
+
+- Employee-count, Aparna/July, quality-report rejection quantity, follow-up
+  naming, weak unrelated evidence, unavailable response, and no filename-prompt
+  behavior are covered by focused backend regressions.
+- Backend tests passed:
+  `tests.test_workbook_domain_neutral` ran 19 tests successfully,
+  `tests.test_chat` ran 11 tests successfully, and
+  `tests.test_legacy_csv_reindex_retrieval tests.test_qdrant_integration` ran
+  12 tests successfully.
+
+## Chat Follow-Up Context DB Note - 2026-07-31 15:49:56 +05:30
+
+### Database change
+
+- Added migration `011_chat_context_followups`.
+- Added `chat_contexts` with owner/org/conversation scoping, expiry, bounded
+  JSON context, and soft-delete support.
+- Added `idx_chat_contexts_owner_conversation` for latest-context lookup by
+  organization, owner, conversation, expiry, and deletion state.
+
+### Stored context boundaries
+
+- Stored fields are limited to previous question, previous grounded answer,
+  cited document/version IDs, source metadata, structured intent metadata, and
+  bounded workbook row references.
+- No API keys, prompts, full workbook/PDF contents, or inaccessible filenames
+  are stored.
+- Context is validated against current owner/org ACLs and completed current
+  document versions before it is saved or reused.
+
+### Verification
+
+- Regression tests covered total/count follow-up row listing, employee count
+  followed by naming, unrelated-document exclusion, ambiguous pronoun
+  clarification, unavailable-without-context behavior, and isolation across
+  users/conversations.
+
+## Stale Follow-Up Context DB Note - 2026-07-31 16:11:49 +05:30
+
+### Investigation
+
+- Active `chat_contexts` inspection found no records for the failing browser
+  exchange, so there were no persisted candidate prior grounded turns to rank.
+- The failure therefore came from missing context causing a fallback to normal
+  workbook analysis, not from a valid newer total context being explicitly
+  outranked by an older people context.
+- The DB ordering risk was still real: context lookup used `created_at DESC`,
+  which can tie for rapid messages because SQLite timestamps are second
+  precision.
+
+### Implementation impact
+
+- No schema migration was required.
+- The latest context query now relies on `chat_contexts.id DESC`, the
+  autoincrement insertion order, to identify the immediately preceding grounded
+  turn within the same owner/org/conversation.
+- Source/result-plan mismatch is rejected before insert, so stale or
+  contradictory row plans are not persisted.
+- Existing context rows remain compatible; future rows include richer typed
+  result-plan JSON fields such as `result_type`, `display_column`, and
+  `contributing_values`.
+
+### Verification
+
+- Regression tests covered total-result follow-up listing, employee-count
+  follow-up naming, latest grounded turn beating older people context,
+  cross-user/cross-chat isolation, missing conversation context returning
+  unavailable, and source-plan mismatch rejection.
+
+## Generic Schema-Driven RAG DB Note - 2026-07-31 17:58:59 +05:30
+
+### Database change
+
+- Added `schema_json` to `workbook_sheets`.
+- Existing databases are migrated with
+  `ALTER TABLE workbook_sheets ADD COLUMN schema_json TEXT NOT NULL DEFAULT '{}'`.
+- New spreadsheet ingestion stores compact per-sheet column schema containing
+  column name, inferred data type, non-empty count, and unique count.
+
+### Stored representation
+
+- Workbook structured storage now preserves sheet names, row numbers, headers,
+  inferred column data types, and row values for all processed sheets.
+- Source citations continue to use exact document/version IDs plus sheet and
+  row ranges.
+- No prompts, credentials, API keys, or inaccessible document contents are
+  stored in schema metadata.
+
+### Verification
+
+- Migration and reindex coverage passed in:
+  `venv\Scripts\python.exe -m unittest tests.test_structured_index_migration tests.test_structured_csv_reindex tests.test_reindex_structured_csv_script tests.test_chat tests.test_workbook_domain_neutral`
+  with 42 tests passing in 57.960 seconds.
+
+## Qdrant Test Isolation DB Note - 2026-07-31 18:23:27 +05:30
+
+- No database schema changed for the Qdrant test-isolation fix.
+- No production data, production Qdrant path, or real Qdrant collection was
+  modified or deleted.
+- Test changes use temporary databases, SQLite rollback vectors, in-memory
+  Qdrant, or `TemporaryDirectory()`-backed Qdrant local storage only.
+- The vector-store singleton reset change affects only cached in-process test
+  state and does not alter persisted database data.

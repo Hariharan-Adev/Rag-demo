@@ -31,8 +31,14 @@ def search_chunks(
             rows = connection.execute(
                 f"""SELECT d.id, d.current_version_id AS searchable_version_id
                     FROM documents d
+                    JOIN document_versions dv
+                      ON dv.id = d.current_version_id
+                     AND dv.document_id = d.id
+                     AND dv.organization_id = d.organization_id
                     WHERE {READABLE_DOCUMENT_SQL}
                       AND d.current_version_id IS NOT NULL
+                      AND dv.status = 'completed'
+                      AND dv.deleted_at IS NULL
                       AND (? IS NULL OR d.collection_id = ?)
                       AND (? IS NULL OR d.id = ?)""",
                 (

@@ -126,3 +126,43 @@ Investigation only. No frontend fix was implemented.
   modules. The existing non-fatal large-chunk warning remains.
 - Roll back `api.ts` and `AppContext.tsx` together with the backend response
   invariant if the API contract is reverted.
+
+## 2026-07-31 15:49 +05:30 - Conversation ID in chat payload
+
+- Root cause: the frontend kept a stable local chat/conversation ID, but
+  `sendChatMessage()` did not send it to `/chat`, so the backend could not
+  resolve pronoun/reference follow-ups server-side.
+- `frontend/src/services/api.ts` now includes `conversation_id` in the `/chat`
+  JSON payload.
+- `frontend/src/context/AppContext.tsx` passes the active or newly-created
+  `conversationId` on every chat request. New Chat still starts with
+  `activeConversationId=null`, so its first message creates a fresh ID and does
+  not reuse old follow-up context.
+- Verification: `npm run build` passed TypeScript and Vite production
+  compilation. The existing non-fatal large-chunk warning remains.
+
+## 2026-08-03 11:17 +05:30 - Aggregate row-range citation display
+
+- Confirmed root cause: the backend returned structured aggregate source ranges
+  with both `row_start` and `row_end`, but the frontend displayed only
+  `row_start`, making a multi-row aggregate citation appear as a single row.
+- Files modified: `frontend/src/context/AppContext.tsx`.
+- Implementation summary: chat source mapping now renders `Row: N` when
+  `row_start` and `row_end` are equal, and `Rows: N-M` when the backend
+  supplies a multi-row range. Page, slide, sheet, and cell display behavior is
+  preserved.
+- Security considerations: this is display-only and does not add client-side
+  trust in source contents, owner data, tenant IDs, or internal retrieval scores.
+- Tests run: `npm run build` passed TypeScript and Vite production compilation
+  with 2,284 modules transformed. The existing non-fatal bundle chunk-size
+  warning remains.
+- Remaining limitations: the chat card still shows the first source in the
+  message body; the retrieval panel receives all mapped sources.
+2026-08-03 12:23:55 +05:30
+
+- Confirmed root cause: backend aggregate citations could include a row range, but the source mapper only rendered a single row label or a compact start/end label without support for multiple contributing ranges.
+- Files modified: `frontend/src/context/AppContext.tsx`, `frontend/src/services/api.ts`.
+- Implementation summary: source mapping now renders `Row N` for single-row citations, `Rows N-M` for contiguous ranges, and comma-separated ranges when backend citations include multiple `row_ranges`. The API source-location type now allows `row_ranges` arrays.
+- Security and tenant-isolation considerations: frontend changes only format backend-provided citation metadata and do not alter authorization, document access, or data fetching.
+- Tests run: `npm run build` -> TypeScript build and Vite production build OK; Vite reported only the existing large chunk warning.
+- Remaining risks or limitations: page/slide range display remains limited to the existing single start value unless backend supplies richer page/slide range fields in future.

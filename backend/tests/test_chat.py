@@ -3,8 +3,10 @@
 import unittest
 from unittest.mock import patch
 
+from app.config import settings
 from app.prompts.rag_prompt import RAG_SYSTEM_PROMPT, UNAVAILABLE_ANSWER
 from app.services.rag_service import answer_question
+from app.services.source_selection import SelectionResult
 
 
 class RagPromptFormattingTests(unittest.TestCase):
@@ -50,13 +52,13 @@ class RagPromptFormattingTests(unittest.TestCase):
 
 
 class RagRetrievalPolicyTests(unittest.TestCase):
-    def test_structured_lookup_bypasses_vector_search_and_llm(self) -> None:
+    def test_structured_lookup_uses_selected_source_without_llm(self) -> None:
         structured = {
             "answer": "| Revenue |\n|---:|\n| 108,000 |",
             "question_type": "structured_lookup",
             "calculation_basis": "1 matching row.",
             "grounded": True,
-            "sources": [{"filename": "finance.xlsx"}],
+            "sources": [{"document_id": 12, "version_id": 13, "filename": "finance.xlsx"}],
             "matched_document_count": 1,
             "matched_row_count": 1,
         }
@@ -70,11 +72,11 @@ class RagRetrievalPolicyTests(unittest.TestCase):
             "app.services.rag_service.is_structured_lookup_question",
             return_value=True,
         ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(path="structured", document_id=12),
+        ), patch(
             "app.services.rag_service.analyze_workbook_question",
             return_value=structured,
-        ), patch(
-            "app.services.rag_service.search_chunks",
-            side_effect=AssertionError("vector search must not run"),
         ), patch(
             "app.services.rag_service.generate_answer",
             side_effect=AssertionError("LLM must not run"),
@@ -103,7 +105,7 @@ class RagRetrievalPolicyTests(unittest.TestCase):
         self.assertFalse(result["grounded"])
         self.assertEqual(
             result["answer"],
-            "The requested information is not available in the uploaded documents.",
+            "Information not available in the uploaded files.",
         )
 
     def test_chat_retrieves_candidates_then_limits_grounded_context(self) -> None:
@@ -142,11 +144,11 @@ class RagRetrievalPolicyTests(unittest.TestCase):
             result = answer_question("Question", 7)
 
         self.assertEqual(search.call_args.kwargs["limit"], 15)
-        self.assertEqual(search.call_args.kwargs["min_score"], 0.35)
-        self.assertEqual(len(result["sources"]), 5)
-        prompt = generate.call_args.args[0]
-        self.assertIn("context 5", prompt)
-        self.assertNotIn("context 6", prompt)
+        self.assertEqual(search.call_args.kwargs["min_score"], settings.rag_min_score)
+        self.assertFalse(result["grounded"])
+        self.assertEqual(result["sources"], [])
+        self.assertEqual(result["question_type"], "clarification")
+        generate.assert_not_called()
 
     def test_unavailable_llm_answer_never_returns_sources(self) -> None:
         candidate = {
@@ -188,3 +190,159 @@ class RagRetrievalPolicyTests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         self.assertFalse(result["grounded"])
         self.assertEqual(audit.call_args.kwargs["outcome"], "insufficient_context")
+
+    def test_weak_structured_result_does_not_return_before_retrieval(self) -> None:
+        weak = {
+            "answer": "No accessible structured answer.",
+            "question_type": "analytical",
+            "grounded": False,
+            "sources": [],
+        }
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_structured_lookup_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.analyze_workbook_question",
+            return_value=weak,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            side_effect=[[], []],
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            side_effect=AssertionError("LLM must not run without evidence"),
+        ), patch(
+            "app.services.rag_service.log_audit_event",
+        ):
+            result = answer_question("Which summary applies to July?", 7)
+
+        self.assertEqual(result["answer"], UNAVAILABLE_ANSWER)
+        self.assertEqual(result["sources"], [])
+        self.assertFalse(result["grounded"])
+
+    def test_metric_question_uses_report_pdf_evidence(self) -> None:
+        candidate = {
+            "document_id": 44,
+            "version_id": 45,
+            "filename": "summary-report.pdf",
+            "content": "Total reviewed 13,268. Total variance quantity 789. Variance rate 5.9%.",
+            "source_type": "pdf",
+            "source_location": {"page": 1},
+            "score": 0.42,
+        }
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_structured_lookup_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.analyze_workbook_question",
+            return_value={"answer": UNAVAILABLE_ANSWER, "grounded": False, "sources": []},
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            return_value=[candidate],
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "The total variance quantity is 789.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ), patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("What is the total variance quantity?", 7)
+
+        self.assertTrue(result["grounded"])
+        self.assertEqual(result["sources"][0]["filename"], "summary-report.pdf")
+        self.assertNotRegex(result["answer"].casefold(), r"select|type.*file|filename")
+
+    def test_low_score_table_chunk_can_be_used_with_scoped_evidence(self) -> None:
+        candidate = {
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "activity-log.xlsx",
+            "content": "Period: 2026-07-01\nTitle: Folder Analysis\nTitle description: Reviewed folders.",
+            "source_type": "excel",
+            "source_location": {"sheet_name": "Rows", "row_start": 2, "row_end": 2},
+            "score": 0.13,
+        }
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.is_structured_lookup_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            side_effect=[[], [candidate]],
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "Folder Analysis was listed for July.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ) as generate, patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("Which title is listed for 2026 07?", 7)
+
+        self.assertTrue(result["grounded"])
+        self.assertEqual(result["sources"][0]["filename"], "activity-log.xlsx")
+        self.assertIn("Folder Analysis", generate.call_args.args[0])
+
+    def test_low_score_unrelated_chunk_is_not_cited(self) -> None:
+        unrelated = {
+            "document_id": 99,
+            "version_id": 100,
+            "filename": "unrelated.xlsx",
+            "content": "Code: X1\nState: IN\nTime: 09:00",
+            "source_type": "excel",
+            "source_location": {"sheet_name": "Sheet1", "row_start": 2, "row_end": 2},
+            "score": 0.13,
+        }
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=True,
+        ), patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.is_structured_lookup_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            side_effect=[[], [unrelated]],
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            side_effect=AssertionError("unrelated evidence must not be grounded"),
+        ), patch(
+            "app.services.rag_service.log_audit_event",
+        ):
+            result = answer_question("Which title is listed for 2026 07?", 7)
+
+        self.assertEqual(result["answer"], UNAVAILABLE_ANSWER)
+        self.assertEqual(result["sources"], [])
+        self.assertFalse(result["grounded"])
+        self.assertNotRegex(result["answer"].casefold(), r"select|type.*file|filename")

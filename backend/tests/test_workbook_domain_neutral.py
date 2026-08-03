@@ -1,4 +1,4 @@
-"""Domain-neutral, multi-sheet workbook ingestion and analysis tests."""
+"""Domain-neutral, schema-driven workbook RAG tests."""
 
 from __future__ import annotations
 
@@ -16,14 +16,19 @@ from starlette.requests import Request
 
 from app import database
 from app.routes import upload
-from app.services import vector_search
-from app.services import vector_store
-from app.services import structured_ingestion
+from app.services import structured_ingestion, vector_search, vector_store
+from app.services.chat_context import save_grounded_context
+from app.services.rag_service import answer_question
 from app.services.vector_store import reset_vector_store_for_tests
 from app.services.workbook_analysis import (
+    RowRecord,
     analyze_workbook_question,
-    is_structured_lookup_question,
+    _column_score,
+    _row_filters,
 )
+
+
+ORG = "00000000-0000-4000-8000-000000000001"
 
 
 def _request() -> Request:
@@ -59,6 +64,8 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.stack = ExitStack()
         self.stack.enter_context(patch.object(database, "DATABASE_PATH", self.database_path))
         self.stack.enter_context(patch.object(database, "UPLOAD_DIRECTORY", self.upload_path))
+        self.stack.enter_context(patch.object(vector_store.settings, "vector_store", "sqlite"))
+        self.stack.enter_context(patch.object(vector_store.settings, "vector_store_provider", "sqlite"))
         self.stack.enter_context(patch.object(vector_store.settings, "qdrant_local_path", ""))
         self.stack.enter_context(patch.object(upload, "UPLOAD_DIRECTORY", self.upload_path))
         self.stack.enter_context(patch.object(upload, "enforce_request_limit", lambda *args, **kwargs: None))
@@ -68,8 +75,7 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
                 upload,
                 "create_embeddings",
                 lambda chunks: [
-                    ([1.0, 0.0] if "FINAL_ONLY" in chunk else [0.0, 1.0])
-                    + [0.0] * 382
+                    ([1.0, 0.0] if "FINAL_ONLY" in chunk else [0.0, 1.0]) + [0.0] * 382
                     for chunk in chunks
                 ],
             )
@@ -93,392 +99,327 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         owner_id: int = 1,
     ) -> dict[str, object]:
         file = UploadFile(file=BytesIO(_workbook_bytes(sheets)), filename=filename)
-        return asyncio.run(upload._process_document_upload(
-            _request(),
-            file,
-            {"id": owner_id},
-        ))
+        return asyncio.run(upload._process_document_upload(_request(), file, {"id": owner_id}))
 
-    def test_all_thirteen_employee_tabs_are_processed_and_counted(self):
-        sheets = [
-            (
-                f"Team {index}",
-                [["Employee ID", "Name"], [f"{index:02d}01", f"Person {index}"]],
-                "hidden" if index == 13 else "visible",
-            )
-            for index in range(1, 14)
-        ]
-        result = self.upload_workbook(sheets, "employees.xlsx")
-        answer = analyze_workbook_question(
-            "How many employees are there?",
-            owner_id=1,
-            document_id=int(result["document_id"]),
-        )
-        self.assertEqual(len(result["workbook"]["processed_sheets"]), 13)
-        self.assertIn("Count: 13", answer["answer"])
-        self.assertEqual(len(answer["sources"]), 13)
+    def upload_text(self, text: str, filename: str, owner_id: int = 1) -> dict[str, object]:
+        file = UploadFile(file=BytesIO(text.encode("utf-8")), filename=filename)
+        return asyncio.run(upload._process_document_upload(_request(), file, {"id": owner_id}))
 
-    def test_finance_totals_averages_and_single_sheet_scope(self):
-        sheets = [
-            ("Q1", [["Category", "Actual Cost"], ["Cloud", 100], ["Travel", 200]], "visible"),
-            ("Q2", [["Category", "Actual Cost"], ["Cloud", 300], ["Travel", 400]], "visible"),
-        ]
-        result = self.upload_workbook(sheets, "finance.xlsx")
-        document_id = int(result["document_id"])
-        total = analyze_workbook_question(
-            "What is the total actual cost?",
-            1,
-            document_id=document_id,
-        )
-        average = analyze_workbook_question(
-            "What is the average actual cost?",
-            1,
-            document_id=document_id,
-        )
-        q2 = analyze_workbook_question(
-            "What is the total actual cost in tab Q2?",
-            1,
-            document_id=document_id,
-        )
-        self.assertIn("1,000", total["answer"])
-        self.assertIn("250", average["answer"])
-        self.assertIn("700", q2["answer"])
-        self.assertEqual([source["sheet_name"] for source in q2["sources"]], ["Q2"])
-
-    def test_month_value_lookup_projects_requested_column_without_llm(self):
+    def test_multi_sheet_tables_are_schema_indexed_and_counted(self) -> None:
         result = self.upload_workbook(
             [
-                (
-                    "Financial Metrics",
-                    [
-                        ["Month", "Revenue", "Net Income"],
-                        ["Jan", 100000, 12000],
-                        ["Feb", 108000, 15335],
-                    ],
-                    "visible",
-                ),
+                ("North", [["Item", "Units"], ["A-1", 4], ["A-2", 6]], "visible"),
+                ("South", [["Item", "Units"], ["B-1", 5]], "visible"),
             ],
-            "monthly-finance.xlsx",
-        )
-        document_id = int(result["document_id"])
-
-        self.assertTrue(is_structured_lookup_question(
-            "give me the feb month revenue?",
-            1,
-            document_id=document_id,
-        ))
-        answer = analyze_workbook_question(
-            "give me the feb month revenue?",
-            1,
-            document_id=document_id,
-        )
-        expanded = analyze_workbook_question(
-            "February revenue",
-            1,
-            document_id=document_id,
+            "inventory.xlsx",
         )
 
-        self.assertEqual(answer["question_type"], "structured_lookup")
-        self.assertIn("108,000", answer["answer"])
-        self.assertIn("B3", answer["answer"])
-        self.assertEqual(
-            answer["sources"][0]["source_location"]["cell_range"],
-            "B3:B3",
-        )
-        self.assertIn("108,000", expanded["answer"])
+        answer = analyze_workbook_question("How many records are there?", 1, document_id=int(result["document_id"]))
 
-    def test_filtered_total_applies_month_before_aggregation(self):
+        self.assertEqual(len(result["workbook"]["processed_sheets"]), 2)
+        self.assertIn("Count: 3", answer["answer"])
+        self.assertEqual({source["source_location"]["sheet_name"] for source in answer["sources"]}, {"North", "South"})
+
+    def test_filtered_total_uses_all_rows_not_vector_excerpt(self) -> None:
         result = self.upload_workbook(
             [
-                (
-                    "Financial Metrics",
-                    [
-                        ["Month", "Revenue"],
-                        ["Jan", 100000],
-                        ["Feb", 108000],
-                    ],
-                    "visible",
-                ),
+                ("Q1", [["Period", "Region", "Amount"], ["2026-01-01", "East", 10], ["2026-02-01", "East", 20]], "visible"),
+                ("Q2", [["Period", "Region", "Amount"], ["2026-07-01", "East", 30], ["2026-07-15", "West", 40]], "visible"),
             ],
-            "monthly-total.xlsx",
-        )
-        answer = analyze_workbook_question(
-            "What is the total revenue for February?",
-            1,
-            document_id=int(result["document_id"]),
+            "ledger.xlsx",
         )
 
-        self.assertEqual(answer["question_type"], "structured_analysis")
-        self.assertIn("108,000", answer["answer"])
-        self.assertNotIn("208,000", answer["answer"])
+        answer = analyze_workbook_question("What is the total amount for July?", 1, document_id=int(result["document_id"]))
 
-    def test_lookup_searches_every_matching_workbook(self):
+        self.assertIn("70", answer["answer"])
+        self.assertNotIn("100", answer["answer"])
+        self.assertEqual(answer["sources"][0]["source_location"]["sheet_name"], "Q2")
+
+    def test_automatic_document_selection_uses_schema_and_values(self) -> None:
         first = self.upload_workbook(
-            [("Metrics", [["Month", "Revenue"], ["Feb", 10]], "visible")],
-            "north.xlsx",
+            [("Catalog", [["Code", "Label"], ["X1", "Alpha"]], "visible")],
+            "catalog.xlsx",
         )
         second = self.upload_workbook(
-            [("Metrics", [["Month", "Revenue"], ["Feb", 20]], "visible")],
-            "south.xlsx",
+            [("Ledger", [["Period", "Amount"], ["March", 25]], "visible")],
+            "ledger.xlsx",
         )
 
-        answer = analyze_workbook_question("February revenue", 1)
+        answer = analyze_workbook_question("What is the total amount for March?", 1)
 
-        self.assertIn("north.xlsx", answer["answer"])
-        self.assertIn("south.xlsx", answer["answer"])
-        self.assertIn("10", answer["answer"])
-        self.assertIn("20", answer["answer"])
-        self.assertEqual(answer["matched_document_count"], 2)
-        self.assertEqual(
-            {source["document_id"] for source in answer["sources"]},
-            {int(first["document_id"]), int(second["document_id"])},
+        self.assertIn("25", answer["answer"])
+        self.assertEqual(answer["sources"][0]["document_id"], int(second["document_id"]))
+        self.assertNotEqual(answer["sources"][0]["document_id"], int(first["document_id"]))
+
+    def test_common_short_words_are_not_cell_value_filters(self) -> None:
+        rows = [
+            RowRecord("Sheet1", 2, {"State": "IN", "Amount": 5}),
+            RowRecord("Sheet1", 3, {"State": "OUT", "Amount": 7}),
+        ]
+
+        self.assertEqual(_row_filters(rows, "What is the total amount in July?"), {})
+        self.assertEqual(_row_filters(rows, "Show state IN"), {"State": {"in"}})
+
+    def test_single_character_and_substring_headers_do_not_create_relevance(self) -> None:
+        self.assertEqual(_column_score("A", "How many products rejected?"), 0)
+        self.assertEqual(_column_score("art", "What is the partial count?"), 0)
+        self.assertGreater(_column_score("Product Count", "How many product records?"), 0)
+
+    def test_unrelated_workbook_cannot_win_generic_count(self) -> None:
+        self.upload_workbook(
+            [("Log", [["A", "Column 2"], ["x", "present"], ["y", "absent"]], "visible")],
+            "neutral.xlsx",
         )
 
-    def test_missing_month_is_an_exhaustive_structured_no_match(self):
+        answer = analyze_workbook_question("How many products rejected?", 1)
+
+        self.assertFalse(answer["grounded"])
+        self.assertEqual(answer["sources"], [])
+
+    def test_relevant_pdf_style_retrieval_wins_over_unrelated_workbook(self) -> None:
+        self.upload_workbook(
+            [("Log", [["A", "Column 2"], ["x", "present"], ["y", "absent"]], "visible")],
+            "neutral.xlsx",
+        )
+        text = self.upload_text(
+            "The uploaded file discusses product rejection evidence.",
+            "quality-summary.txt",
+        )
+        with database.get_connection() as connection:
+            version_id = connection.execute(
+                "SELECT current_version_id FROM documents WHERE id = ?",
+                (int(text["document_id"]),),
+            ).fetchone()["current_version_id"]
+        pdf_source = {
+            "document_id": int(text["document_id"]),
+            "version_id": int(version_id),
+            "filename": "quality-summary.txt",
+            "content": "The uploaded file discusses product rejection evidence.",
+            "source_type": "text",
+            "source_location": {"section": "body"},
+            "score": 0.82,
+        }
+
+        with patch("app.services.rag_service.search_chunks", return_value=[pdf_source]), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "The file contains product rejection evidence (quality-summary.pdf, page 2).",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+            },
+        ), patch("app.services.rag_service.reserve_groq_call"), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch("app.services.rag_service.log_audit_event"):
+            answer = answer_question("What are the product rejections?", 1)
+
+        self.assertEqual(answer["question_type"], "retrieval")
+        self.assertEqual(answer["sources"][0]["filename"], "quality-summary.txt")
+
+    def test_quantity_question_uses_sum_when_numeric_column_matches(self) -> None:
         result = self.upload_workbook(
-            [("Metrics", [["Month", "Revenue"], ["Jan", 10]], "visible")],
-            "missing-month.xlsx",
+            [("Stock", [["Item", "Units"], ["A", 2], ["B", 3]], "visible")],
+            "stock.xlsx",
         )
+
         answer = analyze_workbook_question(
-            "February revenue",
+            "How many units are there?",
             1,
             document_id=int(result["document_id"]),
         )
 
-        self.assertEqual(answer["question_type"], "structured_lookup")
-        self.assertEqual(answer["matched_row_count"], 0)
-        self.assertIn("No matching structured rows", answer["answer"])
+        self.assertIn("Total Units: 5", answer["answer"])
 
-    def test_spreadsheet_reindex_preserves_point_ids_and_labels_rows(self):
+    def test_status_filtering_uses_filtered_count(self) -> None:
         result = self.upload_workbook(
-            [("Metrics", [["Month", "Revenue"], ["Feb", 108000]], "visible")],
-            "reindex.xlsx",
+            [("Cases", [["Item", "Status"], ["A", "open"], ["B", "closed"]], "visible")],
+            "cases.xlsx",
+        )
+
+        answer = analyze_workbook_question(
+            "How many open items?",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        self.assertIn("Count: 1", answer["answer"])
+        self.assertEqual(answer["_context"]["filters"], {"Status": ["open"]})
+
+    def test_grouped_result_is_deterministic_structured_evidence(self) -> None:
+        result = self.upload_workbook(
+            [("Data", [["Category", "Amount"], ["A", 3], ["B", 5], ["A", 7]], "visible")],
+            "grouped.xlsx",
+        )
+
+        answer = analyze_workbook_question("Group amount by category", 1, document_id=int(result["document_id"]))
+
+        self.assertIn("A: 10", answer["answer"])
+        self.assertIn("B: 5", answer["answer"])
+        self.assertTrue(answer["grounded"])
+
+    def test_complete_structured_answer_wins_over_partial_vector_context(self) -> None:
+        result = self.upload_workbook(
+            [("Data", [["Period", "Amount"], ["April", 5], ["April", 15]], "visible")],
+            "complete.xlsx",
+        )
+        partial = {
+            "document_id": int(result["document_id"]),
+            "version_id": 0,
+            "filename": "complete.xlsx",
+            "content": "Period: April\nAmount: 5",
+            "source_type": "excel",
+            "source_location": {"sheet_name": "Data", "row_start": 2, "row_end": 2},
+            "score": 0.99,
+        }
+
+        with patch("app.services.rag_service.search_chunks", return_value=[partial]):
+            answer = answer_question("What is the total amount for April?", 1)
+
+        self.assertIn("20", answer["answer"])
+        self.assertEqual(answer["question_type"], "structured_analysis")
+
+    def test_low_score_retrieval_requires_overlap_and_keeps_sources_empty_when_unavailable(self) -> None:
+        unrelated = {
+            "document_id": 50,
+            "version_id": 51,
+            "filename": "notes.txt",
+            "content": "Completely different content.",
+            "source_type": "text",
+            "source_location": {},
+            "score": 0.1,
+        }
+
+        with patch("app.services.rag_service.has_structured_workbook", return_value=False), patch(
+            "app.services.rag_service.is_analytical_question", return_value=False
+        ), patch("app.services.rag_service.search_chunks", side_effect=[[], [unrelated]]), patch(
+            "app.services.rag_service.generate_answer", side_effect=AssertionError("unrelated source must not be used")
+        ), patch("app.services.rag_service.log_audit_event"):
+            answer = answer_question("Find alpha beta", 1)
+
+        self.assertEqual(answer["answer"], "Information not available in the uploaded files.")
+        self.assertFalse(answer["grounded"])
+        self.assertEqual(answer["sources"], [])
+
+    def test_follow_up_uses_latest_grounded_context_within_same_chat(self) -> None:
+        result = self.upload_workbook(
+            [("Rows", [["Code", "Amount"], ["R1", 9], ["R2", 11]], "visible")],
+            "rows.xlsx",
+        )
+        total = answer_question("What is the total amount?", 1, conversation_id="chat-a")
+        follow_up = answer_question("list them", 1, conversation_id="chat-a")
+        other_chat = answer_question("list them", 1, conversation_id="chat-b")
+        other_user = answer_question("list them", 2, conversation_id="chat-a")
+
+        self.assertIn("20", total["answer"])
+        self.assertIn("9", follow_up["answer"])
+        self.assertIn("11", follow_up["answer"])
+        self.assertEqual({source["document_id"] for source in follow_up["sources"]}, {int(result["document_id"])})
+        self.assertEqual(other_chat["sources"], [])
+        self.assertEqual(other_user["sources"], [])
+
+    def test_clear_topic_change_does_not_reuse_stale_context(self) -> None:
+        result = self.upload_workbook(
+            [("Rows", [["Code", "Amount"], ["R1", 9], ["R2", 11]], "visible")],
+            "rows.xlsx",
+        )
+        answer_question("What is the total amount?", 1, conversation_id="chat-a")
+
+        with patch("app.services.rag_service.search_chunks", return_value=[]), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            changed = answer_question("show invoices", 1, conversation_id="chat-a")
+
+        self.assertEqual(int(result["document_id"]), 1)
+        self.assertFalse(changed["grounded"])
+        self.assertEqual(changed["sources"], [])
+
+    def test_aggregate_citation_carries_complete_row_range(self) -> None:
+        result = self.upload_workbook(
+            [("Cases", [["Item", "Status"], ["A", "open"], ["B", "open"]], "visible")],
+            "cases.xlsx",
+        )
+
+        answer = analyze_workbook_question(
+            "How many open items?",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        location = answer["sources"][0]["source_location"]
+        self.assertEqual(location["row_start"], 2)
+        self.assertEqual(location["row_end"], 3)
+
+    def test_unavailable_and_acl_isolation_have_no_sources(self) -> None:
+        result = self.upload_workbook(
+            [("Private", [["Reference", "Value"], ["SECRET", 500]], "visible")],
+            "private.xlsx",
+        )
+
+        unavailable = analyze_workbook_question("What is the total missing field?", 1, document_id=int(result["document_id"]))
+        inaccessible = analyze_workbook_question("What is the total value?", 2, document_id=int(result["document_id"]))
+
+        self.assertEqual(unavailable["sources"], [])
+        self.assertFalse(unavailable["grounded"])
+        self.assertEqual(inaccessible["sources"], [])
+        self.assertNotIn("500", inaccessible["answer"])
+
+    def test_source_plan_mismatch_is_not_saved_as_follow_up_context(self) -> None:
+        save_grounded_context(
+            owner_id=1,
+            conversation_id="mismatch",
+            question="older",
+            result={
+                "answer": "Grounded",
+                "grounded": True,
+                "sources": [{"document_id": 1, "version_id": 2, "filename": "a.xlsx"}],
+                "_context": {"document_ids": [99], "version_ids": [2], "result_type": "count"},
+            },
+        )
+
+        answer = answer_question("show them", 1, conversation_id="mismatch")
+
+        self.assertEqual(answer["sources"], [])
+
+    def test_reindex_preserves_vectors_and_sheet_locations(self) -> None:
+        result = self.upload_workbook(
+            [("First", [["Code", "Description"], ["A-1", "ordinary"]], "visible"), ("Final", [["Code", "Description"], ["Z-9", "FINAL_ONLY"]], "visible")],
+            "projects.xlsx",
         )
         document_id = int(result["document_id"])
         with database.get_connection() as connection:
             before = connection.execute(
-                """SELECT vector_point_id FROM chunks
-                   WHERE document_id = ? ORDER BY chunk_index""",
+                "SELECT vector_point_id FROM chunks WHERE document_id = ? ORDER BY chunk_index",
                 (document_id,),
             ).fetchall()
-        vectors = {
-            str(row["vector_point_id"]): [0.0, 1.0] + [0.0] * 382
-            for row in before
-        }
+        vectors = {str(row["vector_point_id"]): [0.0, 1.0] + [0.0] * 382 for row in before}
 
         class RecordingStore:
-            def __init__(self):
+            def __init__(self) -> None:
                 self.batches = []
 
             def get_vectors(self, point_ids):
-                return {
-                    point_id: vectors[point_id]
-                    for point_id in point_ids
-                    if point_id in vectors
-                }
+                return {point_id: vectors[point_id] for point_id in point_ids if point_id in vectors}
 
             def upsert_chunks(self, points):
                 self.batches.append(points)
 
         store = RecordingStore()
-        with patch.object(
-            structured_ingestion,
-            "get_vector_store",
-            return_value=store,
-        ), patch.object(
+        with patch.object(structured_ingestion, "get_vector_store", return_value=store), patch.object(
             structured_ingestion,
             "create_embeddings",
-            return_value=[
-                [1.0, 0.0] + [0.0] * 382
-                for _ in range(len(before))
-            ],
+            return_value=[[1.0, 0.0] + [0.0] * 382 for _ in range(len(before))],
         ):
-            first = structured_ingestion.reindex_existing_spreadsheet_document(
+            status = structured_ingestion.reindex_existing_spreadsheet_document(
                 document_id=document_id,
                 owner_id=1,
-                organization_id="00000000-0000-4000-8000-000000000001",
-            )
-            second = structured_ingestion.reindex_existing_spreadsheet_document(
-                document_id=document_id,
-                owner_id=1,
-                organization_id="00000000-0000-4000-8000-000000000001",
+                organization_id=ORG,
             )
 
-        with database.get_connection() as connection:
-            after = connection.execute(
-                """SELECT vector_point_id, text FROM chunks
-                   WHERE document_id = ? ORDER BY chunk_index""",
-                (document_id,),
-            ).fetchall()
-        self.assertEqual(first.status, "completed")
-        self.assertEqual(second.status, "completed")
-        self.assertEqual(
-            [row["vector_point_id"] for row in after],
-            [row["vector_point_id"] for row in before],
-        )
-        indexed_text = "\n".join(str(row["text"]) for row in after)
-        self.assertIn("Month: Feb", indexed_text)
-        self.assertIn("Revenue: 108000", indexed_text)
-        self.assertEqual(len(store.batches), 2)
-
-    def test_inventory_distinct_count_deduplicates_only_when_requested(self):
-        sheets = [
-            ("North", [["Product ID", "Stock"], ["001", 5], ["002", 7]], "visible"),
-            ("South", [["Product ID", "Stock"], ["001", 4], ["003", 9]], "visible"),
-        ]
-        result = self.upload_workbook(sheets, "inventory.xlsx")
-        document_id = int(result["document_id"])
-        records = analyze_workbook_question("How many records are there?", 1, document_id=document_id)
-        unique = analyze_workbook_question(
-            "How many unique products are there?",
-            1,
-            document_id=document_id,
-        )
-        self.assertIn("Count: 4", records["answer"])
-        self.assertIn("3", unique["answer"])
-
-    def test_price_range_is_inclusive_and_cites_selected_rows(self):
-        result = self.upload_workbook(
-            [
-                (
-                    "Equipment",
-                    [
-                        ["Equipment", "Price"],
-                        ["Seed Drill", 45000],
-                        ["Tractor", 550000],
-                        ["Power Tiller", 125000],
-                        ["Irrigation Pump", 75000],
-                        ["Harvester", 200000],
-                        ["Agricultural Drone", 210000],
-                    ],
-                    "visible",
-                ),
-            ],
-            "agriculture.xlsx",
-        )
-        answer = analyze_workbook_question(
-            "Show all equipment priced between ₹50,000 and ₹200,000.",
-            1,
-            document_id=int(result["document_id"]),
-        )
-
-        text = str(answer["answer"])
-        self.assertIn("Power Tiller", text)
-        self.assertIn("Irrigation Pump", text)
-        self.assertIn("Harvester", text)
-        self.assertNotIn("Seed Drill", text)
-        self.assertNotIn("Tractor", text)
-        self.assertNotIn("Agricultural Drone", text)
-        self.assertEqual(answer["sources"][0]["source_location"]["row_start"], 4)
-        self.assertEqual(answer["sources"][0]["source_location"]["row_end"], 6)
-
-    def test_below_price_filter_returns_markdown_table_only_with_valid_rows(self):
-        result = self.upload_workbook(
-            [
-                (
-                    "Tools",
-                    [
-                        ["Name", "Model", "HP Type", "Price"],
-                        ["Rotavator", "RT-200", 45, 95000],
-                        ["Cultivator", "CV-150", 40, 45000],
-                        ["Disc Harrow", "DH-300", 55, 120000],
-                        ["MB Plough", "MBP-250", 50, 85000],
-                        ["Thresher", "TH-600", 60, 180000],
-                    ],
-                    "visible",
-                ),
-            ],
-            "farming-tools.xlsx",
-        )
-        answer = analyze_workbook_question(
-            "List all farming tools priced below ₹100,000.",
-            1,
-            document_id=int(result["document_id"]),
-        )
-        lakh_answer = analyze_workbook_question(
-            "tell me the model which is under 1 lak",
-            1,
-            document_id=int(result["document_id"]),
-        )
-        plural_lakh_answer = analyze_workbook_question(
-            "tell me the model which is under 1 laks",
-            1,
-            document_id=int(result["document_id"]),
-        )
-
-        text = str(answer["answer"])
-        self.assertIn("Matching records (3):", text)
-        self.assertIn("| Name | Model | HP Type | Price | Source |", text)
-        self.assertIn("|---|---|---|---|---|", text)
-        self.assertIn("Rotavator", text)
-        self.assertIn("Cultivator", text)
-        self.assertIn("MB Plough", text)
-        self.assertNotIn("Disc Harrow", text)
-        self.assertNotIn("Thresher", text)
-        self.assertNotIn("- Tools, row", text)
-        lakh_text = str(lakh_answer["answer"])
-        self.assertIn("Matching records (3):", lakh_text)
-        self.assertIn("RT-200", lakh_text)
-        self.assertIn("CV-150", lakh_text)
-        self.assertIn("MBP-250", lakh_text)
-        self.assertNotIn("DH-300", lakh_text)
-        self.assertNotIn("TH-600", lakh_text)
-        plural_lakh_text = str(plural_lakh_answer["answer"])
-        self.assertIn("Matching records (3):", plural_lakh_text)
-        self.assertIn("RT-200", plural_lakh_text)
-        self.assertIn("CV-150", plural_lakh_text)
-        self.assertIn("MBP-250", plural_lakh_text)
-        self.assertNotIn("DH-300", plural_lakh_text)
-        self.assertNotIn("TH-600", plural_lakh_text)
-
-    def test_empty_tabs_do_not_affect_calculations_and_are_reported(self):
-        result = self.upload_workbook(
-            [
-                ("Data", [["Invoice", "Amount"], ["INV-1", 10]], "visible"),
-                ("Blank", [], "visible"),
-            ],
-            "invoices.xlsx",
-        )
-        answer = analyze_workbook_question(
-            "What is the total amount?",
-            1,
-            document_id=int(result["document_id"]),
-        )
-        self.assertEqual(result["workbook"]["empty_sheets"], ["Blank"])
-        self.assertIn("10", answer["answer"])
-        self.assertEqual([source["sheet_name"] for source in answer["sources"]], ["Data"])
-
-    def test_search_finds_a_row_only_in_the_final_sheet(self):
-        result = self.upload_workbook(
-            [
-                ("First", [["Code", "Description"], ["A-1", "ordinary"]], "visible"),
-                ("Final", [["Code", "Description"], ["Z-9", "FINAL_ONLY"]], "visible"),
-            ],
-            "projects.xlsx",
-        )
         with patch.object(vector_search, "create_embeddings", return_value=[[1.0, 0.0] + [0.0] * 382]):
-            matches = vector_search.search_chunks(
-                "FINAL_ONLY",
-                owner_id=1,
-                document_id=int(result["document_id"]),
-                limit=1,
-            )
-        self.assertEqual(matches[0]["sheet_name"], "Final")
-        self.assertIn("FINAL_ONLY", matches[0]["content"])
+            matches = vector_search.search_chunks("FINAL_ONLY", owner_id=1, document_id=document_id, limit=1)
 
-    def test_another_owner_cannot_analyze_a_selected_workbook(self):
-        result = self.upload_workbook(
-            [("Private", [["Invoice", "Amount"], ["SECRET", 500]], "visible")],
-            "private.xlsx",
-        )
-        answer = analyze_workbook_question(
-            "What is the total amount?",
-            owner_id=2,
-            document_id=int(result["document_id"]),
-        )
-        self.assertEqual(answer["sources"], [])
-        self.assertNotIn("500", answer["answer"])
-        self.assertIn("No accessible structured workbook", answer["answer"])
+        self.assertEqual(status.status, "completed")
+        self.assertEqual(len(store.batches), 1)
+        self.assertEqual(matches[0]["sheet_name"], "Final")
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ class SecurityValidationError(ValueError):
 
 
 def validate_extracted_text(text: str) -> None:
-    """Reject empty, oversized, or prompt-injection-like document text."""
+    """Reject empty or oversized text while treating content as untrusted data."""
     if not text.strip():
         raise SecurityValidationError("The document contains no readable text.")
 
@@ -46,12 +46,6 @@ def validate_extracted_text(text: str) -> None:
         raise SecurityValidationError(
             f"Extracted text exceeds {MAX_EXTRACTED_TEXT_CHARS} characters."
         )
-
-    for pattern in PROMPT_INJECTION_PATTERNS:
-        if pattern.search(text):
-            raise SecurityValidationError(
-                "The document appears to contain prompt-injection instructions."
-            )
 
 
 def validate_chunks(chunks: list[str]) -> None:

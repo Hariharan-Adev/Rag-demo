@@ -169,12 +169,26 @@ function sourceScore(source: ChatSource) {
 
 function mapSource(source: ChatSource, index: number): RetrievedDocument {
   const locationData = source.source_location ?? {}
+  const rowStart = locationData.row_start
+  const rowEnd = locationData.row_end
+  const rowRanges = Array.isArray(locationData.row_ranges) ? locationData.row_ranges : []
+  const rowLabel = rowRanges.length
+    ? rowRanges.map((range) => {
+        const start = Number((range as { row_start?: number }).row_start)
+        const end = Number((range as { row_end?: number }).row_end)
+        return end > start ? `Rows ${start}-${end}` : `Row ${start}`
+      }).join(', ')
+    : rowStart
+      ? rowEnd && rowEnd !== rowStart
+        ? `Rows ${rowStart}-${rowEnd}`
+        : `Row ${rowStart}`
+      : null
   const location = [
-    locationData.page_start ? `Page: ${locationData.page_start}` : null,
-    (locationData.slide_start || locationData.slide_number) ? `Slide: ${locationData.slide_start || locationData.slide_number}` : null,
-    locationData.sheet_name ? `Sheet: ${locationData.sheet_name}` : null,
-    locationData.cell_range ? `Cells: ${locationData.cell_range}` : null,
-    locationData.row_start ? `Row: ${locationData.row_start}` : null,
+    locationData.page_start ? `Page ${locationData.page_start}` : null,
+    (locationData.slide_start || locationData.slide_number) ? `Slide ${locationData.slide_start || locationData.slide_number}` : null,
+    locationData.sheet_name ? `Sheet ${locationData.sheet_name}` : null,
+    locationData.cell_range ? `Cells ${locationData.cell_range}` : null,
+    rowLabel,
   ].filter(Boolean).join(' · ')
   return {
     id: source.document_id ? String(source.document_id) : source.filename,
@@ -381,6 +395,7 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
         trimmed,
         selectedCollectionId,
         Number.isFinite(selectedDocumentId) ? selectedDocumentId : null,
+        conversationId,
       )
       const sources = response.grounded ? response.sources.map(mapSource) : []
       const averageScore = sources.length

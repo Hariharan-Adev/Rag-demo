@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     """Question sent to the RAG assistant."""
 
     question: str = Field(min_length=1, max_length=1000)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=100)
     collection_id: int | None = Field(default=None, gt=0)
     document_id: int | None = Field(default=None, gt=0)
     version_id: int | None = Field(default=None, gt=0)
@@ -44,6 +45,7 @@ def chat(
             request.collection_id,
             request.document_id,
             request.version_id,
+            request.conversation_id,
         )
     except HTTPException:
         raise

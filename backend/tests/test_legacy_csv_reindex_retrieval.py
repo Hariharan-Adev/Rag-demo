@@ -228,13 +228,12 @@ class LegacyCsvReindexRetrievalTests(unittest.TestCase):
         self.assertEqual(source["document_id"], self.document_id)
         self.assertEqual(source["filename"], "legacy-equipment.csv")
         self.assertEqual(source["source_type"], "csv")
+        self.assertEqual(source["source_location"]["sheet_name"], "CSV")
+        self.assertEqual(source["source_location"]["row_start"], 3)
+        self.assertEqual(source["source_location"]["row_end"], 6)
         self.assertEqual(
-            source["source_location"],
-            {
-                "sheet_name": "CSV",
-                "row_start": 3,
-                "row_end": 6,
-            },
+            source["source_location"]["row_ranges"],
+            [{"row_start": 3, "row_end": 6}],
         )
 
         unavailable = self._answer_without_semantic_results(
@@ -244,7 +243,7 @@ class LegacyCsvReindexRetrievalTests(unittest.TestCase):
         self.assertEqual(unavailable["answer"], UNAVAILABLE_ANSWER)
         self.assertEqual(
             unavailable["answer"],
-            "The requested information is not available in the uploaded documents.",
+            "Information not available in the uploaded files.",
         )
         self.assertEqual(unavailable["sources"], [])
         self.assertFalse(unavailable["grounded"])

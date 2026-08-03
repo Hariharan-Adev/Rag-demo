@@ -127,12 +127,20 @@ class QdrantVectorStore(VectorStore):
         from qdrant_client import QdrantClient, models
 
         self.models = models
+        provider = (settings.vector_store or settings.vector_store_provider).strip().lower()
         requested_mode = settings.qdrant_mode.strip().lower()
+        if provider == "qdrant_local":
+            # The explicit local provider must never connect to a URL-backed server.
+            requested_mode = "local"
         if requested_mode not in {"auto", "local", "remote", "memory"}:
             raise RuntimeError(
                 "QDRANT_MODE must be auto, local, remote, or memory."
             )
-        local_path = settings.qdrant_path or settings.qdrant_local_path
+        local_path = (
+            settings.qdrant_local_path or settings.qdrant_path
+            if provider == "qdrant_local"
+            else settings.qdrant_path or settings.qdrant_local_path
+        )
         mode = requested_mode
         if mode == "auto":
             mode = "remote" if settings.qdrant_url else (
@@ -817,17 +825,18 @@ def get_vector_store() -> VectorStore:
                 provider = (
                     settings.vector_store or settings.vector_store_provider
                 ).strip().lower()
-                if provider == "qdrant":
+                if provider in {"qdrant", "qdrant_local"}:
                     _store = QdrantVectorStore()
                 elif provider == "sqlite":
                     _store = SQLiteVectorStore()
                 else:
                     raise ValueError(
-                        "VECTOR_STORE must be 'qdrant' or 'sqlite'."
+                        "VECTOR_STORE must be 'qdrant', 'qdrant_local', or 'sqlite'."
                     )
     return _store
 
 
 def reset_vector_store_for_tests() -> None:
     global _store
-    _store = None
+    with _store_lock:
+        _store = None

@@ -162,6 +162,7 @@ def _migrate_workbook_schema(connection: sqlite3.Connection) -> None:
             status TEXT NOT NULL,
             header_row INTEGER,
             headers_json TEXT NOT NULL DEFAULT '[]',
+            schema_json TEXT NOT NULL DEFAULT '{}',
             processing_error TEXT,
             FOREIGN KEY (content_id) REFERENCES document_contents(id) ON DELETE CASCADE,
             FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -187,6 +188,11 @@ def _migrate_workbook_schema(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE chunks ADD COLUMN sheet_name TEXT")
     if "row_number" not in chunk_columns:
         connection.execute("ALTER TABLE chunks ADD COLUMN row_number INTEGER")
+    sheet_columns = _columns(connection, "workbook_sheets")
+    if "schema_json" not in sheet_columns:
+        connection.execute(
+            "ALTER TABLE workbook_sheets ADD COLUMN schema_json TEXT NOT NULL DEFAULT '{}'"
+        )
 
 
 def _legacy_file_hash(document: sqlite3.Row) -> str:
@@ -1060,6 +1066,33 @@ def _migrate_structured_csv_indexing_v10(
     )
 
 
+def _migrate_chat_context_v11(connection: sqlite3.Connection) -> None:
+    """Store bounded, owner-scoped context for grounded chat follow-ups."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS chat_contexts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_id TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            conversation_id TEXT NOT NULL,
+            previous_question TEXT NOT NULL,
+            previous_answer TEXT NOT NULL,
+            context_json TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TEXT,
+            FOREIGN KEY (owner_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chat_contexts_owner_conversation
+            ON chat_contexts(organization_id, owner_id, conversation_id, expires_at, deleted_at);
+        """
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('011_chat_context_followups')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1132,6 +1165,7 @@ def initialize_database() -> None:
             _migrate_active_content_indexes_v8(connection)
             _migrate_chunk_vector_sync_v9(connection)
             _migrate_structured_csv_indexing_v10(connection)
+            _migrate_chat_context_v11(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

@@ -1259,3 +1259,538 @@ PYTHONUNBUFFERED=1
   tests injected deterministic embeddings and all assertions passed.
 - Vite emitted the existing advisory that the 660.18 kB JavaScript chunk
   exceeds 500 kB. The production build still completed successfully.
+
+## Vector Store Inspection - 2026-07-31 14:40:43 +05:30
+
+Scope: Verified the configured vector database by reading the live collection,
+checking backend health, counting vectors, and running a safe similarity search.
+No API keys, JWTs, or document body text were recorded.
+
+### Active vector store
+
+- Active store: Qdrant local mode, selected by `VECTOR_STORE=qdrant_local`.
+- Configured Qdrant mode: `local`.
+- Configured storage path: `./qdrant_data`.
+- Resolved storage path:
+  `C:\Users\aparna_adevtechcorp\Desktop\RAG PROJECT\backend\qdrant_data`.
+- Configured Qdrant URL: empty; no Qdrant server URL is active.
+- Collection name: `rag_chunks`.
+- Provider health call returned: provider `qdrant`, mode `local`, status `ok`,
+  vector size `384`.
+
+### Startup and live connectivity
+
+- Backend startup import check passed: `app.main` imported successfully.
+- Vector store initialized during startup import and returned status `ok`.
+- Live API health check at `http://127.0.0.1:8000/health` returned healthy with
+  database connected and Qdrant connected.
+- Live readiness check at `http://127.0.0.1:8000/health/ready` returned ready.
+- The collection was not treated as connected merely because the package exists;
+  it was opened, counted, and searched successfully.
+
+### Vector counts
+
+- Active collection vector count: `72`.
+- Active payload count from `list_active_points()`: `72`.
+- Vectors belonging to `Support Hours APARNA_july.xlsx`: `5`.
+
+### Safe similarity-search test
+
+- Query used for test: a non-secret task/support-hours query.
+- Retrieved vector count: `5`.
+- Top similarity score: `0.3683`.
+- Top source document: `Support Hours APARNA_july.xlsx`.
+
+### DB state for `Support Hours APARNA_july.xlsx`
+
+- Document id: `3`.
+- Content id: `3`.
+- Current version id: `3`.
+- `processing_status`: `completed`.
+- Workbook structured-row count: `4`.
+- Chunk count: `5`.
+- Completed chunk count: `5`.
+- Vector count in active collection for this workbook: `5`.
+
+### Logs and indexing errors
+
+- No persistent application `.log` files were found under `backend\data`.
+- Operational ingestion records were checked in SQLite.
+- Latest Support Hours ingestion job status: `completed`.
+- Support Hours ingestion job `vector_upsert_failures`: `0`.
+- No ingestion jobs were found with vector or Qdrant error codes/messages.
+- Active chunk indexing summary: `72` completed chunks, no active failed chunks.
+- Support Hours chunk indexing summary: `5` completed chunks, each with a vector
+  point id and Qdrant indexed timestamp.
+
+## Chat Unavailable/Wrong-Document Investigation - 2026-07-31 14:58:05 +05:30
+
+Scope: Traced `What task did Aparna do in July?` and related Support Hours
+queries through `/chat`, structured workbook analysis, Qdrant retrieval, and
+final answer routing. Diagnostics were run server-side with redacted previews;
+no API keys, JWTs, full prompts, stack traces, or full workbook rows were
+recorded.
+
+### Summary diagnosis
+
+Current code no longer returns `information not available` for every Support
+Hours task query, but the exact query `What task did Aparna do in July?` is
+still misrouted. The valid Support Hours data is lost before Azure because
+`analyze_workbook_question()` calls `_structured_lookup_response()` across all
+workbook scopes before selecting the workbook named in the query. The generic
+lookup parser treats the preposition `in` from `in July` as a cell value and
+creates a false filter `Column 2=in` for `Attentence.xlsx`. That false lookup
+returns attendance names and preempts the later workbook-selection path that
+would have selected `Support Hours APARNA_july.xlsx`.
+
+If the structured path is skipped, Qdrant does retrieve Support Hours chunks,
+but the top score for the exact query is `0.1331`, below `RAG_MIN_SCORE=0.30`.
+The retrieval path therefore rejects all chunks and returns the unavailable
+answer before any Azure prompt is built.
+
+### Stage table
+
+| Stage | Pass/Fail | Evidence | Root cause |
+|---|---|---|---|
+| 1. Query received by `/chat` | Pass | Live `/chat` accepted `What task did Aparna do in July?` with user 1 token. | Route receives the query correctly. |
+| 2. Workbook/document scope selected | Fail for structured lookup order | Available scopes were `Attentence.xlsx` and `Support Hours APARNA_july.xlsx`. `_choose_workbook()` would select `Support Hours APARNA_july.xlsx`, but it is not reached before lookup. | `analyze_workbook_question()` calls `_structured_lookup_response(scopes, question)` before `_choose_workbook()`. |
+| 3. Structured workbook analysis invoked or skipped | Invoked, then misrouted | `is_analytical_question=True`; `is_structured_lookup_question=True`; structured analyzer returned `structured_lookup`. | False structured lookup preempts task-list handling. |
+| 4. Retrieved Qdrant chunks | Pass when tested directly | Direct Qdrant search at `min_score=0.0` returned 5 chunks. Top: `Support Hours APARNA_july.xlsx`, score `0.1331`, Sheet1 row 3, preview includes headers and the first task row. | Vector DB is usable; retrieval itself is not the outage. |
+| 5. Similarity/grounding threshold decision | Fail in retrieval fallback | Threshold `RAG_MIN_SCORE=0.30`; top Support Hours score `0.1331`; thresholded retrieval count `0`. | Useful workbook rows are discarded by semantic threshold if structured analysis does not answer. |
+| 6. Structured rows inspected | Fail in filter parsing | Support Hours headers detected: `Task Date`, `Actual hrs`, `Title`, `Title description`; task column `Title`; description column `Title description`; Support Hours parsed filters `{}`. Attendance parsed false filter `Column 2={'in'}` and matched 12 rows. | `_row_filters()` treats short/common values like `IN` as exact matches for the word `in` in the question. No `Aparna` or `July` row filter is extracted from Support Hours columns. |
+| 7. Context sent to Azure OpenAI | Not reached | For current exact query, structured lookup returns before LLM call. For retrieval-only path, thresholded source count is 0, so no context is built. | Valid Support Hours row is never sent to Azure for this query. |
+| 8. Final answer-policy decision | Fail only on retrieval path; wrong answer on current structured path | Retrieval path reaches `if not sources` and returns unavailable with `grounded=False`. Current `/chat` instead returns `grounded=True` but with `Attentence.xlsx` as the source. | Two separate loss points: false structured lookup from wrong workbook, and vector threshold rejection when structured path is bypassed. |
+
+### Independent layer results
+
+- Structured workbook analyzer directly:
+  - Query: `What task did Aparna do in July?`
+  - Result: `structured_lookup`, `grounded=True`, source `Attentence.xlsx`.
+  - Evidence: lookup plan for `Attentence.xlsx` was `value_column=A`,
+    filters `Column 2={'in'}`, 12 matched rows.
+  - Evidence: `_choose_workbook()` would select `Support Hours APARNA_july.xlsx`
+    if it were reached.
+- Vector retrieval directly:
+  - Query: `What task did Aparna do in July?`
+  - `min_score=0.0`: 5 retrieved chunks.
+  - Top score: `0.1331`.
+  - Top source: `Support Hours APARNA_july.xlsx`, Sheet1 row 3.
+  - Thresholded with `RAG_MIN_SCORE=0.30`: 0 retrieved chunks.
+- Final `/chat` endpoint:
+  - Query: `What task did Aparna do in July?`
+  - Current result: `structured_lookup`, `grounded=True`, source
+    `Attentence.xlsx`.
+  - Related query `task done during the support hours by aparna` currently
+    returns the Support Hours task list because it reaches the newer task-list
+    path.
+
+### Exact loss points
+
+- `backend/app/services/workbook_analysis.py:1043-1046`:
+  `analyze_workbook_question()` calls `_structured_lookup_response(scopes,
+  question)` before workbook selection. This lets an unrelated workbook answer
+  first.
+- `backend/app/services/workbook_analysis.py:162-188`:
+  `_row_filters()` accepts any exact categorical cell value mentioned in the
+  query. For `What task did Aparna do in July?`, `_question_mentions_value()`
+  matches the common word `in` to the attendance marker value `IN`.
+- `backend/app/services/workbook_analysis.py:890-907`:
+  `_structured_lookup_response()` iterates all scopes and collects the false
+  attendance matches, then returns them as a valid structured lookup.
+- `backend/app/services/rag_service.py:79-114`:
+  Once structured analysis returns anything, chat orchestration returns that
+  result immediately and does not run vector retrieval or Azure generation.
+- `backend/app/services/rag_service.py:116-156`:
+  If structured analysis is skipped, Qdrant retrieval runs with
+  `min_score=settings.rag_min_score`. For this query, `0.1331 < 0.30`, leaving
+  `sources=[]`; the code returns `UNAVAILABLE_ANSWER` with `grounded=False`.
+
+### No temporary code logs retained
+
+No temporary diagnostic logging code was added to the application. The root
+cause was confirmed through redacted server-side scripts, direct function calls,
+and a live `/chat` request. No diagnostic rows, prompts, keys, or stack traces
+were exposed to the frontend.
+
+## Structured Workbook Wrong-Document Permanent Fix - 2026-07-31 15:14:23 +05:30
+
+### Root cause fixed
+
+- Structured workbook lookup previously ran globally before workbook scope
+  selection, so an unrelated workbook could answer first.
+- Common query words such as `in` could be treated as workbook cell values,
+  causing attendance `IN` rows to match questions like `in July`.
+- Any structured row match was accepted as grounded, even when the match was
+  weak and from a poorly scoped workbook.
+- Dense table chunks below the global semantic threshold were discarded before
+  document-scoped evidence could be checked.
+
+### Files changed
+
+- `backend/app/services/workbook_analysis.py:98-104`: added stop-word and
+  status-value controls for row filters.
+- `backend/app/services/workbook_analysis.py:215-254`: made row filtering
+  column-aware; stop words are ignored, and `IN`/`OUT` status values are allowed
+  only for explicit attendance/status questions.
+- `backend/app/services/workbook_analysis.py:513-531`: added candidate workbook
+  ranking before structured lookup.
+- `backend/app/services/workbook_analysis.py:628-650`: added structured lookup
+  confidence scoring so weak accidental matches do not return early.
+- `backend/app/services/workbook_analysis.py:1036-1059` and
+  `backend/app/services/workbook_analysis.py:1194-1204`: scoped structured
+  lookup to candidate workbooks before choosing analytical handlers.
+- `backend/app/services/rag_service.py:19-31` and
+  `backend/app/services/rag_service.py:85-123`: added bounded low-score
+  retrieval fallback based on selected document, useful metadata, and query-term
+  overlap.
+- `backend/app/services/rag_service.py:186-204`: ungrounded structured results
+  no longer block retrieval; fallback remains ACL-filtered through
+  `search_chunks()`.
+
+### Ranking and threshold policy
+
+- Workbook scope is scored from filename/query overlap, detected relevant
+  columns, meaningful filter values, task columns, and attendance/person columns.
+- Structured lookup requires a confidence score of at least `3.0`, combining
+  selected-workbook confidence, output-column relevance, meaningful filter
+  matches, status-column safety, and matched-row count.
+- Dense spreadsheet/PDF table chunks still use `RAG_MIN_SCORE` first. If no
+  result passes, a low-score fallback may use chunks down to `0.08` only when
+  the best candidate has at least two meaningful overlaps with the query and
+  other returned chunks stay in the same selected document.
+- Unavailable answers continue to return `grounded=false` and `sources=[]`; no
+  source is cited when the answer is ungrounded.
+
+### Test results
+
+- `venv\Scripts\python.exe -m unittest tests.test_workbook_domain_neutral`
+  passed: 18 tests in 38.031 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_chat`
+  passed: 10 tests in 0.029 seconds.
+- `venv\Scripts\python.exe -m compileall app` passed.
+
+## Remove Filename Selection Chat Flow - 2026-07-31 15:33:27 +05:30
+
+### Behavior change
+
+- Chat no longer returns workbook/document filename-selection prompts.
+- Natural-language questions are answered from automatically ranked accessible
+  evidence. Filename/title metadata remains only a ranking signal.
+- If structured evidence is weak or ungrounded, chat continues into scoped
+  vector retrieval. If no sufficient evidence exists, it returns exactly:
+  `Information not available in the uploaded documents.` with
+  `grounded=false` and `sources=[]`.
+- Follow-up style entity requests such as `Name them` are treated as genuine
+  entity-list questions over the strongest scoped source, not as a file-name
+  selection request.
+
+### Files changed
+
+- `backend/app/prompts/rag_prompt.py`: updated the unavailable-answer contract
+  to the requested exact wording.
+- `backend/app/services/workbook_analysis.py:136-145` and
+  `backend/app/services/workbook_analysis.py:420-430`: structured workbook
+  availability and loading now require completed current document versions.
+- `backend/app/services/workbook_analysis.py:480-482`: automatic workbook
+  selection replaces the previous filename-selection prompt path.
+- `backend/app/services/workbook_analysis.py:503-522`: candidate workbooks are
+  ranked by query/content, filename metadata, header relevance, meaningful
+  filters, and task/entity evidence.
+- `backend/app/services/workbook_analysis.py:664-676`: employee/person/name
+  questions, including follow-ups like `Name them`, use structured entity
+  detection automatically.
+- `backend/app/services/workbook_analysis.py:1184-1208`: structured lookup runs
+  only over ranked candidates and no longer returns a clarification prompt.
+- `backend/app/services/vector_search.py:34-40`: default vector retrieval now
+  searches only completed current document versions.
+- `backend/app/services/rag_service.py`: ungrounded structured results no
+  longer end the chat flow; retrieval/unavailable policy decides final output.
+
+### Test results
+
+- `venv\Scripts\python.exe -m unittest tests.test_workbook_domain_neutral`
+  passed: 19 tests in 40.545 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_chat`
+  passed: 11 tests in 0.049 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_legacy_csv_reindex_retrieval tests.test_qdrant_integration`
+  passed: 12 tests in 33.886 seconds.
+- `venv\Scripts\python.exe -m compileall app` passed.
+- `git diff --check` passed; only the repository's existing CRLF conversion
+  warnings were reported.
+
+## 2026-08-03 11:17 +05:30 - Generic source selection and aggregate validation hardening
+
+- Confirmed root cause: global structured workbook analysis accepted a count
+  plan with no meaningful schema, value, filename, or source evidence. A
+  single-character workbook header could score through substring matching, so an
+  unrelated workbook could be selected before retrieval considered the relevant
+  PDF/document evidence.
+- Files modified: `backend/app/prompts/rag_prompt.py`,
+  `backend/app/services/workbook_analysis.py`,
+  `backend/app/services/rag_service.py`,
+  `backend/app/services/chat_context.py`,
+  `backend/tests/test_chat.py`,
+  `backend/tests/test_legacy_csv_reindex_retrieval.py`,
+  `backend/tests/test_qdrant_integration.py`, and
+  `backend/tests/test_workbook_domain_neutral.py`.
+- Implementation summary: workbook scoring now ignores single-character and
+  stop-word tokens, uses token-boundary matching, applies small plural/past-tense
+  normalization, and separates source evidence from aggregation ability. Count
+  plans now require an entity, resolved filter, numeric filter, or explicit
+  record scope. Quantity-style "how many <numeric column>" questions route to a
+  sum, filtered status questions count only matching rows, and weak structured
+  plans return unavailable with no sources so retrieval can evaluate PDFs and
+  other unstructured documents.
+- Retrieval summary: low-score fallback remains bounded by lexical overlap, and
+  only allows a non-workbook source without overlap when it has a clear semantic
+  lead over the next candidate. This prevents unrelated structured workbooks
+  from winning just because they support rows or aggregation.
+- Context summary: short command-style follow-ups now require no substantive new
+  topic token, so topic changes such as "show invoices" are treated as fresh
+  source-selection requests instead of stale context reuse.
+- Security considerations: ACL, organization, owner, current-version,
+  soft-delete, and indexing readiness predicates remain in the existing SQL
+  paths. Diagnostics and tests avoid logging document contents, credentials,
+  embeddings, or cell values beyond neutral fixture data.
+- Original-scenario verification: read-only diagnostics against the local DB
+  show `Attentence.xlsx` and `Support Hours APARNA_july.xlsx` both rank with
+  zero structured evidence for "how many products rejected" and return
+  `Information not available in the uploaded files.` with `grounded=false` and
+  `sources=[]`. The bounded retrieval fallback selects
+  `FINAL INSPECTION REJECTION 17.01.2024.pdf` page 1 for that question; the
+  more ambiguous "what are the rejections" remains unavailable rather than
+  guessing.
+- Tests run: `venv\Scripts\python.exe -m compileall app tests` passed;
+  `venv\Scripts\python.exe -m unittest tests.test_workbook_domain_neutral -v`
+  passed, 18 tests in 62.789 seconds after final token changes;
+  `venv\Scripts\python.exe -m unittest tests.test_chat -v` passed, 11 tests in
+  0.092 seconds after final retrieval changes;
+  `venv\Scripts\python.exe -m unittest tests.test_vector_search
+  tests.test_qdrant_vector_store tests.test_document_parsers -v` passed, 14
+  tests in 8.610 seconds;
+  `venv\Scripts\python.exe -m unittest tests.test_legacy_csv_reindex_retrieval
+  -v` passed, 1 test in 4.169 seconds;
+  `venv\Scripts\python.exe -m unittest discover -s tests -v` passed, 141 tests
+  in 371.010 seconds.
+- Remaining limitations: the application still cannot compute an exact
+  aggregate from incomplete PDF/vector chunks; it retrieves bounded evidence and
+  must answer unavailable or non-aggregate unless the cited source contains
+  enough complete support.
+
+## Generic Schema-Driven RAG Refactor - 2026-07-31 17:58:59 +05:30
+
+### Architecture change
+
+- Replaced the workbook analyzer with a schema-driven planner in
+  `backend/app/services/workbook_analysis.py`.
+- The planner infers generic operations from the question: count, total,
+  average, min/max, distinct, list/detail, grouped result, and filtered rows.
+- Structured workbook/table answers now use all matching rows from the selected
+  source instead of relying on whichever vector chunk was retrieved.
+- Automatic document selection ranks accessible ready workbooks by filename
+  metadata, schema/header relevance, value/date/entity matches, filter quality,
+  and plan validity. No filename-selection prompt or file-specific branch was
+  added.
+- `backend/app/services/rag_service.py` now uses a generic low-score retrieval
+  fallback that requires scoped source overlap; the old report-specific fallback
+  vocabulary was removed.
+- Follow-up context resolution now reads the generic `result_type` stored by
+  structured answers, so reference follow-ups use the latest typed result plan.
+- Added `rag_structured_result_limit` in `backend/app/config.py` to cap listed
+  rows, contributing values, and stored row references.
+
+### Security and evidence controls
+
+- Owner/org ACL checks remain before structured source loading, vector search,
+  context persistence, follow-up resolution, and citation.
+- Only completed current document versions are eligible for structured analysis
+  or retrieval.
+- Unavailable answers continue to return the exact standard text with
+  `grounded=false` and `sources=[]`.
+- Structured output escapes formula-leading cell values and HTML-sensitive text
+  before rendering row/value tables.
+
+### Test results
+
+- `venv\Scripts\python.exe -m compileall app` passed.
+- `venv\Scripts\python.exe -m unittest tests.test_chat tests.test_workbook_domain_neutral`
+  passed: 22 tests in 24.979 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_structured_index_migration tests.test_structured_csv_reindex tests.test_reindex_structured_csv_script tests.test_chat tests.test_workbook_domain_neutral`
+  passed: 42 tests in 57.960 seconds.
+
+## Qdrant Test Isolation and Singleton Fix - 2026-07-31 18:23:27 +05:30
+
+### Root cause
+
+- Full discovery initially failed because some tests patched
+  `qdrant_local_path` to empty while leaving the active provider as Qdrant.
+- Those tests accidentally initialized the real `QdrantVectorStore`, which
+  correctly failed fast with `RuntimeError: QDRANT_PATH is required in local
+  mode.`
+- The concurrent duplicate-upload test hit the same configuration leak from
+  worker threads, so both upload threads raised before returning responses.
+
+### Vector-store/test isolation changes
+
+- `tests/test_document_duplicates.py` now runs against the existing SQLite
+  rollback vector provider and resets the vector-store singleton in teardown.
+- `tests/test_folder_uploads.py` now uses isolated in-memory Qdrant because the
+  test upserts while an SQLite write connection is open.
+- `tests/test_qdrant_vector_store.py` now creates a unique
+  `TemporaryDirectory()` for Qdrant local mode and never reads or deletes any
+  production Qdrant path.
+- `tests/test_security_limits.py` now simulates the production parser timeout
+  process boundary, avoiding Windows sandbox pipe creation while preserving the
+  timeout/termination assertion.
+
+### Concurrency protection
+
+- `app/services/vector_store.py` now resets the cached singleton under the same
+  lock used by `get_vector_store()`.
+- Added `tests/test_vector_store_singleton.py` to verify concurrent
+  initialization creates one store instance and all threads receive that same
+  instance.
+- No global lock was added around normal vector operations.
+
+### Additional structured-query regression fixed
+
+- While running the full suite, two structured CSV range tests exposed a generic
+  planner regression: unrelated list questions could select a text/category
+  column based only on inferred type.
+- `app/services/workbook_analysis.py` now requires real schema/value evidence
+  for list-column selection, supports generic numeric range/comparison filters,
+  and returns unavailable when an unrelated structured question has no evidence.
+
+### Verification
+
+- Initial baseline: `venv\Scripts\python.exe -m unittest discover -s tests`
+  ran 133 tests and failed with 3 failures and 15 errors.
+- Post-fix:
+  - `venv\Scripts\python.exe -m compileall app tests` passed.
+  - `venv\Scripts\python.exe -m unittest tests.test_document_duplicates`
+    passed: 18 tests in 24.227 seconds.
+  - `venv\Scripts\python.exe -m unittest discover -s tests`
+    passed: 134 tests in 112.938 seconds.
+  - `git diff --check` passed; only existing CRLF conversion warnings were
+    reported.
+
+### Intentional simulated failures in logs
+
+- `qdrant temporarily unavailable` is an intentional mocked retry simulation.
+- `safe parser failure` is an intentional mocked parser failure.
+- `An identical active document already exists` is an intentional duplicate
+  detection simulation.
+
+## Conversational Follow-Up Context - 2026-07-31 15:49:56 +05:30
+
+### Missing field/path fixed
+
+- Missing request field/path: `frontend/src/context/AppContext.tsx` created a
+  stable local `conversationId`, but `frontend/src/services/api.ts` did not send
+  it and `backend/app/routes/chat.py` did not accept `conversation_id`.
+- Because `/chat` received only the new question, the backend had no safe
+  server-side antecedent for short reference questions such as `what are they?`.
+
+### Behavior change
+
+- Grounded answers now save compact, owner/org-scoped follow-up context by
+  conversation: previous question, previous grounded answer, cited
+  document/version IDs, sources, and bounded structured row references.
+- Follow-up/reference questions are resolved before global retrieval using
+  pronoun/reference detection, short-query detection, and recent grounded
+  context.
+- Structured total/count/entity answers preserve the row references needed to
+  list or count the same contributing records later.
+- Internal `_context` metadata is stripped before the API response is returned;
+  no prompts, API keys, or full document bodies are stored.
+- Context is isolated by organization, owner, and `conversation_id`; New Chat
+  creates a new `conversation_id`, so old context is not reused.
+
+### Files changed
+
+- `backend/app/services/chat_context.py:30-37`: generic follow-up detection.
+- `backend/app/services/chat_context.py:99-166`: bounded grounded-context save
+  with ACL validation and expiry.
+- `backend/app/services/chat_context.py:279-307`: follow-up resolution from the
+  latest valid context.
+- `backend/app/services/workbook_analysis.py`: structured responses now include
+  server-only row-reference context for counts, totals, lookups, people lists,
+  and task lists.
+- `backend/app/services/rag_service.py`: follow-ups resolve before normal
+  retrieval; grounded answers save context; `_context` is removed before
+  returning.
+- `backend/app/routes/chat.py:18` and `backend/app/routes/chat.py:48`:
+  `conversation_id` is accepted and forwarded.
+
+### Test results
+
+- `venv\Scripts\python.exe -m unittest tests.test_workbook_domain_neutral`
+  passed: 23 tests in 39.583 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_chat`
+  passed: 11 tests in 0.030 seconds.
+- `venv\Scripts\python.exe -m compileall app` passed.
+- `npm run build` passed for the frontend.
+- `git diff --check` passed; only the repository's existing CRLF conversion
+  warnings were reported.
+
+## Stale Follow-Up Context Fix - 2026-07-31 16:11:49 +05:30
+
+### Investigation
+
+- Live DB inspection of `backend/data/rag_new.db` found zero active
+  `chat_contexts` records, so the latest grounded answer shown in the browser
+  had not produced a saved server-side result plan.
+- Candidate prior grounded turns considered for the failing `name them` request:
+  none were present in `chat_contexts`; no timestamps, document IDs, or result
+  plans existed for that active conversation.
+- Because no valid context was available, the previous `resolve_follow_up()`
+  condition returned `None` when `conversation_id` was missing. The request then
+  fell through to normal structured workbook analysis, where `name them` was
+  treated as an entity-list question and selected the Attendance workbook.
+- Exact stale-context selection condition:
+  `backend/app/services/chat_context.py` returned `None` for a reference-style
+  follow-up when `conversation_id` was absent, allowing unrelated global
+  workbook analysis to answer from an older/irrelevant Attendance source.
+- Secondary risk found: latest context lookup ordered by `created_at DESC`.
+  SQLite `CURRENT_TIMESTAMP` has second-level precision, so rapid grounded turns
+  could tie and select an older row nondeterministically.
+
+### Implementation
+
+- `backend/app/services/chat_context.py:198`: latest context lookup now orders
+  by autoincrement `id DESC`, ensuring the newest saved grounded turn wins
+  within the same owner/org/conversation.
+- `backend/app/services/chat_context.py:304`: reference-style follow-ups with
+  no `conversation_id` now return the standard unavailable response instead of
+  falling through to global retrieval or workbook analysis.
+- `backend/app/services/chat_context.py:112-126`: source/result-plan mismatch is
+  rejected at save time when structured row-plan document IDs are outside cited
+  source document IDs.
+- `backend/app/services/workbook_analysis.py:1177` and
+  `backend/app/services/workbook_analysis.py:1224-1229`: stored structured
+  plans now include typed `result_type`, display column, and bounded
+  contributing values so totals/counts resolve follow-ups from their own result
+  schema, not from generic people-list behavior.
+- `backend/app/services/workbook_analysis.py:482-487`: multi-workbook automatic
+  structured selection now requires minimum confidence, preventing weak numeric
+  accidents such as unrelated column `A` from becoming a grounded total.
+
+### Test results
+
+- `venv\Scripts\python.exe -m unittest tests.test_workbook_domain_neutral`
+  passed: 26 tests in 72.587 seconds.
+- `venv\Scripts\python.exe -m unittest tests.test_chat`
+  passed: 11 tests in 0.085 seconds.
+- `venv\Scripts\python.exe -m compileall app` passed.
+- `git diff --check` passed; only the repository's existing CRLF conversion
+  warnings were reported.
+2026-08-03 12:23:55 +05:30
+
+- Confirmed root cause: chat selected structured workbook analysis before comparing all eligible evidence, so an unrelated workbook could win when a generic analytical phrase looked executable. Structured plans also allowed row-count style answers without enough source/entity/filter proof, and citations could point at a broad row span without explicit contributing ranges.
+- Files modified: `backend/app/services/source_selection.py`, `backend/app/services/rag_service.py`, `backend/app/services/workbook_analysis.py`, `backend/tests/test_source_selection_gate.py`, `backend/tests/test_chat.py`, `backend/tests/test_workbook_domain_neutral.py`, `backend/tests/test_legacy_csv_reindex_retrieval.py`.
+- Implementation summary: added one reusable source-selection gate for chat answers; the gate filters explicit documents for ACL/active/readiness, scores structured and unstructured candidates with boundary-token evidence, rejects weak/ambiguous candidates with reason codes, lets explicit structured scopes execute only after schema validation, and logs non-sensitive source-selection diagnostics. Structured count/list planning now requires entity/filter support instead of generic row counts, and grounded answers are rejected if selected source, structured plan and citations do not use the same authorized document.
+- Citation handling: structured aggregate sources now include `row_ranges` covering contributing rows, while preserving `row_start` and `row_end` for compatibility.
+- Security and tenant isolation: source validation reuses authenticated owner/organization predicates, active current-version checks, soft-delete checks, processed workbook readiness, and indexed chunk readiness. Diagnostic events include IDs, scores, plan outcomes and reason codes only; no document contents, raw cell values, credentials, JWTs, API keys or embeddings are logged.
+- Tests run: `.\venv\Scripts\python.exe -m unittest tests.test_source_selection_gate tests.test_workbook_domain_neutral tests.test_chat` -> 32 tests OK; `.\venv\Scripts\python.exe -m unittest tests.test_legacy_csv_reindex_retrieval.LegacyCsvReindexRetrievalTests.test_legacy_csv_becomes_deterministically_queryable_after_reindex` -> OK; `.\venv\Scripts\python.exe -m unittest discover -s tests` -> 144 tests OK; `.\venv\Scripts\python.exe -m compileall app tests` -> OK; `git diff --check` -> OK with CRLF normalization warnings only.
+- Original failure-class reproduction: generated tests cover an unrelated structured workbook with weak headers and a relevant unstructured document; the workbook is rejected with no row-count answer, the unstructured source wins when evidence is sufficient, and unavailable/ambiguous answers return `grounded=false` with `sources=[]`.
+- Remaining risks or limitations: document-wide totals from unstructured top-K retrieval are still not calculated deterministically; the system returns unavailable or asks for clarification unless complete structured evidence exists. Candidate ambiguity now prefers clarification over arbitrary tie-breaking.

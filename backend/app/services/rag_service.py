@@ -2,7 +2,13 @@
 
 from app.config import settings
 from app.prompts.rag_prompt import UNAVAILABLE_ANSWER
+from app.services.chat_context import (
+    resolve_follow_up,
+    save_grounded_context,
+    strip_internal_context,
+)
 from app.services.groq_client import generate_answer
+from app.services.source_selection import select_sources, validate_grounded_result
 from app.services.vector_search import search_chunks
 from app.services.workbook_analysis import (
     analyze_workbook_question,
@@ -21,8 +27,33 @@ def answer_question(
     collection_id: int | None = None,
     document_id: int | None = None,
     version_id: int | None = None,
+    conversation_id: str | None = None,
 ) -> dict[str, object]:
     """Route calculations to structured rows and details to semantic retrieval."""
+    follow_up = resolve_follow_up(
+        owner_id=user_id,
+        conversation_id=conversation_id,
+        question=question,
+    )
+    if follow_up is not None:
+        follow_up = validate_grounded_result(
+            follow_up,
+            selected_document_id=(
+                int(follow_up["sources"][0]["document_id"])
+                if follow_up.get("grounded") and follow_up.get("sources")
+                else None
+            ),
+            owner_id=user_id,
+        )
+        log_audit_event(
+            event_type="chat.request",
+            endpoint="chat",
+            outcome="follow_up",
+            user_id=user_id,
+            client_ip=client_ip,
+        )
+        return follow_up
+
     structured_available = (
         version_id is None
         and has_structured_workbook(user_id, collection_id, document_id)
@@ -36,14 +67,44 @@ def answer_question(
             document_id,
         )
     )
-    if structured_available and (
+    structured_requested = structured_available and (
         is_analytical_question(question) or structured_lookup
-    ):
+    )
+    selection = select_sources(
+        question=question,
+        owner_id=user_id,
+        collection_id=collection_id,
+        document_id=document_id,
+        version_id=version_id,
+        structured_requested=structured_requested,
+        searcher=search_chunks,
+    )
+    if selection.path == "clarification":
+        log_audit_event(
+            event_type="chat.request",
+            endpoint="chat",
+            outcome="clarification",
+            user_id=user_id,
+            client_ip=client_ip,
+            metadata={"reason": selection.reason},
+        )
+        return {
+            "answer": "Please select the document you want me to use.",
+            "question_type": "clarification",
+            "grounded": False,
+            "sources": [],
+        }
+    if selection.path == "structured" and selection.document_id is not None:
         result = analyze_workbook_question(
             question,
             owner_id=user_id,
             collection_id=collection_id,
-            document_id=document_id,
+            document_id=selection.document_id,
+        )
+        result = validate_grounded_result(
+            result,
+            selected_document_id=selection.document_id,
+            owner_id=user_id,
         )
         question_type = str(result.get("question_type") or "analytical")
         if (
@@ -53,8 +114,6 @@ def answer_question(
             audit_outcome = "structured_no_match"
         elif question_type == "structured_lookup":
             audit_outcome = "structured_lookup"
-        elif question_type == "clarification":
-            audit_outcome = "structured_clarification"
         else:
             audit_outcome = "structured_analysis"
         log_audit_event(
@@ -65,33 +124,29 @@ def answer_question(
             client_ip=client_ip,
             metadata={
                 "question_type": result.get("question_type"),
-                "document_id": document_id,
+                "document_id": selection.document_id,
                 "collection_id": collection_id,
                 "matched_document_count": result.get("matched_document_count"),
                 "matched_row_count": result.get("matched_row_count"),
+                "selection_reason": selection.reason,
             },
         )
-        return result
+        if result.get("grounded"):
+            save_grounded_context(
+                owner_id=user_id,
+                conversation_id=conversation_id,
+                question=question,
+                result=result,
+            )
+            return strip_internal_context(result)
 
-    sources = search_chunks(
-        question,
-        owner_id=user_id,
-        limit=max(
-            settings.rag_retrieval_limit,
-            settings.rag_final_context_limit,
-        ),
-        collection_id=collection_id,
-        document_id=document_id,
-        version_id=version_id,
-        min_score=settings.rag_min_score,
-    )
-    sources = sources[:settings.rag_final_context_limit]
+    sources = selection.sources[:settings.rag_final_context_limit]
 
     if not sources:
         log_audit_event(
             event_type="chat.request",
             endpoint="chat",
-            outcome="no_results",
+            outcome=selection.reason if selection.reason else "no_results",
             user_id=user_id,
             client_ip=client_ip,
         )
@@ -173,7 +228,7 @@ Question:
         },
     )
 
-    return {
+    result = {
         "answer": answer,
         "question_type": "retrieval",
         "grounded": True,
@@ -194,3 +249,17 @@ Question:
             for source in sources
         ],
     }
+    result = validate_grounded_result(
+        result,
+        selected_document_id=selection.document_id,
+        owner_id=user_id,
+    )
+    if not result.get("grounded"):
+        return result
+    save_grounded_context(
+        owner_id=user_id,
+        conversation_id=conversation_id,
+        question=question,
+        result=result,
+    )
+    return result

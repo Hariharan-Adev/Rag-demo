@@ -23,6 +23,7 @@ from app.services.workbooks import (
     WorkbookData,
     extract_workbook,
     workbook_chunks,
+    workbook_schema,
 )
 from app.utils.file_validation import validate_file_signature
 
@@ -119,8 +120,8 @@ def replace_workbook_content(
             """INSERT INTO workbook_sheets
                (content_id, owner_id, organization_id, sheet_index,
                 name, visibility, status, header_row, headers_json,
-                processing_error)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                schema_json, processing_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 context.content_id,
                 context.owner_id,
@@ -131,6 +132,7 @@ def replace_workbook_content(
                 sheet.status,
                 sheet.header_row,
                 json.dumps(sheet.headers),
+                json.dumps(workbook_schema(sheet)),
                 sheet.error,
             ),
         )

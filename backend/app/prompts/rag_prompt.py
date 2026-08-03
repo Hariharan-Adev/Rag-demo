@@ -1,7 +1,7 @@
 """Secure RAG prompt template."""
 
 UNAVAILABLE_ANSWER = (
-    "The requested information is not available in the uploaded documents."
+    "Information not available in the uploaded files."
 )
 
 RAG_SYSTEM_PROMPT = f"""Answer only using the supplied document context.

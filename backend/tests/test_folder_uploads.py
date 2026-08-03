@@ -19,7 +19,13 @@ class FolderUploadTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.database_patch = patch.object(database, "DATABASE_PATH", Path(self.temporary.name) / "folder.db")
         self.database_patch.start()
+        self.vector_store_patch = patch.object(vector_store.settings, "vector_store", "qdrant")
+        self.vector_store_provider_patch = patch.object(vector_store.settings, "vector_store_provider", "qdrant")
+        self.qdrant_mode_patch = patch.object(vector_store.settings, "qdrant_mode", "memory")
         self.qdrant_patch = patch.object(vector_store.settings, "qdrant_local_path", "")
+        self.vector_store_patch.start()
+        self.vector_store_provider_patch.start()
+        self.qdrant_mode_patch.start()
         self.qdrant_patch.start()
         database.initialize_database()
         reset_vector_store_for_tests()
@@ -32,8 +38,12 @@ class FolderUploadTests(unittest.TestCase):
             connection.execute("INSERT INTO document_collections (id, owner_id, name) VALUES (20, 2, 'Finance')")
 
     def tearDown(self) -> None:
+        reset_vector_store_for_tests()
         self.database_patch.stop()
         self.qdrant_patch.stop()
+        self.qdrant_mode_patch.stop()
+        self.vector_store_provider_patch.stop()
+        self.vector_store_patch.stop()
         self.temporary.cleanup()
 
     def test_relative_path_is_metadata_safe(self) -> None:

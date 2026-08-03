@@ -10,6 +10,12 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = ""
     groq_vision_model: str = "qwen/qwen3.6-27b"
+    llm_provider: str = ""
+    azure_openai_endpoint: str = ""
+    azure_openai_api_key: str = ""
+    azure_openai_api_version: str = "2024-12-01-preview"
+    azure_openai_rag_deployment: str = ""
+    azure_openai_utility_deployment: str = ""
     enable_image_vision: bool = True
     jwt_secret_key: str = ""
     access_token_expire_minutes: int = 30
@@ -57,12 +63,15 @@ class Settings(BaseSettings):
     qdrant_prefer_grpc: bool = False
     qdrant_path: str = ""
     qdrant_local_path: str = "data/qdrant"
+    embedding_provider: str = "local"
+    local_embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_dimension: int = 384
     embedding_batch_size: int = 64
     embedding_model_version: str = "all-MiniLM-L6-v2"
     rag_retrieval_limit: int = Field(default=15, ge=1, le=100)
     rag_final_context_limit: int = Field(default=5, ge=1, le=20)
     rag_min_score: float = Field(default=0.35, ge=-1.0, le=1.0)
+    rag_structured_result_limit: int = Field(default=100, ge=1, le=1000)
     opensearch_url: str = ""
     opensearch_username: str = ""
     opensearch_password: str = ""

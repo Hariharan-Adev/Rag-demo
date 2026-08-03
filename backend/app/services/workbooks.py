@@ -305,6 +305,46 @@ def _plain_text(value: object) -> str:
     return text.replace("|", r"\|")
 
 
+def _infer_type(values: list[object]) -> str:
+    """Infer a general column type from observed cell values."""
+    present = [value for value in values if _is_nonempty(value)]
+    if not present:
+        return "text"
+    numbers = sum(isinstance(value, (int, float, Decimal)) and not isinstance(value, bool) for value in present)
+    date_like = sum(isinstance(value, (date, datetime, time)) for value in present)
+    strings = [str(value).strip() for value in present if isinstance(value, str)]
+    if numbers / len(present) >= 0.8:
+        return "number"
+    if date_like / len(present) >= 0.8:
+        return "date"
+    unique_ratio = len({str(value).strip().casefold() for value in present}) / max(len(present), 1)
+    if strings and all(re.fullmatch(r"[A-Za-z0-9_.:/#-]+", value) for value in strings) and unique_ratio > 0.8:
+        return "identifier"
+    if unique_ratio <= 0.5:
+        return "category"
+    return "text"
+
+
+def workbook_schema(sheet: WorkbookSheet) -> dict[str, object]:
+    """Build a compact schema for planning structured answers later."""
+    columns = []
+    for header in sheet.headers:
+        values = [row.values.get(header) for row in sheet.rows]
+        present = [value for value in values if _is_nonempty(value)]
+        columns.append({
+            "name": header,
+            "type": _infer_type(values),
+            "non_empty_count": len(present),
+            "unique_count": len({str(value).strip().casefold() for value in present}),
+        })
+    return {
+        "sheet": sheet.name,
+        "header_row": sheet.header_row,
+        "row_count": len(sheet.rows),
+        "columns": columns,
+    }
+
+
 def workbook_chunks(workbook: WorkbookData, filename: str) -> list[tuple[str, str, int | None]]:
     """Create row-oriented chunks, each carrying workbook and sheet provenance."""
     chunks: list[tuple[str, str, int | None]] = []
