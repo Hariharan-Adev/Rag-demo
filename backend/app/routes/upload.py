@@ -23,7 +23,16 @@ from app.services.embeddings import create_embeddings
 from app.services.folder_uploads import record_batch_result, sanitize_relative_path, validate_upload_context
 from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text
 from app.services.vector_store import VectorPoint, get_vector_store
-from app.services.workbooks import WorkbookData, extract_workbook, workbook_chunks, workbook_text
+from app.services.source_extraction import extract_source_chunks
+from app.services.workbooks import (
+    WorkbookData,
+    extract_workbook,
+    workbook_chunks,
+    workbook_from_pdf_chunks,
+    workbook_from_pdf,
+    workbook_schema,
+    workbook_text,
+)
 from app.services.zip_archives import ArchiveValidationError, extract_member, inspect_archive, temporary_archive_directory
 from app.utils.audit import log_audit_event
 from app.utils.document_content import (
@@ -85,8 +94,8 @@ def _replace_workbook_data(
             """
             INSERT INTO workbook_sheets
                 (content_id, owner_id, sheet_index, name, visibility, status,
-                 header_row, headers_json, processing_error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 header_row, headers_json, schema_json, processing_error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 content_id,
@@ -97,6 +106,7 @@ def _replace_workbook_data(
                 sheet.status,
                 sheet.header_row,
                 dumps(sheet.headers, ensure_ascii=False),
+                dumps(workbook_schema(sheet), ensure_ascii=False),
                 sheet.error,
             ),
         )
@@ -447,6 +457,10 @@ async def _process_document_upload(
                 include_very_hidden=settings.include_very_hidden_worksheets,
             )
             extracted_text = workbook_text(workbook_data, original_filename)
+        elif extension == ".pdf":
+            source_chunks = extract_source_chunks(saved_path)
+            workbook_data = workbook_from_pdf(saved_path) or workbook_from_pdf_chunks(source_chunks)
+            extracted_text = "\n\n".join(chunk.text for chunk in source_chunks)
         else:
             extracted_text = extract_text(saved_path)
         validate_extracted_text(extracted_text)

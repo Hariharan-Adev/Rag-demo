@@ -11,6 +11,7 @@ from app.config import settings
 from app.services.chunking import chunk_text
 from app.services.document_loader import DocumentParseError, extract_text
 from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text
+from app.services.pdf_layout import extract_pdf_page_texts
 
 
 @dataclass(frozen=True)
@@ -62,26 +63,57 @@ def _split(text: str, source_type: str, location: dict[str, object]) -> list[Sou
 
 def _pdf(path: Path) -> list[SourceChunk]:
     try:
-        from pypdf import PdfReader
-
         result: list[SourceChunk] = []
-        pages = PdfReader(str(path)).pages
-        if len(pages) > settings.max_pdf_pages:
-            raise DocumentParseError("PDF exceeds the configured page limit.")
-        for page_number, page in enumerate(pages, start=1):
-            text = page.extract_text() or ""
-            if text.strip():
-                for block_index, value in enumerate(chunk_text(text), start=1):
-                    result.append(SourceChunk(value, "pdf", {
-                        "page_start": page_number,
-                        "page_end": page_number,
-                        "block_ids": [f"p{page_number}-b{block_index}"],
-                        "bounding_boxes": [],
-                        "part": block_index,
-                    }))
+        for page_text in extract_pdf_page_texts(path):
+            for block_index, value in enumerate(chunk_text(page_text.text), start=1):
+                result.append(SourceChunk(value, "pdf", {
+                    "page_start": page_text.page_number,
+                    "page_end": page_text.page_number,
+                    "block_ids": [f"p{page_text.page_number}-b{block_index}"],
+                    "bounding_boxes": [],
+                    "part": block_index,
+                }))
         return result
     except Exception as error:
         raise DocumentParseError("The PDF file could not be read.") from error
+
+
+def _is_nonempty_cell(value: object) -> bool:
+    """Treat blank strings like empty cells when detecting workbook headers."""
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+
+def _vertical_merged_values(worksheet) -> dict[tuple[int, int], object]:
+    """Preserve labels from vertically merged header cells without spreading titles."""
+    values: dict[tuple[int, int], object] = {}
+    for cell_range in worksheet.merged_cells.ranges:
+        if cell_range.min_col != cell_range.max_col:
+            continue
+        value = worksheet.cell(cell_range.min_row, cell_range.min_col).value
+        for row_number in range(cell_range.min_row + 1, cell_range.max_row + 1):
+            values[(row_number, cell_range.min_col)] = value
+    return values
+
+
+def _header_row_number(rows: list[tuple[int, list[object]]]) -> int | None:
+    """Choose the most table-like leading row for field labels."""
+    best: tuple[int, int] | None = None
+    for index, (row_number, values) in enumerate(rows[:20]):
+        present = [value for value in values if _is_nonempty_cell(value)]
+        if not present:
+            continue
+        text_count = sum(isinstance(value, str) for value in present)
+        distinct = len({str(value).strip().casefold() for value in present})
+        following_width = (
+            sum(_is_nonempty_cell(value) for value in rows[index + 1][1])
+            if index + 1 < len(rows) else 0
+        )
+        score = len(present) * 3 + text_count * 2 + distinct + min(following_width, len(present))
+        if len(present) == 1 and len(rows) > index + 1:
+            score -= 4
+        if best is None or score > best[0]:
+            best = (score, row_number)
+    return best[1] if best else None
 
 
 def _pptx(path: Path) -> list[SourceChunk]:
@@ -183,28 +215,31 @@ def _xlsx(
                     row for row in worksheet.iter_rows()
                     if any(cell.value is not None for cell in row)
                 ]
-                header_row_number = (
-                    next(
-                        cell.row
-                        for row in populated_rows
-                        for cell in row
-                        if cell.value is not None
+                merged_values = _vertical_merged_values(worksheet)
+                row_values = [
+                    (
+                        row[0].row,
+                        [
+                            merged_values.get((cell.row, cell.column), cell.value)
+                            for cell in row
+                        ],
                     )
-                    if populated_rows else None
-                )
+                    for row in populated_rows
+                ]
+                header_row_number = _header_row_number(row_values)
                 header_context = [
-                    str(cell.value)
+                    str(merged_values.get((cell.row, cell.column), cell.value))
                     for cell in (
                         worksheet[header_row_number] if header_row_number else []
                     )
-                    if cell.value is not None
+                    if _is_nonempty_cell(merged_values.get((cell.row, cell.column), cell.value))
                 ]
                 header_by_column = {
-                    cell.column: str(cell.value).strip()
+                    cell.column: str(merged_values.get((cell.row, cell.column), cell.value)).strip()
                     for cell in (
                         worksheet[header_row_number] if header_row_number else []
                     )
-                    if cell.value is not None and str(cell.value).strip()
+                    if _is_nonempty_cell(merged_values.get((cell.row, cell.column), cell.value))
                 }
                 tables: list[tuple[str, tuple[int, int, int, int]]] = [
                     (table.name, range_boundaries(table.ref))
@@ -230,7 +265,7 @@ def _xlsx(
                     values = [
                         (
                             f"{header_by_column.get(cell.column, cell.coordinate)}: "
-                            f"{cell.value}"
+                            f"{merged_values.get((cell.row, cell.column), cell.value)}"
                             + (
                                 f" (cached value: {values_sheet[cell.coordinate].value})"
                                 if cell.coordinate in formulas

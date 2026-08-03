@@ -11,6 +11,9 @@ import csv
 import math
 import re
 
+from app.services.source_extraction import SourceChunk
+from app.services.pdf_layout import extract_pdf_page_texts
+
 from app.services.document_loader import DocumentParseError
 
 
@@ -69,8 +72,19 @@ def _normalized_value(value: object) -> object:
     return str(value)
 
 
-def _xlsx_value(cell) -> object:
-    value = _normalized_value(cell.value)
+def _canonical_cell(value: object) -> str:
+    """Normalize cells only for structural comparisons such as repeated headers."""
+    return " ".join(str(value or "").casefold().split())
+
+
+def _xlsx_value(cell, merged_values: dict[tuple[int, int], object] | None = None) -> object:
+    """Return a safe value while preserving vertical merged header labels."""
+    raw = (
+        merged_values.get((cell.row, cell.column), cell.value)
+        if merged_values is not None
+        else cell.value
+    )
+    value = _normalized_value(raw)
     if isinstance(value, int) and value >= 0:
         number_format = str(getattr(cell, "number_format", "") or "")
         if re.fullmatch(r"0+", number_format) and len(number_format) > len(str(value)):
@@ -116,6 +130,51 @@ def _headers(values: list[object], width: int) -> list[str]:
     return output
 
 
+def _repair_parent_headers(
+    headers: list[str],
+    nonempty: list[tuple[int, list[object]]],
+    header_index: int,
+    data_rows: list[tuple[int, list[object]]],
+) -> list[str]:
+    """Preserve parent labels from multi-row headers with unmerged child cells."""
+    if header_index <= 0:
+        return headers
+    parent_values = nonempty[header_index - 1][1]
+    if not parent_values or not _is_nonempty(parent_values[0]):
+        return headers
+    first_header = str(headers[0]).strip()
+    first_parent = str(parent_values[0]).strip()
+    if not first_parent or not re.fullmatch(r"[A-Za-z]", first_header):
+        return headers
+    repaired = list(headers)
+    repaired[0] = first_parent
+    second_values = [
+        str(values[1]).strip().casefold()
+        for _, values in data_rows
+        if len(values) > 1 and _is_nonempty(values[1])
+    ]
+    if len(repaired) > 1 and str(repaired[1]).startswith("Column "):
+        # Attendance-style workbooks often use a blank child cell for IN/OUT rows.
+        repaired[1] = (
+            "Attendance Direction"
+            if {"in", "out"} & set(second_values)
+            else f"{first_parent} Detail"
+        )
+    return _headers(repaired, len(repaired))
+
+
+def _vertical_merged_values(worksheet) -> dict[tuple[int, int], object]:
+    """Copy labels down vertically merged ranges without spreading title rows."""
+    values: dict[tuple[int, int], object] = {}
+    for cell_range in worksheet.merged_cells.ranges:
+        if cell_range.min_col != cell_range.max_col:
+            continue
+        value = worksheet.cell(cell_range.min_row, cell_range.min_col).value
+        for row_number in range(cell_range.min_row + 1, cell_range.max_row + 1):
+            values[(row_number, cell_range.min_col)] = value
+    return values
+
+
 def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> WorkbookSheet:
     nonempty = [
         (number, values)
@@ -130,8 +189,13 @@ def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> 
     data_rows = nonempty[header_index + 1 :]
     width = max([len(header_values), *(len(values) for _, values in data_rows)])
     headers = _headers(header_values, width)
+    headers = _repair_parent_headers(headers, nonempty, header_index, data_rows)
     structured = []
+    canonical_headers = [_canonical_cell(header) for header in headers]
     for row_number, values in data_rows:
+        comparable = [_canonical_cell(values[index] if index < len(values) else None) for index in range(width)]
+        if comparable == canonical_headers:
+            continue
         row = {
             header: values[index] if index < len(values) else None
             for index, header in enumerate(headers)
@@ -153,7 +217,7 @@ def _extract_xlsx(
 ) -> WorkbookData:
     from openpyxl import load_workbook
 
-    workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    workbook = load_workbook(path, read_only=False, data_only=True, keep_links=False)
     sheets: list[WorkbookSheet] = []
     try:
         for worksheet in workbook.worksheets:
@@ -165,8 +229,9 @@ def _extract_xlsx(
                 sheets.append(WorkbookSheet(worksheet.title, state, "disabled"))
                 continue
             try:
+                merged_values = _vertical_merged_values(worksheet)
                 rows = [
-                    (index, [_xlsx_value(cell) for cell in row])
+                    (index, [_xlsx_value(cell, merged_values) for cell in row])
                     for index, row in enumerate(worksheet.iter_rows(), start=1)
                 ]
                 sheets.append(_make_sheet(worksheet.title, state, rows))
@@ -262,6 +327,115 @@ def _extract_csv(path: Path) -> WorkbookData:
     return WorkbookData([
         _make_sheet("CSV", "visible", rows)
     ])
+
+
+def _split_pdf_table_line(line: str) -> list[str]:
+    """Split table-looking PDF text while avoiding ordinary sentence lines."""
+    value = line.strip().strip("|")
+    if not value:
+        return []
+    if "|" in value:
+        cells = [cell.strip() for cell in value.split("|")]
+    elif "\t" in value:
+        cells = [cell.strip() for cell in value.split("\t")]
+    else:
+        cells = [cell.strip() for cell in re.split(r"\s{2,}", value)]
+    cells = [cell for cell in cells if cell]
+    return cells if len(cells) >= 2 else []
+
+
+def _inspection_rejection_rows(text: str) -> list[tuple[int, list[object]]]:
+    """Recover key totals from flattened final-inspection rejection PDFs."""
+    rows: list[tuple[int, list[object]]] = [(
+        1,
+        [
+            "S.No",
+            "Model",
+            "Inspected Qty",
+            "OK Qty",
+            "Total Reject Count",
+            "Rejection %",
+        ],
+    )]
+    for line in text.splitlines():
+        match = re.match(
+            r"^\s*(\d+)\s+(.+?)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)%",
+            line,
+        )
+        if not match:
+            continue
+        serial, model, inspected, ok_qty, rejected, percent = match.groups()
+        # Keep the model descriptor intact; the rightmost totals are stable.
+        rows.append((
+            len(rows) + 1,
+            [
+                int(serial),
+                model.strip(),
+                int(inspected),
+                int(ok_qty),
+                int(rejected),
+                f"{percent}%",
+            ],
+        ))
+    return rows if len(rows) > 1 else []
+
+
+def workbook_from_pdf_chunks(chunks: list[SourceChunk]) -> WorkbookData | None:
+    """Build structured rows from clear text-extracted PDF tables."""
+    sheets: list[WorkbookSheet] = []
+    table_index = 0
+    for chunk in chunks:
+        if chunk.source_type != "pdf":
+            continue
+        inspection_rows = _inspection_rejection_rows(chunk.text)
+        if inspection_rows:
+            table_index += 1
+            page = int(chunk.location.get("page_start") or chunk.location.get("page") or 1)
+            sheet = _make_sheet(
+                f"PDF page {page} table {table_index}",
+                "visible",
+                inspection_rows,
+            )
+            if sheet.status == "processed":
+                sheets.append(sheet)
+            continue
+        rows: list[tuple[int, list[object]]] = []
+        for line in chunk.text.splitlines():
+            cells = _split_pdf_table_line(line)
+            if cells:
+                rows.append((len(rows) + 1, cells))
+        if len(rows) < 2:
+            continue
+        widths = [len(values) for _, values in rows]
+        common_width = max(set(widths), key=widths.count)
+        table_rows = [
+            (row_number, values)
+            for row_number, values in rows
+            if len(values) == common_width
+        ]
+        if len(table_rows) < 2:
+            continue
+        table_index += 1
+        page = int(chunk.location.get("page_start") or chunk.location.get("page") or 1)
+        sheet = _make_sheet(f"PDF page {page} table {table_index}", "visible", table_rows)
+        if sheet.status == "processed":
+            sheets.append(sheet)
+    return WorkbookData(sheets) if any(sheet.status == "processed" for sheet in sheets) else None
+
+
+def workbook_from_pdf(path: Path) -> WorkbookData | None:
+    """Extract clear text PDF tables before retrieval chunking removes row breaks."""
+    try:
+        chunks = []
+        for page_text in extract_pdf_page_texts(path):
+            chunks.append(SourceChunk(
+                text=page_text.text,
+                source_type="pdf",
+                location={"page_start": page_text.page_number, "page_end": page_text.page_number},
+            ))
+        return workbook_from_pdf_chunks(chunks)
+    except Exception:
+        return None
 
 
 def extract_workbook(

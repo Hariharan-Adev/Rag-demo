@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from io import BytesIO
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +20,7 @@ from app.routes import upload
 from app.services import structured_ingestion, vector_search, vector_store
 from app.services.chat_context import save_grounded_context
 from app.services.rag_service import answer_question
+from app.services.source_selection import select_sources
 from app.services.vector_store import reset_vector_store_for_tests
 from app.services.workbook_analysis import (
     RowRecord,
@@ -53,6 +55,43 @@ def _workbook_bytes(sheets: list[tuple[str, list[list[object]], str]]) -> bytes:
     workbook.save(output)
     workbook.close()
     return output.getvalue()
+
+
+def _merged_attendance_bytes() -> bytes:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Attendance"
+    sheet.merge_cells("A1:D1")
+    sheet["A1"] = "Monthly Attendance Report"
+    sheet.merge_cells("A3:A4")
+    sheet["A3"] = "Employee ID"
+    sheet.merge_cells("B3:B4")
+    sheet["B3"] = "Employee Name"
+    sheet.merge_cells("C3:D3")
+    sheet["C3"] = "Attendance"
+    sheet["C4"] = "Present Days"
+    sheet["D4"] = "Absent Days"
+    sheet.append(["E001", "Aparna", 20, 2])
+    sheet.append(["E002", "Hari", 18, 4])
+    output = BytesIO()
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
+class _FakePdfPage:
+    """Test double that exposes plain and layout pypdf extraction modes."""
+
+    def __init__(self, plain: str, layout: str | None = None) -> None:
+        self.plain = plain
+        self.layout = layout or plain
+
+    def extract_text(self, *args, **kwargs) -> str:
+        if kwargs.get("visitor_text"):
+            return self.plain
+        if kwargs.get("extraction_mode") == "layout":
+            return self.layout
+        return self.plain
 
 
 class WorkbookDomainNeutralTests(unittest.TestCase):
@@ -104,6 +143,22 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
     def upload_text(self, text: str, filename: str, owner_id: int = 1) -> dict[str, object]:
         file = UploadFile(file=BytesIO(text.encode("utf-8")), filename=filename)
         return asyncio.run(upload._process_document_upload(_request(), file, {"id": owner_id}))
+
+    def upload_pdf_table(self, text: str, filename: str = "metrics.pdf") -> dict[str, object]:
+        page = _FakePdfPage(text)
+        file = UploadFile(file=BytesIO(b"%PDF-1.4\n%%EOF"), filename=filename)
+        with patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[page])):
+            return asyncio.run(upload._process_document_upload(_request(), file, {"id": 1}))
+
+    def upload_pdf_layout_table(self, plain: str, layout: str, filename: str = "final-inspection-rejection.pdf") -> dict[str, object]:
+        page = _FakePdfPage(plain, layout)
+        file = UploadFile(file=BytesIO(b"%PDF-1.4\n%%EOF"), filename=filename)
+        with patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[page])):
+            return asyncio.run(upload._process_document_upload(_request(), file, {"id": 1}))
+
+    def upload_merged_attendance_workbook(self) -> dict[str, object]:
+        file = UploadFile(file=BytesIO(_merged_attendance_bytes()), filename="attendance.xlsx")
+        return asyncio.run(upload._process_document_upload(_request(), file, {"id": 1}))
 
     def test_multi_sheet_tables_are_schema_indexed_and_counted(self) -> None:
         result = self.upload_workbook(
@@ -255,6 +310,123 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertIn("A: 10", answer["answer"])
         self.assertIn("B: 5", answer["answer"])
         self.assertTrue(answer["grounded"])
+
+    def test_pdf_table_is_structured_for_count_total_and_percentage(self) -> None:
+        result = self.upload_pdf_table(
+            "\n".join([
+                "Defect | Quantity | Rate",
+                "Crack | 2 | 4.0%",
+                "Scratch | 3 | 6.0%",
+            ])
+        )
+        document_id = int(result["document_id"])
+
+        count = analyze_workbook_question("How many defects are found?", 1, document_id=document_id)
+        total = analyze_workbook_question("What is the total quantity?", 1, document_id=document_id)
+        rate = analyze_workbook_question("What is the overall rate?", 1, document_id=document_id)
+
+        self.assertIn("Count: 2", count["answer"])
+        self.assertIn("Total Quantity: 5", total["answer"])
+        self.assertIn("Average Rate: 5", rate["answer"])
+        self.assertEqual(total["sources"][0]["source_type"], "pdf")
+        self.assertEqual(total["sources"][0]["source_location"]["page_start"], 1)
+        self.assertEqual(total["sources"][0]["source_location"]["table_name"], "Table 1")
+
+    def test_flattened_pdf_uses_layout_table_for_rejection_counts(self) -> None:
+        result = self.upload_pdf_layout_table(
+            "FINAL INSPECTION REJECTION Component Rejection Count Gear 5 Valve 3",
+            "\n".join([
+                "FINAL INSPECTION REJECTION",
+                "Component  Rejection Count",
+                "Gear       5",
+                "Valve      3",
+            ]),
+        )
+        document_id = int(result["document_id"])
+
+        total = analyze_workbook_question(
+            "What is the total rejection count?",
+            1,
+            document_id=document_id,
+        )
+        filtered = analyze_workbook_question(
+            "What is the rejection count for Gear?",
+            1,
+            document_id=document_id,
+        )
+
+        self.assertIn("Total Rejection Count: 8", total["answer"])
+        self.assertIn("Total Rejection Count: 5", filtered["answer"])
+        self.assertEqual(total["sources"][0]["source_type"], "pdf")
+
+    def test_merged_attendance_headers_are_preserved(self) -> None:
+        result = self.upload_merged_attendance_workbook()
+        document_id = int(result["document_id"])
+
+        with database.get_connection() as connection:
+            sheet = connection.execute(
+                """SELECT ws.headers_json
+                   FROM workbook_sheets ws
+                   JOIN documents d ON d.content_id = ws.content_id
+                   WHERE d.id = ?""",
+                (document_id,),
+            ).fetchone()
+        answer = analyze_workbook_question(
+            "What is the total present days for Aparna in attendance?",
+            1,
+            document_id=document_id,
+        )
+
+        self.assertIn("Employee ID", sheet["headers_json"])
+        self.assertIn("Employee Name", sheet["headers_json"])
+        self.assertNotIn("Column 1", sheet["headers_json"])
+        self.assertNotIn("Column 2", sheet["headers_json"])
+        self.assertIn("Total Present Days: 20", answer["answer"])
+
+    def test_named_document_routes_before_mixed_semantic_search(self) -> None:
+        attendance = self.upload_merged_attendance_workbook()
+        self.upload_workbook(
+            [("Inspection", [["Component", "Rejection Count"], ["Gear", 5]], "visible")],
+            "final-inspection-rejection.xlsx",
+        )
+        requested_document_ids: list[int | None] = []
+
+        def searcher(*args, **kwargs):
+            requested_document_ids.append(kwargs.get("document_id"))
+            document_id = int(kwargs["document_id"])
+            return [{
+                "document_id": document_id,
+                "version_id": 1,
+                "filename": "attendance.xlsx",
+                "content": "Attendance evidence",
+                "source_type": "excel",
+                "source_location": {},
+                "score": 0.9,
+            }]
+
+        result = select_sources(
+            question="What does the attendance upload say?",
+            owner_id=1,
+            searcher=searcher,
+        )
+
+        self.assertEqual(requested_document_ids[0], int(attendance["document_id"]))
+        self.assertEqual(result.document_id, int(attendance["document_id"]))
+
+    def test_ambiguous_numeric_target_returns_unavailable(self) -> None:
+        result = self.upload_workbook(
+            [("Data", [["First Amount", "Second Amount"], [10, 20]], "visible")],
+            "ambiguous.xlsx",
+        )
+
+        answer = analyze_workbook_question(
+            "What is the total amount?",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        self.assertFalse(answer["grounded"])
+        self.assertEqual(answer["sources"], [])
 
     def test_complete_structured_answer_wins_over_partial_vector_context(self) -> None:
         result = self.upload_workbook(

@@ -43,7 +43,7 @@ from app.services.structured_ingestion import (
     ingest_structured_csv,
     replace_workbook_content,
 )
-from app.services.workbooks import extract_workbook
+from app.services.workbooks import extract_workbook, workbook_from_pdf, workbook_from_pdf_chunks
 from app.utils.security import validate_chunks, validate_extracted_text
 from app.utils.observability import log_event
 from app.services.storage import resolve_storage_key, storage_key_for, write_storage_bytes
@@ -93,6 +93,8 @@ def _extract_bundle_child(
             if path.suffix.lower() in {".xlsx", ".xls"}
             else None
         )
+        if workbook is None and path.suffix.lower() == ".pdf":
+            workbook = workbook_from_pdf(path) or workbook_from_pdf_chunks(source_chunks)
         output.put(("ok", source_chunks, source_metadata, workbook))
     except Exception as error:
         output.put(("error", type(error).__name__, str(error)))
@@ -122,6 +124,8 @@ def _extract_bundle(path: Path):
             if path.suffix.lower() in {".xlsx", ".xls"}
             else None
         )
+        if workbook is None and path.suffix.lower() == ".pdf":
+            workbook = workbook_from_pdf(path) or workbook_from_pdf_chunks(source_chunks)
         return source_chunks, source_metadata, workbook
 
     context = multiprocessing.get_context("spawn")

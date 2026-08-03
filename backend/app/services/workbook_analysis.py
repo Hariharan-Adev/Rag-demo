@@ -16,9 +16,10 @@ from app.services.document_access import READABLE_DOCUMENT_SQL
 
 
 INTENT_PATTERNS = (
-    r"\bhow many\b", r"\bcount\b", r"\b(total|sum)\b",
+    r"\bhow many\b", r"\bcount\b", r"\bno\b", r"\bnumber of\b", r"\b(total|sum)\b",
     r"\b(average|avg|mean)\b", r"\b(minimum|min|lowest|smallest)\b",
     r"\b(maximum|max|highest|largest)\b", r"\b(unique|distinct)\b",
+    r"\b(percent|percentage|rate|overall)\b",
     r"\b(list|show|which|what are|give)\b", r"\bgroup\b.+\bby\b",
     r"\bbetween\b.+\band\b", r"\bfrom\b.+\bto\b",
     r"\b(below|under|less than|above|over|greater than|at least|at most)\b",
@@ -262,10 +263,12 @@ def _number(value: object) -> Decimal | None:
         except InvalidOperation:
             return None
     text = str(value).strip()
-    if not re.fullmatch(r"[^\w\s-]?\s*\(?-?\d[\d,]*(?:\.\d+)?\)?", text):
+    if not re.fullmatch(r"\(?\s*[-+]?\s*[^\w\s-]*\s*\d[\d,]*(?:\.\d+)?\s*%?\s*\)?", text):
         return None
+    negative = text.startswith("(") and text.endswith(")")
     try:
-        return Decimal(re.sub(r"[^\d.\-]", "", text))
+        number = Decimal(re.sub(r"[^\d.\-]", "", text))
+        return -number if negative and number > 0 else number
     except InvalidOperation:
         return None
 
@@ -414,7 +417,9 @@ def _operation(question: str) -> str:
         return "minimum"
     if re.search(r"\b(unique|distinct)\b", normalized):
         return "distinct"
-    if re.search(r"\bhow many\b|\bcount\b", normalized):
+    if re.search(r"\b(percent|percentage|rate|overall)\b", normalized):
+        return "average"
+    if re.search(r"\bhow many\b|\bcount\b|\bno\b|\bnumber of\b", normalized):
         return "count"
     if re.search(r"\bgroup\b.+\bby\b", normalized):
         return "group"
@@ -471,6 +476,8 @@ def _choose_column(
         inferred = scope.schema.get(header, {}).get("type", "text")
         if numeric and not any(_number(value) is not None for value in values):
             continue
+        if numeric and inferred != "number" and not (_tokens(header) & {"amount", "qty", "quantity", "count", "rate", "total"}):
+            continue
         score = _column_score(header, subject)
         if score > 0 and preferred_types and inferred in preferred_types:
             score += 2
@@ -479,7 +486,22 @@ def _choose_column(
     if not candidates:
         return None
     candidates.sort(key=lambda item: (-item[0], item[1].casefold()))
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None
     return candidates[0][1]
+
+
+def _candidate_columns(scope: WorkbookScope, *, numeric: bool = False, preferred_types: set[str] | None = None) -> list[str]:
+    """Find columns that can safely stand in when document scope is strong."""
+    output: list[str] = []
+    for header, values in _column_values(scope.rows).items():
+        inferred = scope.schema.get(header, {}).get("type", "text")
+        if numeric and not any(_number(value) is not None for value in values):
+            continue
+        if preferred_types and inferred not in preferred_types:
+            continue
+        output.append(header)
+    return sorted(output, key=str.casefold)
 
 
 def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool = False) -> Plan:
@@ -519,14 +541,29 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
             return Plan("unavailable", rejection_reason="ambiguous_distinct_column")
         return Plan("distinct", entity_column=column, list_column=column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if operation == "count":
+        entity_column = _choose_column(scope, question, preferred_types={"category", "text", "identifier"})
+        if (
+            entity_column
+            and _column_score(entity_column, question) > 0
+            and not (_tokens(entity_column) & {"amount", "qty", "quantity", "count", "rate", "total", "reject", "rejection"})
+        ):
+            return Plan("count", entity_column=entity_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
         numeric_quantity = _choose_column(scope, question, numeric=True)
         if numeric_quantity and _column_score(numeric_quantity, question) > 0:
             return Plan("total", value_column=numeric_quantity, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
-        entity_column = _choose_column(scope, question, preferred_types={"category", "text", "identifier"})
         generic_record_count = explicit_scope and (_tokens(question) & {"record", "records", "row", "rows"})
+        scoped_entity_count = (
+            not entity_column
+            and evidence_score >= 4
+            and any(reason in evidence_reasons for reason in {"filename_token_match", "sheet_token_match"})
+            and len(_candidate_columns(scope, preferred_types={"category", "text", "identifier"})) == 1
+        )
         if not (entity_column or generic_record_count):
-            return Plan("unavailable", rejection_reason="count_has_no_entity_or_filter")
-        if not (filters or numeric_filter or generic_record_count or _column_score(entity_column or "", question) > 0):
+            if scoped_entity_count:
+                entity_column = _candidate_columns(scope, preferred_types={"category", "text", "identifier"})[0]
+            else:
+                return Plan("unavailable", rejection_reason="count_has_no_entity_or_filter")
+        if not (filters or numeric_filter or generic_record_count or scoped_entity_count or _column_score(entity_column or "", question) > 0):
             return Plan("unavailable", rejection_reason="count_has_unresolved_filter")
         if not has_source_evidence:
             return Plan("unavailable", rejection_reason="weak_count_source_evidence")
@@ -575,7 +612,8 @@ def _sources(scope: WorkbookScope, rows: list[RowRecord]) -> list[dict[str, obje
     grouped: dict[str, list[int]] = defaultdict(list)
     for row in rows:
         grouped[row.sheet].append(row.row_number)
-    source_type = "csv" if scope.filename.casefold().endswith(".csv") else "excel"
+    filename = scope.filename.casefold()
+    source_type = "csv" if filename.endswith(".csv") else "pdf" if filename.endswith(".pdf") else "excel"
     def ranges(numbers: list[int]) -> list[dict[str, int]]:
         ordered = sorted(set(numbers))
         if not ordered:
@@ -591,18 +629,30 @@ def _sources(scope: WorkbookScope, rows: list[RowRecord]) -> list[dict[str, obje
         spans.append({"row_start": start, "row_end": previous})
         return spans
 
+    def location(sheet: str, numbers: list[int]) -> dict[str, object]:
+        base: dict[str, object] = {
+            "sheet_name": "CSV" if source_type == "csv" else sheet,
+            "row_start": min(numbers),
+            "row_end": max(numbers),
+            "row_ranges": ranges(numbers),
+        }
+        if source_type == "pdf":
+            match = re.search(r"\bpage\s+(\d+)\b", sheet.casefold())
+            if match:
+                page = int(match.group(1))
+                base.update({"page_start": page, "page_end": page})
+            table = re.search(r"\btable\s+(\d+)\b", sheet.casefold())
+            if table:
+                base["table_name"] = f"Table {int(table.group(1))}"
+        return base
+
     return [
         {
             "document_id": scope.document_id,
             "version_id": scope.version_id,
             "filename": scope.filename,
             "source_type": source_type,
-            "source_location": {
-                "sheet_name": "CSV" if source_type == "csv" else sheet,
-                "row_start": min(numbers),
-                "row_end": max(numbers),
-                "row_ranges": ranges(numbers),
-            },
+            "source_location": location(sheet, numbers),
             "retrieval_score": None,
         }
         for sheet, numbers in grouped.items()
@@ -626,7 +676,21 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
     answer: str
     contributing_values: list[object] = []
     if plan.intent == "count":
-        answer = f"Count: {len(rows):,}. Calculation basis: {basis}."
+        if (
+            plan.entity_column
+            and "employee" in _tokens(plan.entity_column)
+            and "employee" in _tokens(scope.filename + " " + plan.entity_column)
+        ):
+            values = {
+                str(row.values.get(plan.entity_column)).strip().casefold()
+                for row in rows
+                if row.values.get(plan.entity_column) is not None
+                and str(row.values.get(plan.entity_column)).strip()
+                and _number(row.values.get(plan.entity_column)) is None
+            }
+            answer = f"Count: {len(values):,}. Calculation basis: distinct employee-name values in '{plan.entity_column}'."
+        else:
+            answer = f"Count: {len(rows):,}. Calculation basis: {basis}."
     elif plan.intent == "distinct" and plan.list_column:
         values = {
             str(row.values.get(plan.list_column)).strip().casefold()

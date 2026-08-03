@@ -143,6 +143,56 @@ def _active_accessible_document(
         ).fetchone() is not None
 
 
+def _confident_document_id_from_question(
+    question: str,
+    owner_id: int,
+    collection_id: int | None,
+) -> int | None:
+    """Route named-document questions before broad semantic search can mix files."""
+    organization_id = _organization_id(owner_id)
+    if organization_id is None:
+        return None
+    question_tokens = safe_tokens(question)
+    if not question_tokens:
+        return None
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"""SELECT d.id, d.original_filename, d.display_filename
+                FROM documents d
+                JOIN document_versions dv
+                  ON dv.id = d.current_version_id
+                 AND dv.document_id = d.id
+                 AND dv.organization_id = d.organization_id
+                WHERE {READABLE_DOCUMENT_SQL}
+                  AND d.current_version_id IS NOT NULL
+                  AND d.processing_status = 'completed'
+                  AND dv.status = 'completed'
+                  AND dv.deleted_at IS NULL
+                  AND (? IS NULL OR d.collection_id = ?)
+                ORDER BY d.id""",
+            (
+                organization_id, owner_id, owner_id,
+                collection_id, collection_id,
+            ),
+        ).fetchall()
+    scored: list[tuple[int, int]] = []
+    for row in rows:
+        name_tokens = safe_tokens(
+            f"{row['original_filename']} {row['display_filename']}"
+        )
+        overlap = question_tokens & name_tokens
+        if overlap:
+            scored.append((len(overlap) * 4, int(row["id"])))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    if scored[0][0] < 4:
+        return None
+    if len(scored) > 1 and scored[0][0] - scored[1][0] <= AMBIGUITY_MARGIN:
+        return None
+    return scored[0][1]
+
+
 def _semantic_decisions(question: str, sources: list[dict[str, object]]) -> list[CandidateDecision]:
     question_tokens = safe_tokens(question)
     grouped: dict[int, CandidateDecision] = {}
@@ -202,9 +252,11 @@ def _structured_decisions(
             rejection = plan.rejection_reason or "schema_mismatch"
         elif score < MIN_STRUCTURED_SCORE:
             rejection = "insufficient_evidence"
+        filename = scope.filename.casefold()
+        source_type = "csv" if filename.endswith(".csv") else "pdf" if filename.endswith(".pdf") else "excel"
         decisions.append(CandidateDecision(
             document_id=scope.document_id,
-            source_type="excel" if not scope.filename.casefold().endswith(".csv") else "csv",
+            source_type=source_type,
             score=score,
             schema_score=evidence_score,
             reasons=sorted(set(reasons)),
@@ -233,14 +285,20 @@ def select_sources(
     """Compare eligible structured and unstructured evidence before answering."""
     if document_id is not None and not _active_accessible_document(owner_id, document_id, version_id):
         return SelectionResult(path="unavailable", reason="acl_excluded")
-    if document_id is not None and version_id is None and structured_requested:
-        structured = _structured_decisions(question, owner_id, collection_id, document_id)
+    routed_document_id = document_id
+    if routed_document_id is None and version_id is None:
+        routed_document_id = _confident_document_id_from_question(
+            question, owner_id, collection_id
+        )
+    if routed_document_id is not None and version_id is None and structured_requested:
+        structured = _structured_decisions(question, owner_id, collection_id, routed_document_id)
         best_structured = _best_non_rejected(structured)
         log_event(
             "rag.source_selection",
             user_id=owner_id,
             collection_id=collection_id,
             explicit_document_id=document_id,
+            routed_document_id=routed_document_id,
             candidates=[
                 {
                     "document_id": item.document_id,
@@ -258,7 +316,11 @@ def select_sources(
             return SelectionResult(
                 path="structured",
                 document_id=best_structured.document_id,
-                reason="explicit_structured_scope",
+                reason=(
+                    "explicit_structured_scope"
+                    if document_id is not None
+                    else "filename_routed_structured_scope"
+                ),
                 diagnostics=structured,
             )
 
@@ -267,7 +329,7 @@ def select_sources(
         owner_id=owner_id,
         limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
         collection_id=collection_id,
-        document_id=document_id,
+        document_id=routed_document_id,
         version_id=version_id,
         min_score=settings.rag_min_score,
     )
@@ -278,7 +340,7 @@ def select_sources(
             owner_id=owner_id,
             limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
             collection_id=collection_id,
-            document_id=document_id,
+            document_id=routed_document_id,
             version_id=version_id,
             min_score=0.0,
         )
@@ -288,7 +350,7 @@ def select_sources(
             semantic = fallback_decisions
     structured = []
     if version_id is None:
-        structured = _structured_decisions(question, owner_id, collection_id, document_id)
+        structured = _structured_decisions(question, owner_id, collection_id, routed_document_id)
     diagnostics = [*structured, *semantic]
     best_structured = _best_non_rejected(structured)
     best_semantic = _best_non_rejected(semantic)
@@ -298,6 +360,7 @@ def select_sources(
         user_id=owner_id,
         collection_id=collection_id,
         explicit_document_id=document_id,
+        routed_document_id=routed_document_id,
         candidates=[
             {
                 "document_id": item.document_id,
@@ -344,7 +407,7 @@ def select_sources(
         )
 
     selected = valid[0]
-    if selected.source_type in {"excel", "csv"} and best_structured and selected.document_id == best_structured.document_id:
+    if selected.source_type in {"excel", "csv", "pdf"} and best_structured and selected.document_id == best_structured.document_id:
         return SelectionResult(path="structured", document_id=selected.document_id, reason="structured_schema_evidence", diagnostics=diagnostics)
     selected_sources = [
         source for source in retrieval_sources
@@ -354,7 +417,7 @@ def select_sources(
         path="retrieval",
         document_id=selected.document_id,
         sources=selected_sources,
-        reason="semantic_evidence",
+        reason="filename_routed_semantic_evidence" if routed_document_id is not None and document_id is None else "semantic_evidence",
         diagnostics=diagnostics,
     )
 
