@@ -99,21 +99,124 @@ def _detect_header(rows: list[tuple[int, list[object]]]) -> int:
         score = len(present) * 3 + text_count * 2 + distinct + min(following_width, len(present))
         if len(present) == 1 and len(rows) > index + 1:
             score -= 4
+        score -= index
         if score > best_score:
             best_index, best_score = index, score
     return best_index
 
 
-def _headers(values: list[object], width: int) -> list[str]:
+def _headers(header_rows: list[list[object]], width: int) -> list[str]:
+    """Build unique headers, preserving useful labels from stacked header rows."""
     output: list[str] = []
     used: dict[str, int] = {}
     for index in range(width):
-        raw = values[index] if index < len(values) else None
-        base = str(raw).strip() if _is_nonempty(raw) else f"Column {index + 1}"
+        parts: list[str] = []
+        for values in header_rows:
+            raw = values[index] if index < len(values) else None
+            if not _is_nonempty(raw):
+                continue
+            part = str(raw).strip()
+            if part.casefold() not in {value.casefold() for value in parts}:
+                parts.append(part)
+        if len(parts) > 1:
+            descriptive = [part for part in parts if len(part) > 1]
+            if descriptive:
+                parts = descriptive
+        base = " / ".join(parts) if parts else f"Column {index + 1}"
         count = used.get(base.casefold(), 0) + 1
         used[base.casefold()] = count
         output.append(base if count == 1 else f"{base} ({count})")
     return output
+
+
+def _header_layers(
+    rows: list[tuple[int, list[object]]],
+    header_index: int,
+) -> list[tuple[int, list[object]]]:
+    """Include one adjacent, substantial row when a sheet uses stacked headers."""
+    layers = [rows[header_index]]
+    if header_index == 0:
+        return layers
+    previous = rows[header_index - 1]
+    previous_present = sum(_is_nonempty(value) for value in previous[1])
+    current_present = sum(_is_nonempty(value) for value in rows[header_index][1])
+    if (
+        previous[0] + 1 == rows[header_index][0]
+        and previous_present >= 2
+        and current_present >= 2
+        and previous_present >= current_present * 0.5
+    ):
+        layers.insert(0, previous)
+    return layers
+
+
+def _normalize_attendance_pairs(
+    headers: list[str],
+    rows: list[WorkbookRow],
+) -> tuple[list[str], list[WorkbookRow]]:
+    """Split paired employee name/number cells across adjacent IN and OUT rows."""
+    entity_header = next(
+        (
+            header
+            for header in headers
+            if "employee" in header.casefold() and "name" in header.casefold()
+        ),
+        None,
+    )
+    if entity_header is None:
+        return headers, rows
+    marker_header = next(
+        (
+            header
+            for header in headers
+            if {"in", "out"} <= {
+                str(row.values.get(header) or "").strip().casefold()
+                for row in rows
+            }
+        ),
+        None,
+    )
+    if marker_header is None:
+        return headers, rows
+
+    normalized_rows = [
+        WorkbookRow(
+            row_number=row.row_number,
+            values={
+                "Employee Name": None,
+                "Employee Number": None,
+                **{
+                    header: value
+                    for header, value in row.values.items()
+                    if header != entity_header
+                },
+            },
+        )
+        for row in rows
+    ]
+    group_start: int | None = None
+    employee_name: object = None
+    employee_number: object = None
+    for index, row in enumerate(rows):
+        marker = str(row.values.get(marker_header) or "").strip().casefold()
+        if marker == "in":
+            group_start = index
+            employee_name = row.values.get(entity_header)
+            employee_number = None
+        elif marker == "out" and group_start is not None:
+            employee_number = row.values.get(entity_header)
+            for grouped_index in range(group_start, index):
+                normalized_rows[grouped_index].values["Employee Number"] = employee_number
+        if group_start is not None:
+            normalized_rows[index].values["Employee Name"] = employee_name
+            normalized_rows[index].values["Employee Number"] = employee_number
+
+    normalized_headers = [
+        "Employee Name",
+        "Employee Number",
+        *(header for header in headers if header != entity_header),
+    ]
+    return normalized_headers, normalized_rows
 
 
 def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> WorkbookSheet:
@@ -126,10 +229,14 @@ def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> 
         return WorkbookSheet(name=name, state=state, status="empty")
 
     header_index = _detect_header(nonempty)
-    header_number, header_values = nonempty[header_index]
+    header_layers = _header_layers(nonempty, header_index)
+    header_number = header_layers[0][0]
     data_rows = nonempty[header_index + 1 :]
-    width = max([len(header_values), *(len(values) for _, values in data_rows)])
-    headers = _headers(header_values, width)
+    width = max([
+        *(len(values) for _, values in header_layers),
+        *(len(values) for _, values in data_rows),
+    ])
+    headers = _headers([values for _, values in header_layers], width)
     structured = []
     for row_number, values in data_rows:
         row = {
@@ -138,6 +245,7 @@ def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> 
         }
         if any(_is_nonempty(value) for value in row.values()):
             structured.append(WorkbookRow(row_number=row_number, values=row))
+    headers, structured = _normalize_attendance_pairs(headers, structured)
     return WorkbookSheet(
         name=name,
         state=state,

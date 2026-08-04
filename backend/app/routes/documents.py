@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from app.auth import get_current_user
@@ -20,6 +23,31 @@ from app.services.vector_store import get_vector_store
 from app.utils.audit import log_audit_event
 
 router = APIRouter(prefix="/documents", tags=["documents"])
+
+
+_PREVIEW_MEDIA_TYPES = {
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+    ".tiff": "image/tiff",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    # HTML is intentionally served as source text, never as active content.
+    ".html": "text/plain; charset=utf-8",
+    ".htm": "text/plain; charset=utf-8",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",
+}
 
 
 class VisibilityUpdate(BaseModel):
@@ -112,6 +140,7 @@ def list_documents(
                    d.owner_id, d.collection_id, d.upload_batch_id, d.relative_path,
                    d.processing_status, d.current_version_id,
                    dc.name AS collection_name, dv.version_number,
+                   dv.file_size, dv.mime_type,
                    COALESCE(COUNT(c.id), 0) AS chunk_count
             FROM documents d
             LEFT JOIN document_collections dc ON dc.id = d.collection_id
@@ -145,6 +174,8 @@ def list_documents(
                 "status": row["processing_status"],
                 "current_version_id": row["current_version_id"],
                 "current_version_number": row["version_number"],
+                "file_size": row["file_size"],
+                "mime_type": row["mime_type"],
             }
             for row in rows
         ]
@@ -192,6 +223,55 @@ def get_document(
             "current_version": _version_dict(version) if version else None,
         }
     }
+
+
+@router.get("/{document_id}/content", response_class=FileResponse)
+def get_document_content(
+    document_id: int,
+    download: bool = False,
+    current_user: dict[str, object] = Depends(get_current_user),
+) -> FileResponse:
+    """Stream an authorized document's current file for preview or download."""
+    with get_connection() as connection:
+        document = require_document(connection, document_id, current_user)
+        version = connection.execute(
+            """SELECT storage_key, stored_filename
+               FROM document_versions
+               WHERE id = ? AND document_id = ? AND organization_id = ?
+                 AND deleted_at IS NULL""",
+            (
+                document["current_version_id"], document_id,
+                current_user["organization_id"],
+            ),
+        ).fetchone()
+
+    if version is None:
+        raise HTTPException(status_code=404, detail="Document content was not found.")
+
+    suffix = Path(str(document["display_filename"])).suffix.lower()
+    media_type = _PREVIEW_MEDIA_TYPES.get(suffix)
+    if media_type is None:
+        raise HTTPException(status_code=415, detail="This document type cannot be previewed.")
+
+    storage_key = str(version["storage_key"] or version["stored_filename"] or "")
+    try:
+        path = resolve_storage_key(storage_key)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail="Document content was not found.") from error
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Document content was not found.")
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=str(document["display_filename"]),
+        content_disposition_type="attachment" if download else "inline",
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        },
+    )
 
 
 @router.get("/{document_id}/versions")

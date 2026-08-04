@@ -35,7 +35,7 @@ class DocumentParserTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_registry_contains_every_required_extension(self):
-        required = {".txt", ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
+        required = {".txt", ".md", ".json", ".xml", ".html", ".htm", ".pdf", ".docx", ".xlsx", ".xls", ".csv", ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
         self.assertEqual(SUPPORTED_EXTENSIONS, required)
         self.assertIsInstance(PARSER_REGISTRY[".xlsx"], ExcelParser)
         self.assertIsInstance(PARSER_REGISTRY[".ppt"], PowerPointParser)
@@ -105,6 +105,18 @@ class DocumentParserTests(unittest.TestCase):
             [1, 2],
         )
         self.assertTrue(all(chunk.source_type == "pdf" for chunk in chunks))
+
+    def test_dense_pdf_pages_are_split_below_embedding_token_window(self):
+        path = self.root / "inspection.pdf"
+        path.write_bytes(b"%PDF-test")
+        dense_page = " ".join(f"word-{index}" for index in range(500))
+        pages = [SimpleNamespace(extract_text=lambda: dense_page)]
+        with patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=pages)):
+            chunks = extract_source_chunks(path)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk.text.split()) <= 180 for chunk in chunks))
+        self.assertTrue(all(chunk.location["page_start"] == 1 for chunk in chunks))
 
     def test_pptx_chunks_retain_slide_shape_and_table_row(self):
         from pptx import Presentation

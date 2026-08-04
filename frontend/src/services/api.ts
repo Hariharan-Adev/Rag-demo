@@ -53,6 +53,8 @@ export interface DocumentRecord {
   status?: string
   current_version_id?: number | null
   current_version_number?: number | null
+  file_size?: number | null
+  mime_type?: string | null
 }
 
 export interface CollectionRecord {
@@ -459,6 +461,19 @@ export async function listDocuments() {
     method: 'GET',
     headers: authHeaders(),
   })
+}
+
+export async function fetchDocumentContent(documentId: string, signal?: AbortSignal) {
+  const response = await fetch(`${API_BASE_URL}/documents/${documentId}/content`, {
+    method: 'GET',
+    headers: authHeaders(),
+    signal,
+  })
+  if (!response.ok) {
+    const error = await readError(response, 'Unable to load this document preview.')
+    throw new ApiError(error.message, response.status, error.code, error.retryable)
+  }
+  return response.blob()
 }
 
 export async function deleteDocument(documentId: string) {

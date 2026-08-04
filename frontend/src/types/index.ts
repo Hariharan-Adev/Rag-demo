@@ -11,8 +11,10 @@ export interface User {
 export interface PolicyDocument {
   id: string
   name: string
-  type: 'TXT' | 'PDF' | 'DOCX' | 'XLSX' | 'XLS' | 'CSV' | 'PPTX' | 'PPT' | 'PNG' | 'JPG' | 'JPEG' | 'BMP' | 'GIF' | 'TIFF' | 'WEBP'
+  type: 'TXT' | 'MD' | 'JSON' | 'XML' | 'HTML' | 'HTM' | 'PDF' | 'DOCX' | 'XLSX' | 'XLS' | 'CSV' | 'PPTX' | 'PPT' | 'PNG' | 'JPG' | 'JPEG' | 'BMP' | 'GIF' | 'TIFF' | 'WEBP'
   size: string
+  sizeBytes?: number | null
+  mimeType?: string | null
   chunks: number
   category: string
   updatedAt: string

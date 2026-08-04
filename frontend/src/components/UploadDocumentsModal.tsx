@@ -16,6 +16,7 @@ import {
 } from '../services/api'
 import { Button } from './ui/Button'
 import { Modal } from './ui/Modal'
+import DocumentPreviewModal from './DocumentPreviewModal'
 
 type FileStatus = 'pending' | 'uploading' | 'processing' | 'completed' | 'skipped' | 'failed' | 'cancelled'
 type Validation = 'Ready' | 'Unsupported' | 'Too large' | 'Empty' | 'Duplicate candidate'
@@ -35,7 +36,7 @@ interface UploadItem {
 }
 
 const defaultConfig: UploadConfig = {
-  supported_extensions: ['.txt', '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp'],
+  supported_extensions: ['.txt', '.md', '.json', '.xml', '.html', '.htm', '.pdf', '.docx', '.xlsx', '.xls', '.csv', '.pptx', '.ppt', '.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', '.webp'],
   archive_extensions: ['.zip'],
   max_file_size_mb: 25,
   max_zip_upload_mb: 50,
@@ -66,6 +67,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
   const [newCollectionName, setNewCollectionName] = useState('')
   const [uploading, setUploading] = useState(false)
   const [batchId, setBatchId] = useState<number | null>(null)
+  const [previewFile, setPreviewFile] = useState<File | null>(null)
   const cancelledRef = useRef(false)
   const controllersRef = useRef(new Map<string, AbortController>())
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -226,7 +228,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
   const readyItems = items.filter(item => item.status === 'pending' && (item.validation === 'Ready' || item.validation === 'Duplicate candidate'))
   const percent = items.length ? Math.round(summary.processed / items.length * 100) : 0
 
-  return (
+  return (<>
     <Modal open={open} onClose={close} title="Upload documents">
       <div className="grid grid-cols-2 gap-2 rounded-xl bg-slate-100 p-1">
         <button type="button" onClick={() => { setMode('files'); setItems([]) }} className={`rounded-lg px-3 py-2 text-xs font-semibold ${mode === 'files' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-500'}`}>Upload files</button>
@@ -262,7 +264,7 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
           <div className="mt-3 max-h-64 overflow-auto rounded-xl border border-slate-200">
             <table className="w-full min-w-[680px] text-left text-[10px]">
               <thead className="sticky top-0 bg-slate-50 text-slate-500"><tr><th className="p-2">File</th><th className="p-2">Relative path</th><th className="p-2">Type</th><th className="p-2">Size</th><th className="p-2">Validation</th><th className="p-2">Status</th></tr></thead>
-              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 truncate p-2 font-semibold">{item.file.name}</td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.result?.content_reused ? 'restored' : item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
+              <tbody>{items.map(item => <tr key={item.id} className="border-t border-slate-100"><td className="max-w-36 p-2 font-semibold"><button type="button" onClick={() => setPreviewFile(item.file)} className="block max-w-36 truncate text-left text-blue-700 hover:underline" title={`Preview ${item.file.name}`}>{item.file.name}</button></td><td className="max-w-52 truncate p-2 text-slate-500">{item.relativePath}</td><td className="p-2 uppercase">{extension(item.file).slice(1) || '-'}</td><td className="p-2">{formatSize(item.file.size)}</td><td className="p-2">{item.validation}</td><td className="p-2"><span className={item.status === 'completed' ? 'text-emerald-600' : item.status === 'failed' ? 'text-red-600' : 'text-slate-600'}>{item.result?.content_reused ? 'restored' : item.status}</span>{item.error && <span className="block max-w-44 truncate text-red-500" title={item.error}>{item.error}</span>}</td></tr>)}</tbody>
             </table>
           </div>
 
@@ -285,5 +287,6 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
         <Button onClick={() => void runUploads(readyItems)} disabled={!readyItems.length || uploading}>{uploading ? 'Processing...' : mode === 'folder' ? 'Upload folder' : 'Upload files'}</Button>
       </div>
     </Modal>
-  )
+    <DocumentPreviewModal file={previewFile} open={previewFile !== null} onClose={() => setPreviewFile(null)} />
+  </>)
 }

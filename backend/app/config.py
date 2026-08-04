@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     embedding_model_version: str = "all-MiniLM-L6-v2"
     rag_retrieval_limit: int = Field(default=15, ge=1, le=100)
     rag_final_context_limit: int = Field(default=5, ge=1, le=20)
+    rag_comprehensive_context_limit: int = Field(default=15, ge=1, le=50)
     rag_min_score: float = Field(default=0.35, ge=-1.0, le=1.0)
     rag_structured_result_limit: int = Field(default=100, ge=1, le=1000)
     opensearch_url: str = ""

@@ -218,7 +218,7 @@ def register_parser(extensions: tuple[str, ...], parser: DocumentParser) -> None
         PARSER_REGISTRY[extension.lower()] = parser
 
 
-register_parser((".txt",), TxtParser())
+register_parser((".txt", ".md", ".json", ".xml", ".html", ".htm"), TxtParser())
 register_parser((".pdf",), PdfParser())
 register_parser((".docx",), DocxParser())
 register_parser((".xlsx", ".xls"), ExcelParser())

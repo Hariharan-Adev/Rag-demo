@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack
+from datetime import time
 from io import BytesIO
 from pathlib import Path
 import tempfile
@@ -22,10 +23,13 @@ from app.services.rag_service import answer_question
 from app.services.vector_store import reset_vector_store_for_tests
 from app.services.workbook_analysis import (
     RowRecord,
+    WorkbookScope,
     analyze_workbook_question,
+    _answer_time_matrix,
     _column_score,
     _row_filters,
 )
+from app.services.workbooks import _make_sheet
 
 
 ORG = "00000000-0000-4000-8000-000000000001"
@@ -159,6 +163,38 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
 
         self.assertEqual(_row_filters(rows, "What is the total amount in July?"), {})
         self.assertEqual(_row_filters(rows, "Show state IN"), {"State": {"in"}})
+        self.assertEqual(_row_filters(rows, "Show the in time"), {"State": {"in"}})
+
+    def test_stacked_attendance_headers_and_in_rows_are_preserved(self) -> None:
+        sheet = _make_sheet(
+            "Attendance",
+            "visible",
+            [
+                (1, ["Attendance report", *([None] * 11)]),
+                (2, ["Employee Name & No", None, "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", "Mon", "Tue"]),
+                (3, ["A", None, "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th"]),
+                (4, ["Alice", "IN", *([time(9, 0)] * 10)]),
+                (5, [101, "OUT", *([time(18, 0)] * 10)]),
+                (6, [None, "Double OT", *([time(1, 0)] * 10)]),
+                (7, ["Bob", "IN", *([time(8, 55)] * 10)]),
+                (8, [102, "OUT", *([time(17, 45)] * 10)]),
+            ],
+        )
+
+        self.assertEqual(sheet.header_row, 2)
+        self.assertEqual(sheet.headers[:2], ["Employee Name", "Employee Number"])
+        self.assertEqual(sheet.headers[3], "Sun / 1st")
+        self.assertEqual(sheet.rows[1].values["Employee Name"], "Alice")
+        self.assertEqual(sheet.rows[1].values["Employee Number"], 101)
+        self.assertEqual(sheet.rows[2].values["Employee Name"], "Alice")
+        self.assertEqual(sheet.rows[2].values["Employee Number"], 101)
+        self.assertEqual(
+            _row_filters(
+                [RowRecord(sheet.name, row.row_number, row.values) for row in sheet.rows],
+                "Give me the in time of all employees",
+            ),
+            {"Column 2": {"in"}},
+        )
 
     def test_single_character_and_substring_headers_do_not_create_relevance(self) -> None:
         self.assertEqual(_column_score("A", "How many products rejected?"), 0)
@@ -420,6 +456,30 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertEqual(status.status, "completed")
         self.assertEqual(len(store.batches), 1)
         self.assertEqual(matches[0]["sheet_name"], "Final")
+
+    def test_time_matrix_pairs_in_out_rows_and_filters_working_duration(self) -> None:
+        scope = WorkbookScope(
+            document_id=7,
+            version_id=3,
+            filename="attendance.xlsx",
+            sheet_names=["April"],
+            schema={},
+            rows=[
+                RowRecord("April", 4, {"Employee Name": "Night Worker", "Employee Number": 99, "Type": "IN", "Mon / 1st": "22:00:00", "Tue / 2nd": "09:00:00"}),
+                RowRecord("April", 5, {"Employee Name": "Night Worker", "Employee Number": 99, "Type": "OUT", "Mon / 1st": "08:30:00", "Tue / 2nd": "18:30:00"}),
+                RowRecord("April", 6, {"Employee Name": "Night Worker", "Employee Number": 99, "Type": "Total W.hrs", "Mon / 1st": "10:30:00", "Tue / 2nd": "09:30:00"}),
+            ],
+        )
+        result = _answer_time_matrix(
+            scope,
+            "List all employees who worked more than 10 hours on any day, including employee name, date, IN time, OUT time and total working hours.",
+        )
+
+        self.assertIsNotNone(result)
+        answer = str(result["answer"])
+        self.assertIn("| Night Worker | Mon / 1st | 22:00:00 | 08:30:00 | 10:30:00 |", answer)
+        self.assertNotIn("Tue / 2nd", answer)
+        self.assertEqual(result["_context"]["numeric_filter"]["column"], "Total Working Hours")
 
 
 if __name__ == "__main__":

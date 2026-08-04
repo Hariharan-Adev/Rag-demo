@@ -156,10 +156,11 @@ def _pipeline_job_key(
     organization_id: str,
     version_id: int,
     job_type: str = "document_ingestion",
+    pipeline_version: str | None = None,
 ) -> str:
     return (
         f"{organization_id}:{version_id}:{job_type}:"
-        f"{settings.ingestion_pipeline_version}"
+        f"{pipeline_version or settings.ingestion_pipeline_version}"
     )
 
 
@@ -343,10 +344,19 @@ def enqueue_job(
     storage_key: str,
     idempotency_key: str,
     allow_active_content_reuse: bool = False,
+    pipeline_version: str | None = None,
+    force_reprocess: bool = False,
     connection: sqlite3.Connection | None = None,
 ) -> str:
     job_id = str(uuid4())
-    pipeline_key = _pipeline_job_key(organization_id, version_id)
+    effective_pipeline_version = (
+        pipeline_version or settings.ingestion_pipeline_version
+    )
+    pipeline_key = _pipeline_job_key(
+        organization_id,
+        version_id,
+        pipeline_version=effective_pipeline_version,
+    )
     def insert(target: sqlite3.Connection) -> str:
         existing = target.execute(
             """SELECT id FROM ingestion_jobs
@@ -365,12 +375,13 @@ def enqueue_job(
                ON CONFLICT DO NOTHING""",
             (
                 job_id, organization_id, owner_id, document_id, version_id,
-                pipeline_key, idempotency_key, settings.ingestion_pipeline_version,
+                pipeline_key, idempotency_key, effective_pipeline_version,
                 json.dumps({
                     "storage_key": storage_key,
-                    "pipeline_version": settings.ingestion_pipeline_version,
+                    "pipeline_version": effective_pipeline_version,
                     "embedding_model": settings.embedding_model_version,
                     "allow_active_content_reuse": allow_active_content_reuse,
+                    "force_reprocess": force_reprocess,
                 }),
                 settings.ingestion_max_attempts,
             ),
@@ -832,8 +843,12 @@ def process_job(job_id: str) -> None:
     if job["job_type"] == "archive_ingestion":
         _process_archive_job(job)
         return
+    initial_payload = json.loads(job["payload_json"])
     try:
-        if _resume_existing_chunks(job):
+        if (
+            not bool(initial_payload.get("force_reprocess", False))
+            and _resume_existing_chunks(job)
+        ):
             log_event(
                 "ingestion.job.resumed",
                 job_id=job_id,
@@ -859,7 +874,7 @@ def process_job(job_id: str) -> None:
         return
     failure_stage = "stored_upload_validation"
     try:
-        payload = json.loads(job["payload_json"])
+        payload = initial_payload
         allow_active_content_reuse = bool(
             payload.get("allow_active_content_reuse", False)
         ) or job["current_version_id"] is not None

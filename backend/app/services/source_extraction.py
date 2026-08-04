@@ -71,7 +71,14 @@ def _pdf(path: Path) -> list[SourceChunk]:
         for page_number, page in enumerate(pages, start=1):
             text = page.extract_text() or ""
             if text.strip():
-                for block_index, value in enumerate(chunk_text(text), start=1):
+                # all-MiniLM-L6-v2 truncates long inputs. Keep PDF chunks below
+                # that practical token window so headings, rows, and totals all
+                # contribute to their embeddings instead of only the first part
+                # of a dense page being searchable.
+                for block_index, value in enumerate(
+                    chunk_text(text, chunk_size=180, overlap=30),
+                    start=1,
+                ):
                     result.append(SourceChunk(value, "pdf", {
                         "page_start": page_number,
                         "page_end": page_number,

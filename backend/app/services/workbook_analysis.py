@@ -85,7 +85,8 @@ def is_structured_lookup_question(
     """Return whether accessible structured rows can answer the question."""
     scopes = _load_scopes(owner_id, collection_id, document_id)
     return any(
-        _plan_for_scope(scope, question, explicit_scope=document_id is not None).intent != "unavailable"
+        _is_time_matrix_question(scope, question)
+        or _plan_for_scope(scope, question, explicit_scope=document_id is not None).intent != "unavailable"
         for scope in scopes
     )
 
@@ -130,6 +131,14 @@ def analyze_workbook_question(
 ) -> dict[str, object]:
     """Plan and answer from all relevant structured rows, not vector excerpts."""
     scopes = _load_scopes(owner_id, collection_id, document_id)
+    time_matrix_answers = [
+        (_source_evidence(scope, question)[0], answer)
+        for scope in scopes
+        if (answer := _answer_time_matrix(scope, question)) is not None
+    ]
+    if time_matrix_answers:
+        time_matrix_answers.sort(key=lambda item: -item[0])
+        return time_matrix_answers[0][1]
     ranked = _rank_scopes(scopes, question, explicit_scope=document_id is not None)
     if not ranked or ranked[0][0] < 2:
         return _unavailable("no_relevant_structured_source")
@@ -320,6 +329,183 @@ def _numeric_matches(value: object, condition: tuple[str, Decimal, Decimal | Non
     return False
 
 
+_WEEKDAY_PATTERN = re.compile(
+    r"\b(?:mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)\b"
+)
+
+
+def _time_minutes(value: object) -> Decimal | None:
+    """Parse a clock/duration cell without treating it as an ordinary number."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"\s*(\d{1,3}):([0-5]\d)(?::([0-5]\d))?\s*", str(value))
+    if not match:
+        return None
+    hours, minutes, seconds = (Decimal(part or "0") for part in match.groups())
+    return hours * 60 + minutes + seconds / Decimal(60)
+
+
+def _time_role(value: object) -> str | None:
+    marker = _normalized(value)
+    if marker == "in":
+        return "in"
+    if marker == "out":
+        return "out"
+    tokens = set(marker.split())
+    if "total" in tokens and ({"hour", "hours", "hr", "hrs"} & tokens):
+        return "total"
+    return None
+
+
+def _time_matrix_columns(scope: WorkbookScope) -> tuple[str, str, str | None, list[str]] | None:
+    """Discover entity, marker, identifier, and date columns from cell semantics."""
+    columns = _column_values(scope.rows)
+    marker_candidates: list[tuple[int, str]] = []
+    for header, values in columns.items():
+        roles = {_time_role(value) for value in values} - {None}
+        if {"in", "out"} <= roles:
+            marker_candidates.append((len(roles), header))
+    if not marker_candidates:
+        return None
+    marker_candidates.sort(key=lambda item: (-item[0], item[1].casefold()))
+    marker_column = marker_candidates[0][1]
+    name_column = max(
+        (header for header in columns if header != marker_column),
+        key=lambda header: (_column_score(header, "employee name"), -len(header)),
+        default="",
+    )
+    if _column_score(name_column, "employee name") <= 0:
+        return None
+    number_column = max(
+        (header for header in columns if header not in {marker_column, name_column}),
+        key=lambda header: _column_score(header, "employee number id"),
+        default="",
+    ) or None
+    if number_column and _column_score(number_column, "employee number id") <= 0:
+        number_column = None
+    date_columns = [
+        header for header in columns
+        if header not in {marker_column, name_column, number_column}
+        and (
+            _WEEKDAY_PATTERN.search(header.casefold())
+            or re.search(r"\b\d{1,2}(?:st|nd|rd|th)\b", header.casefold())
+        )
+        and any(_time_minutes(value) is not None for value in columns[header])
+    ]
+    if not date_columns:
+        return None
+    return name_column, marker_column, number_column, date_columns
+
+
+def _is_time_matrix_question(scope: WorkbookScope, question: str) -> bool:
+    normalized = _normalized(question)
+    asks_duration = bool(
+        re.search(r"\b(worked|working|work)\b", normalized)
+        and re.search(r"\b(hour|hours|hrs|duration)\b", normalized)
+    )
+    return asks_duration and _numeric_condition(question) is not None and _time_matrix_columns(scope) is not None
+
+
+def _duration_matches(minutes: Decimal, condition: tuple[str, Decimal, Decimal | None]) -> bool:
+    operator, left, right = condition
+    return _numeric_matches(
+        minutes,
+        (operator, left * Decimal(60), right * Decimal(60) if right is not None else None),
+    )
+
+
+def _format_duration(minutes: Decimal) -> str:
+    total_seconds = int(minutes * Decimal(60))
+    hours, remainder = divmod(total_seconds, 3600)
+    minute, second = divmod(remainder, 60)
+    return f"{hours:02d}:{minute:02d}:{second:02d}"
+
+
+def _answer_time_matrix(scope: WorkbookScope, question: str) -> dict[str, object] | None:
+    """Answer duration comparisons from wide IN/OUT attendance-style matrices."""
+    if not _is_time_matrix_question(scope, question):
+        return None
+    discovered = _time_matrix_columns(scope)
+    condition = _numeric_condition(question)
+    if discovered is None or condition is None:
+        return None
+    name_column, marker_column, number_column, date_columns = discovered
+    grouped: dict[tuple[str, str], dict[str, RowRecord]] = defaultdict(dict)
+    for row in scope.rows:
+        role = _time_role(row.values.get(marker_column))
+        name = str(row.values.get(name_column) or "").strip()
+        if not role or not name:
+            continue
+        grouped[(row.sheet, name)][role] = row
+
+    matches: list[tuple[str, str, object, object, Decimal, list[RowRecord]]] = []
+    for (_, name), role_rows in grouped.items():
+        in_row = role_rows.get("in")
+        out_row = role_rows.get("out")
+        total_row = role_rows.get("total")
+        if not in_row or not out_row:
+            continue
+        for date_column in date_columns:
+            in_value = in_row.values.get(date_column)
+            out_value = out_row.values.get(date_column)
+            in_minutes = _time_minutes(in_value)
+            out_minutes = _time_minutes(out_value)
+            if in_minutes is None or out_minutes is None:
+                continue
+            calculated_minutes = out_minutes - in_minutes
+            if calculated_minutes < 0:
+                calculated_minutes += Decimal(24 * 60)
+            provided_minutes = _time_minutes(total_row.values.get(date_column)) if total_row else None
+            # Use the workbook total when it agrees with the IN/OUT pair. A visibly
+            # stale or broken formula must not override the auditable calculation.
+            total_minutes = (
+                provided_minutes
+                if provided_minutes is not None and abs(provided_minutes - calculated_minutes) <= Decimal(1)
+                else calculated_minutes
+            )
+            if _duration_matches(total_minutes, condition):
+                contributing = [in_row, out_row, *([total_row] if total_row else [])]
+                matches.append((name, date_column, in_value, out_value, total_minutes, contributing))
+
+    if not matches:
+        return {
+            "answer": "No employees matched the requested working-hours condition.",
+            "question_type": "structured_analysis",
+            "calculation_basis": "All readable IN/OUT pairs were evaluated by employee and date.",
+            "sources": [],
+            "grounded": True,
+            "_context": {"kind": "structured_rows", "result_type": "records", "document_ids": [scope.document_id], "version_ids": [scope.version_id], "row_refs": []},
+        }
+
+    lines = [
+        "| Employee Name | Date | IN Time | OUT Time | Total Working Hours |",
+        "|---|---|---|---|---|",
+    ]
+    contributing_rows: list[RowRecord] = []
+    for name, date, in_value, out_value, duration, records in matches:
+        lines.append(
+            "| " + " | ".join((_display(name), _display(date), _display(in_value), _display(out_value), _format_duration(duration))) + " |"
+        )
+        contributing_rows.extend(records)
+    unique_rows = list({(row.sheet, row.row_number): row for row in contributing_rows}.values())
+    return {
+        "answer": f"Matching records ({len(matches)}):\n\n" + "\n".join(lines),
+        "question_type": "structured_analysis",
+        "calculation_basis": f"{len(matches)} employee-date pair(s) matched after evaluating IN, OUT, and total working hours.",
+        "sources": _sources(scope, unique_rows),
+        "grounded": True,
+        "_context": {
+            "kind": "structured_rows",
+            "result_type": "records",
+            "filters": {},
+            "numeric_filter": {"column": "Total Working Hours", "operator": condition[0], "left": str(condition[1]), "right": str(condition[2]) if condition[2] is not None else None},
+            "document_ids": [scope.document_id],
+            "version_ids": [scope.version_id],
+            "row_refs": [{"document_id": scope.document_id, "sheet": row.sheet, "row_number": row.row_number} for row in unique_rows],
+        },
+    }
+
+
 def _canonical(value: object) -> str:
     normalized = _normalized(value)
     return MONTH_ALIASES.get(normalized, normalized)
@@ -357,7 +543,15 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
             normalized_value = _normalized(value)
             if not normalized_value:
                 continue
-            if normalized_value in STOP_WORDS and not header_requested:
+            time_marker_requested = (
+                normalized_value in {"in", "out"}
+                and bool(re.search(rf"\b{normalized_value}\s+times?\b", _normalized(question)))
+            )
+            if (
+                normalized_value in STOP_WORDS
+                and not header_requested
+                and not time_marker_requested
+            ):
                 continue
             if _number(value) is not None:
                 continue
@@ -532,6 +726,8 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
             return Plan("unavailable", rejection_reason="weak_count_source_evidence")
         return Plan("count", entity_column=entity_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if numeric_filter:
+        return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
+    if filters and re.search(r"\ball\b", _normalized(question)):
         return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     list_column = _choose_column(scope, question, preferred_types={"text", "category", "identifier"})
     if list_column:

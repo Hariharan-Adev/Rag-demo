@@ -228,9 +228,11 @@ def select_sources(
     document_id: int | None = None,
     version_id: int | None = None,
     structured_requested: bool = False,
+    context_limit: int | None = None,
     searcher=search_chunks,
 ) -> SelectionResult:
     """Compare eligible structured and unstructured evidence before answering."""
+    final_context_limit = context_limit or settings.rag_final_context_limit
     if document_id is not None and not _active_accessible_document(owner_id, document_id, version_id):
         return SelectionResult(path="unavailable", reason="acl_excluded")
     if document_id is not None and version_id is None and structured_requested:
@@ -265,7 +267,7 @@ def select_sources(
     retrieval_sources = searcher(
         question,
         owner_id=owner_id,
-        limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
+        limit=max(settings.rag_retrieval_limit, final_context_limit),
         collection_id=collection_id,
         document_id=document_id,
         version_id=version_id,
@@ -276,7 +278,7 @@ def select_sources(
         fallback_sources = searcher(
             question,
             owner_id=owner_id,
-            limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
+            limit=max(settings.rag_retrieval_limit, final_context_limit),
             collection_id=collection_id,
             document_id=document_id,
             version_id=version_id,
@@ -328,7 +330,7 @@ def select_sources(
             selected_sources = [
                 source for source in retrieval_sources
                 if int(source["document_id"]) == best_semantic.document_id
-            ][:settings.rag_final_context_limit]
+            ][:final_context_limit]
             return SelectionResult(
                 path="retrieval",
                 document_id=best_semantic.document_id,
@@ -349,7 +351,7 @@ def select_sources(
     selected_sources = [
         source for source in retrieval_sources
         if int(source["document_id"]) == selected.document_id
-    ][:settings.rag_final_context_limit]
+    ][:final_context_limit]
     return SelectionResult(
         path="retrieval",
         document_id=selected.document_id,

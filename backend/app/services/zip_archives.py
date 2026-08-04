@@ -16,7 +16,8 @@ from app.utils.document_content import sanitize_filename
 
 ARCHIVE_TEMP_ROOT = Path(tempfile.gettempdir()) / "docsense-rag-archives"
 ZIP_DOCUMENT_EXTENSIONS = {
-    ".pdf", ".docx", ".txt", ".csv", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".pdf", ".docx", ".txt", ".md", ".json", ".xml", ".html", ".htm",
+    ".csv", ".xls", ".xlsx", ".ppt", ".pptx",
     ".png", ".jpg", ".jpeg", ".webp",
 }
 NESTED_ARCHIVE_EXTENSIONS = {".zip", ".rar", ".7z", ".tar", ".gz"}

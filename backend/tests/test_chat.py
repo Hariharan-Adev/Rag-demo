@@ -5,11 +5,29 @@ from unittest.mock import patch
 
 from app.config import settings
 from app.prompts.rag_prompt import RAG_SYSTEM_PROMPT, UNAVAILABLE_ANSWER
-from app.services.rag_service import answer_question
+from app.services.rag_service import (
+    _context_limit_for_question,
+    _output_contract,
+    answer_question,
+)
 from app.services.source_selection import SelectionResult
 
 
 class RagPromptFormattingTests(unittest.TestCase):
+    def test_explicit_output_contracts_are_detected(self) -> None:
+        contract = _output_contract("List all records as a JSON answer only")
+
+        self.assertIn("every supported matching item", contract)
+        self.assertIn("valid JSON only", contract)
+        self.assertIn("without preamble", contract)
+        self.assertEqual(
+            _context_limit_for_question("Show every matching record"),
+            max(
+                settings.rag_final_context_limit,
+                settings.rag_comprehensive_context_limit,
+            ),
+        )
+
     def test_comparison_phrases_are_covered(self) -> None:
         for phrase in (
             "compare",
@@ -52,6 +70,96 @@ class RagPromptFormattingTests(unittest.TestCase):
 
 
 class RagRetrievalPolicyTests(unittest.TestCase):
+    def test_comprehensive_request_uses_expanded_context_and_contract(self) -> None:
+        candidates = [
+            {
+                "document_id": 12,
+                "version_id": 34,
+                "filename": "milestones.txt",
+                "content": f"Project milestone {index}",
+                "source_type": "text",
+                "source_location": {"paragraph": index},
+                "score": 0.9,
+            }
+            for index in range(1, 11)
+        ]
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            return_value=candidates,
+        ) as search, patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "| Milestone |\n|---|\n| 1 |",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ) as generate, patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question("List all project milestones as a table", 7)
+
+        self.assertEqual(
+            search.call_args.kwargs["limit"],
+            max(settings.rag_retrieval_limit, settings.rag_comprehensive_context_limit),
+        )
+        self.assertEqual(len(result["sources"]), 10)
+        prompt = generate.call_args.args[0]
+        self.assertIn("every supported matching item", prompt)
+        self.assertIn("GitHub-Flavored Markdown table", prompt)
+
+    def test_unscoped_pdf_analytics_are_not_stolen_by_an_unrelated_workbook(self) -> None:
+        pdf_candidate = {
+            "document_id": 54,
+            "version_id": 35,
+            "filename": "FINAL INSPECTION REJECTION.pdf",
+            "content": "CUSTOMER Rejection % LUCAS-TVS 50.6%",
+            "source_type": "pdf",
+            "source_location": {"page_start": 1, "page_end": 1},
+            "score": 0.95,
+        }
+        with patch(
+            "app.services.rag_service.has_structured_workbook",
+            side_effect=lambda _user, _collection=None, document_id=None: (
+                document_id is None
+            ),
+        ), patch(
+            "app.services.rag_service.is_structured_lookup_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            return_value=[pdf_candidate],
+        ), patch(
+            "app.services.rag_service.analyze_workbook_question",
+            side_effect=AssertionError("unrelated workbook must not handle the question"),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "LUCAS-TVS has the highest rejection percentage at 50.6%.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ), patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question(
+                "Which customer has the highest rejection percentage?",
+                7,
+            )
+
+        self.assertEqual(result["sources"][0]["filename"], pdf_candidate["filename"])
+        self.assertIn("LUCAS-TVS", result["answer"])
+
     def test_structured_lookup_uses_selected_source_without_llm(self) -> None:
         structured = {
             "answer": "| Revenue |\n|---:|\n| 108,000 |",

@@ -186,8 +186,8 @@
   .markdown-content pre code { @apply font-mono text-[12px] leading-5; }
   .markdown-content blockquote { @apply my-3 border-l-2 border-slate-300 pl-4 text-slate-600; }
   .markdown-content .markdown-table-wrapper { @apply my-4 w-full max-w-full overflow-x-auto; }
-  .markdown-content table { @apply w-full min-w-[640px] border-collapse text-left text-[13px]; }
-  .markdown-content th, .markdown-content td { @apply border border-slate-200 px-3.5 py-3 align-top; }
+  .markdown-content table { @apply min-w-full border-collapse text-left text-[13px]; width: max-content; }
+  .markdown-content th, .markdown-content td { @apply whitespace-nowrap border border-slate-200 px-3.5 py-3 align-top; overflow-wrap: normal; word-break: normal; }
   .markdown-content th { @apply bg-slate-50 font-semibold text-slate-900; }
   .markdown-content tbody tr:nth-child(even) td { @apply bg-slate-50/60; }
   .user-message-actions {
@@ -204,6 +204,24 @@
     pointer-events: auto;
     transform: translateY(0);
   }
+  .preview-toolbar { @apply flex h-11 shrink-0 items-center gap-1.5 overflow-x-auto border-b border-slate-200 bg-white px-3 text-[11px] text-slate-500; }
+  .preview-toolbar button { @apply flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg px-2 font-semibold text-slate-600 hover:bg-blue-50 hover:text-blue-600 disabled:cursor-not-allowed disabled:opacity-35; }
+  .preview-toolbar__divider { @apply mx-1 h-5 w-px shrink-0 bg-slate-200; }
+  .preview-sheet-table { @apply min-w-full border-separate border-spacing-0 bg-white text-left text-[11px] text-slate-700; width: max-content; }
+  .preview-sheet-table th, .preview-sheet-table td { @apply min-w-28 max-w-72 whitespace-pre-wrap border-b border-r border-slate-200 px-3 py-2 align-top; overflow-wrap: anywhere; }
+  .preview-sheet-table thead th { @apply sticky top-0 z-20 min-w-28 bg-slate-100 text-center font-bold text-slate-500; }
+  .preview-sheet-table__row-number { @apply sticky left-0 z-10 min-w-12 w-12 bg-slate-100 text-center font-bold text-slate-400; }
+  .preview-sheet-table thead .preview-sheet-table__row-number { @apply z-30; }
+  .preview-document-page { @apply mx-auto min-h-full max-w-[850px] bg-white px-7 py-8 text-sm leading-7 text-slate-800 shadow-lg sm:px-14 sm:py-12; }
+  .preview-document-page h1 { @apply mb-4 mt-7 text-2xl font-bold first:mt-0; }
+  .preview-document-page h2 { @apply mb-3 mt-6 text-xl font-bold; }
+  .preview-document-page h3 { @apply mb-2 mt-5 text-lg font-semibold; }
+  .preview-document-page p { @apply my-3; }
+  .preview-document-page ul { @apply my-3 list-disc pl-6; }
+  .preview-document-page ol { @apply my-3 list-decimal pl-6; }
+  .preview-document-page table { @apply my-5 w-full border-collapse; }
+  .preview-document-page th, .preview-document-page td { @apply border border-slate-300 px-3 py-2 text-left align-top; }
+  .preview-document-page th { @apply bg-slate-100 font-bold; }
 }
 
 ::-webkit-scrollbar { width: 5px; height: 5px; }

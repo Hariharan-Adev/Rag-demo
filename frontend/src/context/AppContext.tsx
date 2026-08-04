@@ -134,7 +134,7 @@ function initialsFromEmail(email: string) {
 
 function documentType(filename: string): PolicyDocument['type'] {
   const extension = filename.split('.').pop()?.toUpperCase()
-  const supported: PolicyDocument['type'][] = ['TXT', 'PDF', 'DOCX', 'XLSX', 'XLS', 'CSV', 'PPTX', 'PPT', 'PNG', 'JPG', 'JPEG', 'BMP', 'GIF', 'TIFF', 'WEBP']
+  const supported: PolicyDocument['type'][] = ['TXT', 'MD', 'JSON', 'XML', 'HTML', 'HTM', 'PDF', 'DOCX', 'XLSX', 'XLS', 'CSV', 'PPTX', 'PPT', 'PNG', 'JPG', 'JPEG', 'BMP', 'GIF', 'TIFF', 'WEBP']
   return supported.includes(extension as PolicyDocument['type']) ? extension as PolicyDocument['type'] : 'TXT'
 }
 
@@ -148,7 +148,9 @@ function mapDocument(row: DocumentRecord): PolicyDocument {
     id: String(row.id),
     name: row.filename,
     type: documentType(row.filename),
-    size: `${row.chunk_count} chunk${row.chunk_count === 1 ? '' : 's'}`,
+    size: row.file_size == null ? `${row.chunk_count} chunk${row.chunk_count === 1 ? '' : 's'}` : formatFileSize(row.file_size),
+    sizeBytes: row.file_size,
+    mimeType: row.mime_type,
     chunks: row.chunk_count,
     category: 'Uploaded Documents',
     updatedAt: formatDate(row.created_at),
@@ -161,6 +163,12 @@ function mapDocument(row: DocumentRecord): PolicyDocument {
     currentVersionId: row.current_version_id,
     currentVersionNumber: row.current_version_number,
   }
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
 
 function sourceScore(source: ChatSource) {

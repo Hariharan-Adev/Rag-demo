@@ -1,11 +1,102 @@
 """Retrieve authorized current-version chunks through the vector-store provider."""
 
 import json
+import re
 
 from app.database import get_connection
 from app.services.document_access import READABLE_DOCUMENT_SQL
 from app.services.embeddings import create_embeddings
 from app.services.vector_store import get_vector_store
+
+
+_LEXICAL_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for",
+    "from", "has", "have", "how", "i", "in", "is", "it", "me", "of", "on",
+    "or", "overall", "show", "tell", "that", "the", "this", "to", "was",
+    "what", "which", "who", "with",
+}
+
+
+def _search_terms(value: str) -> list[str]:
+    """Return bounded, meaningful terms for deterministic hybrid retrieval."""
+    normalized = value.casefold().replace("%", " percentage ")
+    terms: list[str] = []
+    for term in re.findall(r"[a-z0-9]+", normalized):
+        if len(term) < 2 or term in _LEXICAL_STOP_WORDS or term in terms:
+            continue
+        terms.append(term)
+    # Bound both SQL size and adversarial query cost while favoring specific terms.
+    return sorted(terms, key=lambda term: (-len(term), term))[:12]
+
+
+def _lexical_candidates(
+    *,
+    query: str,
+    organization_id: str,
+    allowed_documents: set[int],
+    searchable_versions: list[int],
+    limit: int,
+) -> list[dict[str, object]]:
+    """Find exact-term candidates when semantic similarity is too conservative."""
+    terms = _search_terms(query)
+    if not terms:
+        return []
+    document_placeholders = ",".join("?" for _ in allowed_documents)
+    version_placeholders = ",".join("?" for _ in searchable_versions)
+    lexical_conditions: list[str] = []
+    lexical_parameters: list[object] = []
+    for term in terms:
+        lexical_conditions.append(
+            "(lower(c.text) LIKE ? OR lower(d.display_filename) LIKE ?)"
+        )
+        lexical_parameters.extend((f"%{term}%", f"%{term}%"))
+        if term == "percentage":
+            lexical_conditions.append(r"(c.text LIKE ? ESCAPE '\')")
+            lexical_parameters.append(r"%\%%")
+    candidate_limit = max(100, limit * 20)
+    with get_connection() as connection:
+        rows = connection.execute(
+            f"""SELECT c.id, c.text, d.display_filename
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id
+                WHERE c.organization_id = ?
+                  AND c.document_id IN ({document_placeholders})
+                  AND c.version_id IN ({version_placeholders})
+                  AND c.deleted_at IS NULL AND d.deleted_at IS NULL
+                  AND ({" OR ".join(lexical_conditions)})
+                LIMIT ?""",
+            (
+                organization_id,
+                *sorted(allowed_documents),
+                *searchable_versions,
+                *lexical_parameters,
+                candidate_limit,
+            ),
+        ).fetchall()
+
+    candidates: list[dict[str, object]] = []
+    minimum_matches = 1 if len(terms) == 1 else 2
+    for row in rows:
+        searchable = (
+            f"{row['display_filename']} {row['text']}"
+            .casefold()
+            .replace("%", " percentage ")
+        )
+        searchable_terms = set(re.findall(r"[a-z0-9]+", searchable))
+        matched = sum(term in searchable_terms for term in terms)
+        if matched < minimum_matches:
+            continue
+        coverage = matched / len(terms)
+        if coverage < 0.5:
+            continue
+        candidates.append({
+            "chunk_id": int(row["id"]),
+            # Keep this comparable to cosine similarity while making a strong
+            # exact-term match eligible above the normal retrieval threshold.
+            "score": min(0.99, 0.45 + (0.5 * coverage)),
+        })
+    candidates.sort(key=lambda item: (-float(item["score"]), int(item["chunk_id"])))
+    return candidates[:limit]
 
 
 def search_chunks(
@@ -80,10 +171,27 @@ def search_chunks(
         limit=limit,
         score_threshold=min_score,
     )
-    ranked = [
+    semantic_ranked = [
         result for result in results
         if min_score is None or float(result["score"]) >= min_score
     ]
+    lexical_ranked = _lexical_candidates(
+        query=query,
+        organization_id=organization_id,
+        allowed_documents=allowed_documents,
+        searchable_versions=searchable_versions,
+        limit=limit,
+    )
+    merged: dict[int, dict[str, object]] = {}
+    for result in [*semantic_ranked, *lexical_ranked]:
+        chunk_id = int(result["chunk_id"])
+        existing = merged.get(chunk_id)
+        if existing is None or float(result["score"]) > float(existing["score"]):
+            merged[chunk_id] = result
+    ranked = sorted(
+        merged.values(),
+        key=lambda result: (-float(result["score"]), int(result["chunk_id"])),
+    )[:limit]
     chunk_ids = [int(result["chunk_id"]) for result in ranked]
     if not chunk_ids:
         return []

@@ -206,7 +206,16 @@ tenant-safe spreadsheet reindex command. Review candidates first:
 Then process active CSV, XLSX, and XLS current versions in bounded batches:
 
 ```powershell
-.\venv\Scripts\python.exe -m scripts.reindex_spreadsheets --batch-size 100
+  .\venv\Scripts\python.exe -m scripts.reindex_spreadsheets --batch-size 100
+  ```
+
+Dense PDFs indexed before the `pdf-180-v1` chunking correction can be
+durably queued once and processed by the normal ingestion worker:
+
+```powershell
+.\.venv312\Scripts\python.exe -m scripts.reindex_pdfs --dry-run
+.\.venv312\Scripts\python.exe -m scripts.reindex_pdfs --batch-size 100
+.\.venv312\Scripts\python.exe -m app.worker --once
 ```
 
 Use `--document-id`, `--owner-id`, or `--organization-id` to narrow a rollout,
