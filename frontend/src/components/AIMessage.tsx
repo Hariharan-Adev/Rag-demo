@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { useState } from 'react'
 import { useApp } from '../context/AppContext'
 import type { ChatItem } from '../types'
+import { formatStructuredAnswer } from '../utils/answerFormatting'
 import MarkdownContent from './MarkdownContent'
 import { Tooltip } from './ui/Tooltip'
 
@@ -10,9 +11,10 @@ export default function AIMessage({ message }: { message: ChatItem }) {
   const { showToast, updateMessage, regenerate, documents, setSelectedDocument } = useApp()
   const [copied, setCopied] = useState(false)
   const [feedback, setFeedback] = useState(false)
+  const displayContent = formatStructuredAnswer(message.content)
 
   const copy = async () => {
-    await navigator.clipboard?.writeText(`${message.content} ${message.detail ?? ''}`)
+    await navigator.clipboard?.writeText(`${displayContent} ${message.detail ?? ''}`)
     setCopied(true)
     showToast('Copied successfully')
     window.setTimeout(() => setCopied(false), 1500)
@@ -22,8 +24,8 @@ export default function AIMessage({ message }: { message: ChatItem }) {
   const bookmark = () => { updateMessage(message.id, { bookmarked: !message.bookmarked }); showToast(message.bookmarked ? 'Bookmark removed' : 'Response bookmarked') }
   const share = async () => {
     if (navigator.share) {
-      try { await navigator.share({ title: 'Docsense AI answer', text: `${message.content}\n${message.detail ?? ''}` }) } catch { return }
-    } else await navigator.clipboard?.writeText(message.content)
+      try { await navigator.share({ title: 'Docsense AI answer', text: `${displayContent}\n${message.detail ?? ''}` }) } catch { return }
+    } else await navigator.clipboard?.writeText(displayContent)
     showToast('Share text copied')
   }
   const openSource = () => {
@@ -44,7 +46,7 @@ export default function AIMessage({ message }: { message: ChatItem }) {
     <motion.article initial={{ opacity: 0, y: 7 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: .2 }} className="flex min-w-0 gap-3">
       <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-gradient-to-br from-blue-600 to-indigo-500 text-white shadow-[0_5px_14px_rgba(37,99,235,.2)]"><Sparkles size={14} /></span>
       <div className="min-w-0 flex-1 rounded-2xl border border-[#eef2f7] bg-white p-4 shadow-[0_8px_30px_rgba(37,99,235,.06)] sm:p-5">
-        <MarkdownContent content={message.content} />
+        <MarkdownContent content={displayContent} />
         {message.detail && <div className="mt-3 text-slate-600"><MarkdownContent content={message.detail} /></div>}
         {message.source && (
           <button type="button" onClick={openSource} className="mt-4 flex max-w-md items-center gap-2.5 rounded-xl border border-[#e6ecf5] bg-[#f8fbff] px-3 py-2.5 text-left hover:border-blue-200 hover:bg-[#eef4ff]">

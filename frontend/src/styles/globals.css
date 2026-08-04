@@ -185,9 +185,9 @@
   .markdown-content pre { @apply my-4 max-w-full overflow-x-auto rounded-xl bg-slate-900 p-4 text-slate-100; }
   .markdown-content pre code { @apply font-mono text-[12px] leading-5; }
   .markdown-content blockquote { @apply my-3 border-l-2 border-slate-300 pl-4 text-slate-600; }
-  .markdown-content .markdown-table-wrapper { @apply my-4 w-full max-w-full overflow-x-auto; }
-  .markdown-content table { @apply w-full min-w-[640px] border-collapse text-left text-[13px]; }
-  .markdown-content th, .markdown-content td { @apply border border-slate-200 px-3.5 py-3 align-top; }
+  .markdown-content .markdown-table-wrapper { @apply my-4 w-full max-w-full overflow-x-auto rounded-lg border border-slate-200; }
+  .markdown-content table { @apply w-full min-w-[640px] table-fixed border-collapse text-left text-[13px]; }
+  .markdown-content th, .markdown-content td { @apply border border-slate-200 px-3.5 py-3 align-top; white-space: normal; overflow-wrap: anywhere; word-break: normal; }
   .markdown-content th { @apply bg-slate-50 font-semibold text-slate-900; }
   .markdown-content tbody tr:nth-child(even) td { @apply bg-slate-50/60; }
   .user-message-actions {

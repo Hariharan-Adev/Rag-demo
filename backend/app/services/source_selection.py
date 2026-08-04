@@ -272,6 +272,15 @@ def _best_non_rejected(decisions: list[CandidateDecision]) -> CandidateDecision 
     return None
 
 
+def _has_validated_structured_filter(decision: CandidateDecision | None) -> bool:
+    """Treat an evidence-backed row filter as stronger than noisy text overlap."""
+    return (
+        decision is not None
+        and decision.score >= MIN_STRUCTURED_SCORE
+        and "validated_filter" in decision.reasons
+    )
+
+
 def select_sources(
     *,
     question: str,
@@ -378,6 +387,13 @@ def select_sources(
     valid = [item for item in diagnostics if item.rejection_reason is None]
     if not valid:
         return SelectionResult(path="unavailable", reason="insufficient_evidence", diagnostics=diagnostics)
+    if structured_requested and _has_validated_structured_filter(best_structured):
+        return SelectionResult(
+            path="structured",
+            document_id=best_structured.document_id,
+            reason="structured_filter_evidence",
+            diagnostics=diagnostics,
+        )
     valid.sort(key=lambda item: (-item.score, item.document_id))
     if (
         len(valid) > 1
@@ -387,6 +403,13 @@ def select_sources(
         return SelectionResult(path="clarification", reason="ambiguous_candidate", diagnostics=diagnostics)
 
     if structured_requested and best_structured is not None:
+        if _has_validated_structured_filter(best_structured):
+            return SelectionResult(
+                path="structured",
+                document_id=best_structured.document_id,
+                reason="structured_filter_evidence",
+                diagnostics=diagnostics,
+            )
         if best_semantic and best_semantic.document_id != best_structured.document_id and best_semantic.score > best_structured.score:
             selected_sources = [
                 source for source in retrieval_sources

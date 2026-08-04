@@ -353,6 +353,13 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
     question_text = f" {_normalized(question)} "
     question_tokens = _tokens(question)
     filters: dict[str, set[str]] = {}
+    matched_sheets = {
+        _canonical(row.sheet)
+        for row in rows
+        if _tokens(row.sheet) & question_tokens
+    }
+    if matched_sheets:
+        filters["__sheet__"] = matched_sheets
     for header, values in _column_values(rows).items():
         matched = set()
         header_requested = bool(_tokens(header) & question_tokens)
@@ -366,10 +373,24 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
                 continue
             value_tokens = _tokens(normalized_value)
             exact_value = f" {normalized_value} " in question_text
-            if exact_value or (value_tokens and value_tokens <= question_tokens):
+            if exact_value or (
+                value_tokens
+                and any(token in question_tokens for token in value_tokens)
+                and value_tokens - question_tokens <= {f"{token}s" for token in question_tokens}
+            ):
                 matched.add(_canonical(value))
         if matched:
             filters[header] = matched
+    directional_value = _requested_direction_value(question)
+    if directional_value:
+        for header, values in _column_values(rows).items():
+            header_tokens = _tokens(header)
+            value_set = {_canonical(value) for value in values}
+            if (
+                {"attendance", "direction"} & header_tokens
+                and directional_value in value_set
+            ):
+                filters.setdefault(header, set()).add(directional_value)
     mentioned_months = {
         canonical for alias, canonical in MONTH_ALIASES.items()
         if re.search(rf"\b{re.escape(alias)}\b", _normalized(question))
@@ -379,6 +400,23 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
             if any(any(_value_matches_month(value, month) for month in mentioned_months) for value in values):
                 filters.setdefault(header, set()).update(mentioned_months)
     return filters
+
+
+def _requested_direction_value(question: str) -> str | None:
+    """Map common in/out time wording to row values in direction-style tables."""
+    normalized = _normalized(question)
+    if re.search(r"\bin\s+time\b|\btime\s+in\b", normalized):
+        return "in"
+    if re.search(r"\bout\s+time\b|\btime\s+out\b", normalized):
+        return "out"
+    return None
+
+
+def _requests_time_records(question: str, filters: dict[str, set[str]]) -> bool:
+    """Prefer full rows when a question asks for times spread across date columns."""
+    if not filters or _requested_direction_value(question) is None:
+        return False
+    return "time" in _tokens(question)
 
 
 def _apply_filters(
@@ -391,8 +429,12 @@ def _apply_filters(
     filtered = [
         row for row in rows
         if all(
-            _canonical(row.values.get(header)) in accepted
-            or any(_value_matches_month(row.values.get(header), value) for value in accepted)
+            (
+                _canonical(row.sheet) in accepted
+                if header == "__sheet__"
+                else _canonical(row.values.get(header)) in accepted
+                or any(_value_matches_month(row.values.get(header), value) for value in accepted)
+            )
             for header, accepted in filters.items()
         )
     ]
@@ -403,6 +445,27 @@ def _apply_filters(
         row for row in filtered
         if _numeric_matches(row.values.get(header), (operator, left, right))
     ]
+
+
+def _resolve_filter_conflicts(
+    rows: list[RowRecord],
+    filters: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Drop one contradictory inferred filter when mixed sheet layouts collide."""
+    if not filters or _apply_filters(rows, filters):
+        return filters
+    candidates: list[tuple[int, int, dict[str, set[str]]]] = []
+    for header in filters:
+        if header == "__sheet__":
+            continue
+        candidate = {key: value for key, value in filters.items() if key != header}
+        matched = _apply_filters(rows, candidate)
+        if matched:
+            candidates.append((len(candidate), len(matched), candidate))
+    if not candidates:
+        return filters
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    return candidates[0][2]
 
 
 def _operation(question: str) -> str:
@@ -476,7 +539,7 @@ def _choose_column(
         inferred = scope.schema.get(header, {}).get("type", "text")
         if numeric and not any(_number(value) is not None for value in values):
             continue
-        if numeric and inferred != "number" and not (_tokens(header) & {"amount", "qty", "quantity", "count", "rate", "total"}):
+        if numeric and inferred != "number" and not (_tokens(header) & {"amount", "cost", "price", "qty", "quantity", "count", "rate", "total"}):
             continue
         score = _column_score(header, subject)
         if score > 0 and preferred_types and inferred in preferred_types:
@@ -507,7 +570,7 @@ def _candidate_columns(scope: WorkbookScope, *, numeric: bool = False, preferred
 def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool = False) -> Plan:
     operation = _operation(question)
     evidence_score, evidence_reasons = _source_evidence(scope, question)
-    filters = _row_filters(scope.rows, question)
+    filters = _resolve_filter_conflicts(scope.rows, _row_filters(scope.rows, question))
     numeric_condition = _numeric_condition(question)
     numeric_column = _choose_column(scope, question, numeric=True) if numeric_condition else None
     numeric_filter = (
@@ -542,15 +605,15 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
         return Plan("distinct", entity_column=column, list_column=column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if operation == "count":
         entity_column = _choose_column(scope, question, preferred_types={"category", "text", "identifier"})
+        numeric_quantity = _choose_column(scope, question, numeric=True)
+        if numeric_quantity and _column_score(numeric_quantity, question) > 0:
+            return Plan("total", value_column=numeric_quantity, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
         if (
             entity_column
             and _column_score(entity_column, question) > 0
             and not (_tokens(entity_column) & {"amount", "qty", "quantity", "count", "rate", "total", "reject", "rejection"})
         ):
             return Plan("count", entity_column=entity_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
-        numeric_quantity = _choose_column(scope, question, numeric=True)
-        if numeric_quantity and _column_score(numeric_quantity, question) > 0:
-            return Plan("total", value_column=numeric_quantity, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
         generic_record_count = explicit_scope and (_tokens(question) & {"record", "records", "row", "rows"})
         scoped_entity_count = (
             not entity_column
@@ -569,6 +632,8 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
             return Plan("unavailable", rejection_reason="weak_count_source_evidence")
         return Plan("count", entity_column=entity_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if numeric_filter:
+        return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
+    if _requests_time_records(question, filters):
         return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     list_column = _choose_column(scope, question, preferred_types={"text", "category", "identifier"})
     if list_column:
@@ -659,16 +724,47 @@ def _sources(scope: WorkbookScope, rows: list[RowRecord]) -> list[dict[str, obje
     ]
 
 
-def _records_table(scope: WorkbookScope, rows: list[RowRecord]) -> str:
-    headers = list({header: None for row in rows for header in row.values}.keys())
+def _record_headers(rows: list[RowRecord], plan: Plan) -> list[str]:
+    """Choose only the columns needed for a readable row-style answer."""
+    if plan.list_column:
+        return [plan.list_column]
+    if plan.intent == "records" and len(rows) == 1 and plan.filters:
+        filter_headers = [header for header in rows[0].values if header in plan.filters]
+        if len(filter_headers) == 1:
+            ordered = list(rows[0].values)
+            for header in ordered[ordered.index(filter_headers[0]) + 1:]:
+                if rows[0].values.get(header) is not None and str(rows[0].values.get(header)).strip():
+                    return [header]
+        headers = [
+            header for header in rows[0].values
+            if header not in plan.filters and rows[0].values.get(header) is not None
+        ]
+        if headers:
+            return headers
+    return list({header: None for row in rows for header in row.values}.keys())
+
+
+def _records_table(rows: list[RowRecord], plan: Plan) -> str:
+    headers = _record_headers(rows, plan)
     lines = [
-        "| " + " | ".join([*map(_display, headers), "Source"]) + " |",
-        "|" + "|".join("---" for _ in [*headers, "Source"]) + "|",
+        "| " + " | ".join(map(_display, headers)) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
     ]
     for row in rows[:settings.rag_structured_result_limit]:
         values = [_display(row.values.get(header, "")) for header in headers]
-        lines.append("| " + " | ".join([*values, _display(f"{scope.filename}, {row.sheet}, row {row.row_number}")]) + " |")
+        lines.append("| " + " | ".join(values) + " |")
     return "\n".join(lines)
+
+
+def _single_row_answer(rows: list[RowRecord], plan: Plan) -> str | None:
+    """Return a direct value answer when the question asks one row for one field."""
+    headers = _record_headers(rows, plan)
+    if len(rows) != 1 or len(headers) != 1:
+        return None
+    value = rows[0].values.get(headers[0])
+    if value is None or not str(value).strip():
+        return None
+    return f"{_display(headers[0])}: {_display(value)}"
 
 
 def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -> dict[str, object]:
@@ -739,7 +835,9 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
             + "\n".join(f"- {_display(value)}" for value in values[:settings.rag_structured_result_limit])
         )
     else:
-        answer = f"Matching records ({len(rows)}):\n\n{_records_table(scope, rows)}"
+        answer = _single_row_answer(rows, plan)
+        if answer is None:
+            answer = f"Matching records ({len(rows)}):\n\n{_records_table(rows, plan)}"
     return {
         "answer": answer,
         "question_type": "structured_analysis",

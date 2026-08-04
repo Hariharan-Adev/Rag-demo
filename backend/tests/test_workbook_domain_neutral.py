@@ -383,6 +383,184 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertNotIn("Column 2", sheet["headers_json"])
         self.assertIn("Total Present Days: 20", answer["answer"])
 
+    def test_attendance_in_time_question_returns_in_rows(self) -> None:
+        result = self.upload_workbook(
+            [
+                (
+                    "Sheet1",
+                    [
+                        ["EmpLoyee Name & No", "Attendance Direction", "1st", "2nd"],
+                        ["Aparna", "IN", "09:10:00", "09:15:00"],
+                        [101, "OUT", "18:10:00", "18:20:00"],
+                        ["Hari", "IN", "10:00:00", "10:05:00"],
+                        [102, "OUT", "19:00:00", "19:05:00"],
+                    ],
+                    "visible",
+                )
+            ],
+            "Attentence.xlsx",
+        )
+
+        answer = analyze_workbook_question(
+            "What is the in time of all employees in atendence sheet?",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        self.assertEqual(answer["question_type"], "structured_analysis")
+        self.assertTrue(answer["grounded"])
+        self.assertIn("Matching records (2)", answer["answer"])
+        self.assertIn("Aparna", answer["answer"])
+        self.assertIn("Hari", answer["answer"])
+        self.assertIn("09:10:00", answer["answer"])
+        self.assertNotIn("18:10:00", answer["answer"])
+        self.assertEqual(answer["_context"]["filters"], {"Attendance Direction": ["in"]})
+
+    def test_attendance_filter_wins_over_unrelated_semantic_match(self) -> None:
+        attendance = self.upload_workbook(
+            [
+                (
+                    "Sheet1",
+                    [
+                        ["EmpLoyee Name & No", "Attendance Direction", "1st"],
+                        ["Aparna", "IN", "09:10:00"],
+                        [101, "OUT", "18:10:00"],
+                    ],
+                    "visible",
+                )
+            ],
+            "Attentence.xlsx",
+        )
+        tracker = self.upload_text(
+            "Task tracker about employees and sheet details repeated employees sheet.",
+            "aparna_task_tracker.txt",
+        )
+
+        with database.get_connection() as connection:
+            tracker_version = connection.execute(
+                "SELECT current_version_id FROM documents WHERE id = ?",
+                (int(tracker["document_id"]),),
+            ).fetchone()["current_version_id"]
+
+        noisy_source = {
+            "document_id": int(tracker["document_id"]),
+            "version_id": int(tracker_version),
+            "filename": "aparna_task_tracker.txt",
+            "content": "employees sheet " * 20,
+            "source_type": "excel",
+            "source_location": {"sheet_name": "Tasks", "row_start": 1},
+            "score": 0.99,
+        }
+
+        with patch("app.services.rag_service.search_chunks", return_value=[noisy_source]), patch(
+            "app.services.rag_service.generate_answer",
+            side_effect=AssertionError("validated attendance rows should not call the LLM"),
+        ):
+            answer = answer_question(
+                "What is the in time of all employees in atendence sheet?",
+                1,
+            )
+
+        self.assertEqual(answer["question_type"], "structured_analysis")
+        self.assertIn("09:10:00", answer["answer"])
+        self.assertEqual(answer["sources"][0]["document_id"], int(attendance["document_id"]))
+
+    def test_attendance_day_follow_up_uses_prior_row_context(self) -> None:
+        self.upload_workbook(
+            [
+                (
+                    "Sheet1",
+                    [
+                        ["EmpLoyee Name & No", "Attendance Direction", "1st", "18th"],
+                        ["D BALAJI", "IN", None, "22:00:00"],
+                        [33, "OUT", None, "08:25:00"],
+                    ],
+                    "visible",
+                )
+            ],
+            "Attentence.xlsx",
+        )
+
+        first = answer_question("D BALAJI in time", 1, conversation_id="attendance-chat")
+        follow_up = answer_question("on 18 th", 1, conversation_id="attendance-chat")
+
+        self.assertTrue(first["grounded"])
+        self.assertEqual(follow_up["question_type"], "follow_up")
+        self.assertIn("18th from the prior grounded result", follow_up["answer"])
+        self.assertIn("D BALAJI: 22:00:00", follow_up["answer"])
+        self.assertNotIn("08:25:00", follow_up["answer"])
+
+    def test_person_sheet_career_goal_lookup_handles_mixed_layouts(self) -> None:
+        sandhiya = "To grow as a strong UI/UX Product Designer with React knowledge."
+        bathmaraj = "Deepen expertise in DevOps and infrastructure automation."
+        result = self.upload_workbook(
+            [
+                (
+                    "Sandhiya",
+                    [
+                        ["Role", "UI/UX Designer", "Pick from list"],
+                        ["Career goals", sandhiya, "Prompt"],
+                    ],
+                    "visible",
+                ),
+                (
+                    "Bathmaraj",
+                    [
+                        ["Name", "Bathmaraj V"],
+                        ["Career goals", bathmaraj],
+                    ],
+                    "visible",
+                ),
+            ],
+            "Employee Skill Matrix.xlsx",
+        )
+
+        answer = answer_question(
+            "sandhiyas career goal",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        self.assertTrue(answer["grounded"])
+        self.assertEqual(answer["question_type"], "structured_analysis")
+        self.assertIn(sandhiya, answer["answer"])
+        self.assertNotIn(bathmaraj, answer["answer"])
+        self.assertEqual(answer["sources"][0]["source_location"]["sheet_name"], "Sandhiya")
+
+    def test_form_style_field_lookup_returns_direct_value_without_source_column(self) -> None:
+        responsibilities = "Gather requirements and prepare BRD, FRD, and process documents."
+        result = self.upload_workbook(
+            [
+                (
+                    "Keerthana",
+                    [
+                        ["Column1", "Role", "Business Analyst", "Pick from list"],
+                        [
+                            None,
+                            "Expected responsibilities",
+                            responsibilities,
+                            "What are your current responsibility and roles in details?",
+                        ],
+                    ],
+                    "visible",
+                )
+            ],
+            "Employee Skill Matrix (1).xlsx",
+        )
+
+        answer = answer_question(
+            "expected responsibilities of keerthana",
+            1,
+            document_id=int(result["document_id"]),
+        )
+
+        self.assertTrue(answer["grounded"])
+        self.assertEqual(answer["question_type"], "structured_analysis")
+        self.assertEqual(answer["answer"], f"Business Analyst: {responsibilities}")
+        self.assertNotIn("Matching records", answer["answer"])
+        self.assertNotIn("Source", answer["answer"])
+        self.assertEqual(answer["sources"][0]["source_location"]["sheet_name"], "Keerthana")
+
     def test_named_document_routes_before_mixed_semantic_search(self) -> None:
         attendance = self.upload_merged_attendance_workbook()
         self.upload_workbook(

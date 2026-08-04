@@ -32,12 +32,33 @@ def is_follow_up_question(question: str) -> bool:
     """Detect reference-style follow-ups without relying on one exact phrase."""
     normalized = _normalize(question)
     tokens = set(re.findall(r"[a-z0-9]+", normalized))
+    if re.search(r"\b(?:on|for|in)\s+\d{1,2}\s*(?:st|nd|rd|th)?\b", normalized):
+        return True
     if tokens & FOLLOW_UP_WORDS:
         return True
     substantive = tokens - FOLLOW_UP_COMMAND_WORDS - {"me", "all", "the", "by"}
     if len(tokens) <= 4 and tokens & FOLLOW_UP_COMMAND_WORDS and not substantive:
         return True
     return bool(re.search(r"\b(only|just)\s+(for|in|by)\b|\bgroup\b.+\bby\b", normalized))
+
+
+def _day_column_requested(question: str, rows: list[dict[str, object]]) -> str | None:
+    """Match follow-ups like 'on 18 th' to stored day columns such as '18th'."""
+    normalized = _normalize(question)
+    match = re.search(r"\b(?:on|for|in)?\s*(\d{1,2})\s*(st|nd|rd|th)?\b", normalized)
+    if not match:
+        return None
+    day = int(match.group(1))
+    if not 1 <= day <= 31:
+        return None
+    suffix = match.group(2) or {1: "st", 2: "nd", 3: "rd"}.get(day if day < 20 else day % 10, "th")
+    requested = f"{day}{suffix}"
+    for row in rows:
+        values = row.get("values") if isinstance(row.get("values"), dict) else {}
+        for header in values:
+            if _normalize(str(header)) == requested:
+                return str(header)
+    return None
 
 
 def _organization_id(owner_id: int) -> str | None:
@@ -272,6 +293,16 @@ def _rows_answer(question: str, context: dict[str, object], rows: list[dict[str,
     value_column = structured.get("value_column")
     entity_column = structured.get("entity_column")
     normalized = _normalize(question)
+    day_column = _day_column_requested(question, rows)
+    if day_column:
+        lines = [f"{day_column} from the prior grounded result:"]
+        for row in rows[:50]:
+            value = row["values"].get(day_column)
+            label = row["values"].get(str(entity_column or "EmpLoyee Name & No")) or row["filename"]
+            lines.append(
+                f"- {label}: {value} ({row['filename']}, {row['sheet']} row {row['row_number']})"
+            )
+        return "\n".join(lines)
     if re.search(r"\bhow many\b|\bcount\b", normalized):
         return f"Count: {len(rows):,}. Calculation basis: prior grounded context."
     column = entity_column or value_column
