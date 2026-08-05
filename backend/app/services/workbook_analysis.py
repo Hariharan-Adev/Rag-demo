@@ -86,6 +86,8 @@ def is_structured_lookup_question(
     scopes = _load_scopes(owner_id, collection_id, document_id)
     return any(
         _is_time_matrix_question(scope, question)
+        or _is_arrival_matrix_question(scope, question)
+        or _is_departure_matrix_question(scope, question)
         or _plan_for_scope(scope, question, explicit_scope=document_id is not None).intent != "unavailable"
         for scope in scopes
     )
@@ -131,14 +133,20 @@ def analyze_workbook_question(
 ) -> dict[str, object]:
     """Plan and answer from all relevant structured rows, not vector excerpts."""
     scopes = _load_scopes(owner_id, collection_id, document_id)
-    time_matrix_answers = [
+    matrix_answers = [
         (_source_evidence(scope, question)[0], answer)
         for scope in scopes
-        if (answer := _answer_time_matrix(scope, question)) is not None
+        if (
+            answer := (
+                _answer_time_matrix(scope, question)
+                or _answer_arrival_matrix(scope, question)
+                or _answer_departure_matrix(scope, question)
+            )
+        ) is not None
     ]
-    if time_matrix_answers:
-        time_matrix_answers.sort(key=lambda item: -item[0])
-        return time_matrix_answers[0][1]
+    if matrix_answers:
+        matrix_answers.sort(key=lambda item: -item[0])
+        return matrix_answers[0][1]
     ranked = _rank_scopes(scopes, question, explicit_scope=document_id is not None)
     if not ranked or ranked[0][0] < 2:
         return _unavailable("no_relevant_structured_source")
@@ -251,7 +259,7 @@ def _normalized(value: object) -> str:
 def _tokens(value: object) -> set[str]:
     tokens = set()
     for token in re.findall(r"[a-z0-9]+", str(value).casefold()):
-        if token in STOP_WORDS or len(token) <= 1:
+        if token in STOP_WORDS or len(token) <= 1 or token.isdigit():
             continue
         tokens.add(token)
         if len(token) > 3 and token.endswith("s"):
@@ -347,14 +355,56 @@ def _time_minutes(value: object) -> Decimal | None:
 
 def _time_role(value: object) -> str | None:
     marker = _normalized(value)
-    if marker == "in":
+    if marker in {
+        "in", "clock in", "check in", "checkin", "arrival", "arrived",
+        "entry", "start", "start time",
+    }:
         return "in"
-    if marker == "out":
+    if marker in {
+        "out", "clock out", "check out", "checkout", "departure", "departed",
+        "exit", "end", "end time",
+    }:
         return "out"
     tokens = set(marker.split())
     if "total" in tokens and ({"hour", "hours", "hr", "hrs"} & tokens):
         return "total"
     return None
+
+
+def _entity_header_score(header: str) -> int:
+    tokens = _tokens(header)
+    score = 0
+    if "name" in tokens:
+        score += 8
+    if tokens & {"employee", "staff", "worker", "person", "associate", "operator", "member"}:
+        score += 6
+    if tokens & {"id", "number", "no", "code"}:
+        score -= 4
+    return score
+
+
+def _identifier_header_score(header: str) -> int:
+    tokens = _tokens(header)
+    score = 0
+    if tokens & {"employee", "staff", "worker", "person", "associate", "operator", "member"}:
+        score += 4
+    if tokens & {"id", "number", "no", "code"}:
+        score += 7
+    if "name" in tokens:
+        score -= 4
+    return score
+
+
+def _date_like_header(header: str) -> bool:
+    normalized = _normalized(header)
+    return bool(
+        _WEEKDAY_PATTERN.search(normalized)
+        or re.search(r"\b\d{1,2}(?:st|nd|rd|th)\b", normalized)
+        or re.fullmatch(r"(?:19|20)\d{2}[ /-]\d{1,2}[ /-]\d{1,2}", normalized)
+        or re.fullmatch(r"\d{1,2}[ /-]\d{1,2}(?:[ /-](?:19|20)?\d{2})?", normalized)
+        or re.fullmatch(r"(?:day\s*)?([1-9]|[12]\d|3[01])", normalized)
+        or bool(_tokens(normalized) & {"date", "day"})
+    )
 
 
 def _time_matrix_columns(scope: WorkbookScope) -> tuple[str, str, str | None, list[str]] | None:
@@ -371,24 +421,23 @@ def _time_matrix_columns(scope: WorkbookScope) -> tuple[str, str, str | None, li
     marker_column = marker_candidates[0][1]
     name_column = max(
         (header for header in columns if header != marker_column),
-        key=lambda header: (_column_score(header, "employee name"), -len(header)),
+        key=lambda header: (_entity_header_score(header), -len(header)),
         default="",
     )
-    if _column_score(name_column, "employee name") <= 0:
+    if _entity_header_score(name_column) <= 0:
         return None
     number_column = max(
         (header for header in columns if header not in {marker_column, name_column}),
-        key=lambda header: _column_score(header, "employee number id"),
+        key=_identifier_header_score,
         default="",
     ) or None
-    if number_column and _column_score(number_column, "employee number id") <= 0:
+    if number_column and _identifier_header_score(number_column) <= 0:
         number_column = None
     date_columns = [
         header for header in columns
         if header not in {marker_column, name_column, number_column}
         and (
-            _WEEKDAY_PATTERN.search(header.casefold())
-            or re.search(r"\b\d{1,2}(?:st|nd|rd|th)\b", header.casefold())
+            _date_like_header(header)
         )
         and any(_time_minutes(value) is not None for value in columns[header])
     ]
@@ -506,6 +555,176 @@ def _answer_time_matrix(scope: WorkbookScope, question: str) -> dict[str, object
     }
 
 
+def _is_arrival_matrix_question(scope: WorkbookScope, question: str) -> bool:
+    normalized = _normalized(question)
+    asks_arrival = bool(
+        re.search(r"\b(arrival|arrivals|arrive|arrived|entry|entered)\b", normalized)
+        or re.search(r"\b(?:check(?:ed)?|clock(?:ed)?)\s+in\b", normalized)
+        or re.search(r"\b(?:in|check\s+in|clock\s+in|start)\s+time(?:s)?\b", normalized)
+    )
+    return asks_arrival and _time_matrix_columns(scope) is not None
+
+
+def _is_departure_matrix_question(scope: WorkbookScope, question: str) -> bool:
+    normalized = _normalized(question)
+    asks_departure = bool(
+        re.search(r"\b(left|leave|leaves|leaving|departure|departures|departed|exit|exited)\b", normalized)
+        or re.search(r"\b(?:check(?:ed)?|clock(?:ed)?)\s+out\b", normalized)
+        or re.search(r"\b(?:out|check\s+out|clock\s+out|end)\s+time(?:s)?\b", normalized)
+    )
+    return asks_departure and _time_matrix_columns(scope) is not None
+
+
+def _clock_condition(question: str) -> tuple[str, Decimal] | None:
+    """Read an explicit before/after clock comparison from the question."""
+    match = re.search(
+        r"\b(before|earlier\s+than|after|later\s+than|past)\s+"
+        r"(\d{1,2})(?::([0-5]\d))?\s*(a\.?m\.?|p\.?m\.?)?(?=\s|[.?!,;:]|$)",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    comparison = re.sub(r"\s+", " ", match.group(1).casefold())
+    hour = int(match.group(2))
+    minute = int(match.group(3) or "0")
+    meridiem = (match.group(4) or "").casefold().replace(".", "")
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour %= 12
+        if meridiem == "pm":
+            hour += 12
+    elif hour > 23:
+        return None
+    operator = "lt" if comparison in {"before", "earlier than"} else "gt"
+    return operator, Decimal(hour * 60 + minute)
+
+
+def _configured_shift_starts() -> list[Decimal]:
+    starts: list[Decimal] = []
+    for value in settings.attendance_shift_start_times.split(","):
+        minutes = _time_minutes(value.strip())
+        if minutes is not None and Decimal(0) <= minutes < Decimal(24 * 60):
+            starts.append(minutes)
+    return sorted(set(starts))
+
+
+def _nearest_shift_lateness(arrival: Decimal, starts: list[Decimal]) -> tuple[Decimal, Decimal]:
+    """Return the nearest configured shift and signed minutes from its start."""
+    candidates: list[tuple[Decimal, bool, Decimal, Decimal]] = []
+    for start in starts:
+        delta = (arrival - start + Decimal(12 * 60)) % Decimal(24 * 60) - Decimal(12 * 60)
+        # At an exact midpoint, prefer the earlier shift so the record is not
+        # silently treated as early for the following shift.
+        candidates.append((abs(delta), delta < 0, start, delta))
+    _, _, start, delta = min(candidates)
+    return start, delta
+
+
+def _answer_arrival_matrix(scope: WorkbookScope, question: str) -> dict[str, object] | None:
+    """Unpivot attendance IN rows into employee/date/arrival records."""
+    if not _is_arrival_matrix_question(scope, question):
+        return None
+    return _answer_clock_event_matrix(scope, question, role="in", label="Arrival Time")
+
+
+def _answer_departure_matrix(scope: WorkbookScope, question: str) -> dict[str, object] | None:
+    """Unpivot attendance OUT rows into employee/date/departure records."""
+    if not _is_departure_matrix_question(scope, question):
+        return None
+    return _answer_clock_event_matrix(scope, question, role="out", label="Departure Time")
+
+
+def _answer_clock_event_matrix(
+    scope: WorkbookScope,
+    question: str,
+    *,
+    role: str,
+    label: str,
+) -> dict[str, object] | None:
+    discovered = _time_matrix_columns(scope)
+    if discovered is None:
+        return None
+    name_column, marker_column, _, date_columns = discovered
+    asks_late = role == "in" and bool(re.search(r"\b(late|lateness)\b", _normalized(question)))
+    condition = _clock_condition(question)
+    shift_starts = _configured_shift_starts() if asks_late and condition is None else []
+    if asks_late and condition is None and not shift_starts:
+        return _unavailable("late_arrival_definition_missing")
+
+    matches: list[tuple[str, str, object, RowRecord]] = []
+    for row in scope.rows:
+        if _time_role(row.values.get(marker_column)) != role:
+            continue
+        name = str(row.values.get(name_column) or "").strip()
+        if not name:
+            continue
+        for date_column in date_columns:
+            event_time = row.values.get(date_column)
+            event_minutes = _time_minutes(event_time)
+            if event_minutes is None:
+                continue
+            if condition is not None and not _numeric_matches(event_minutes, (condition[0], condition[1], None)):
+                continue
+            if asks_late and condition is None:
+                _, late_by = _nearest_shift_lateness(event_minutes, shift_starts)
+                if late_by <= 0:
+                    continue
+            matches.append((name, date_column, event_time, row))
+
+    if not matches:
+        return {
+            "answer": f"No {label.casefold()} records matched the requested condition.",
+            "question_type": "structured_analysis",
+            "calculation_basis": f"All readable {role.upper()} times were evaluated by employee and date.",
+            "sources": [],
+            "grounded": True,
+            "_context": {"kind": "structured_rows", "result_type": "records", "document_ids": [scope.document_id], "version_ids": [scope.version_id], "row_refs": []},
+        }
+
+    lines = [
+        f"| {_display(name_column)} | Date | {label} |",
+        "|---|---|---|",
+    ]
+    for name, date, event_time, _ in matches:
+        lines.append("| " + " | ".join((_display(name), _display(date), _display(event_time))) + " |")
+    unique_rows = list({(row.sheet, row.row_number): row for *_, row in matches}.values())
+    basis = f"{len(matches)} readable {role.upper()} time(s) were returned by employee and date."
+    if condition is not None:
+        comparison = "earlier than" if condition[0] == "lt" else "later than"
+        basis = f"{len(matches)} {role.upper()} time(s) were {comparison} {_format_duration(condition[1])}."
+    elif asks_late:
+        configured = ", ".join(_format_duration(value) for value in shift_starts)
+        basis = (
+            f"{len(matches)} IN time(s) were later than their nearest configured shift start. "
+            f"Configured shift starts: {configured}."
+        )
+    return {
+        "answer": f"Matching records ({len(matches)}):\n\n" + "\n".join(lines),
+        "question_type": "structured_analysis",
+        "calculation_basis": basis,
+        "sources": _sources(scope, unique_rows),
+        "grounded": True,
+        "_context": {
+            "kind": "structured_rows",
+            "result_type": "records",
+            "filters": {},
+            "numeric_filter": (
+                {"column": label, "operator": condition[0], "left": str(condition[1]), "right": None}
+                if condition is not None else None
+            ),
+            "shift_starts": [_format_duration(value) for value in shift_starts],
+            "document_ids": [scope.document_id],
+            "version_ids": [scope.version_id],
+            "row_refs": [
+                {"document_id": scope.document_id, "sheet": row.sheet, "row_number": row.row_number}
+                for row in unique_rows
+            ],
+        },
+    }
+
+
 def _canonical(value: object) -> str:
     normalized = _normalized(value)
     return MONTH_ALIASES.get(normalized, normalized)
@@ -554,6 +773,8 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
             ):
                 continue
             if _number(value) is not None:
+                continue
+            if _time_minutes(value) is not None:
                 continue
             value_tokens = _tokens(normalized_value)
             exact_value = f" {normalized_value} " in question_text
@@ -643,6 +864,8 @@ def _source_evidence(scope: WorkbookScope, question: str) -> tuple[int, list[str
             reasons.append("header_token_match")
         value_tokens = set()
         for value in values[:200]:
+            if _time_minutes(value) is not None:
+                continue
             value_tokens |= _tokens(value)
         if value_tokens & question_tokens:
             score += 2
@@ -679,6 +902,12 @@ def _choose_column(
 def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool = False) -> Plan:
     operation = _operation(question)
     evidence_score, evidence_reasons = _source_evidence(scope, question)
+    if (
+        _is_time_matrix_question(scope, question)
+        or _is_arrival_matrix_question(scope, question)
+        or _is_departure_matrix_question(scope, question)
+    ):
+        return Plan("records", confidence=evidence_score)
     filters = _row_filters(scope.rows, question)
     numeric_condition = _numeric_condition(question)
     numeric_column = _choose_column(scope, question, numeric=True) if numeric_condition else None

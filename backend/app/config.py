@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     rag_comprehensive_context_limit: int = Field(default=15, ge=1, le=50)
     rag_min_score: float = Field(default=0.35, ge=-1.0, le=1.0)
     rag_structured_result_limit: int = Field(default=100, ge=1, le=1000)
+    attendance_shift_start_times: str = "06:00,09:00,14:00,22:00"
     opensearch_url: str = ""
     opensearch_username: str = ""
     opensearch_password: str = ""

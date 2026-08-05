@@ -16,6 +16,7 @@ from openpyxl import Workbook
 from starlette.requests import Request
 
 from app import database
+from app.config import settings
 from app.routes import upload
 from app.services import structured_ingestion, vector_search, vector_store
 from app.services.chat_context import save_grounded_context
@@ -25,8 +26,11 @@ from app.services.workbook_analysis import (
     RowRecord,
     WorkbookScope,
     analyze_workbook_question,
+    _answer_arrival_matrix,
+    _answer_departure_matrix,
     _answer_time_matrix,
     _column_score,
+    _plan_for_scope,
     _row_filters,
 )
 from app.services.workbooks import _make_sheet
@@ -480,6 +484,86 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertIn("| Night Worker | Mon / 1st | 22:00:00 | 08:30:00 | 10:30:00 |", answer)
         self.assertNotIn("Tue / 2nd", answer)
         self.assertEqual(result["_context"]["numeric_filter"]["column"], "Total Working Hours")
+
+    def test_late_arrival_requires_a_file_grounded_cutoff(self) -> None:
+        scope = WorkbookScope(
+            document_id=7,
+            version_id=3,
+            filename="attendance.xlsx",
+            sheet_names=["April"],
+            schema={},
+            rows=[
+                RowRecord("April", 4, {"Employee Name": "Early Worker", "Type": "IN", "Mon / 1st": "08:55:00"}),
+                RowRecord("April", 5, {"Employee Name": "Early Worker", "Type": "OUT", "Mon / 1st": "17:55:00"}),
+                RowRecord("April", 7, {"Employee Name": "Late Worker", "Type": "IN", "Mon / 1st": "09:20:00"}),
+                RowRecord("April", 8, {"Employee Name": "Late Worker", "Type": "OUT", "Mon / 1st": "18:00:00"}),
+            ],
+        )
+
+        with patch.object(settings, "attendance_shift_start_times", ""):
+            undefined = _answer_arrival_matrix(
+                scope,
+                "Show the employee name, date and arrival time for every late arrival.",
+            )
+        self.assertEqual(undefined["answer"], "Information not available in the uploaded files.")
+        self.assertEqual(undefined["unavailable_reason"], "late_arrival_definition_missing")
+
+        with patch.object(settings, "attendance_shift_start_times", "09:00,14:00,22:00"):
+            inferred = _answer_arrival_matrix(
+                scope,
+                "Show the employee name, date and arrival time for every late arrival.",
+            )
+        self.assertIn("| Late Worker | Mon / 1st | 09:20:00 |", inferred["answer"])
+        self.assertNotIn("Early Worker", inferred["answer"])
+
+        defined = _answer_arrival_matrix(
+            scope,
+            "Show employee name, date and arrival time for arrivals after 9:15 AM.",
+        )
+        self.assertIn("| Late Worker | Mon / 1st | 09:20:00 |", defined["answer"])
+        self.assertNotIn("Early Worker", defined["answer"])
+
+        arrived_before = _answer_arrival_matrix(
+            scope,
+            "Which employees arrived before 9:00 AM?",
+        )
+        self.assertIn("| Early Worker | Mon / 1st | 08:55:00 |", arrived_before["answer"])
+        self.assertNotIn("Late Worker", arrived_before["answer"])
+
+        left_before = _answer_departure_matrix(
+            scope,
+            "Which employees left before 6:00 PM?",
+        )
+        self.assertIn("| Early Worker | Mon / 1st | 17:55:00 |", left_before["answer"])
+        self.assertNotIn("Late Worker", left_before["answer"])
+
+    def test_time_matrix_uses_common_schema_aliases_and_iso_dates(self) -> None:
+        scope = WorkbookScope(
+            document_id=8,
+            version_id=4,
+            filename="staff-log.xlsx",
+            sheet_names=["Log"],
+            schema={},
+            rows=[
+                RowRecord("Log", 2, {"Staff Name": "Asha", "Event": "Clock In", "2026-08-01": "08:45:00"}),
+                RowRecord("Log", 3, {"Staff Name": "Asha", "Event": "Clock Out", "2026-08-01": "17:30:00"}),
+                RowRecord("Log", 4, {"Staff Name": "Bala", "Event": "Check In", "2026-08-01": "09:15:00"}),
+                RowRecord("Log", 5, {"Staff Name": "Bala", "Event": "Check Out", "2026-08-01": "18:30:00"}),
+            ],
+        )
+
+        arrivals = _answer_arrival_matrix(scope, "Which staff checked in before 9:00 AM?")
+        self.assertIn("| Staff Name | Date | Arrival Time |", arrivals["answer"])
+        self.assertIn("| Asha | 2026-08-01 | 08:45:00 |", arrivals["answer"])
+        self.assertNotIn("Bala", arrivals["answer"])
+
+        departures = _answer_departure_matrix(scope, "Which staff clocked out before 6:00 PM?")
+        self.assertIn("| Asha | 2026-08-01 | 17:30:00 |", departures["answer"])
+        self.assertNotIn("Bala", departures["answer"])
+
+        plan = _plan_for_scope(scope, "Which staff checked in before 9:00 AM?")
+        self.assertEqual(plan.intent, "records")
+        self.assertFalse(plan.filters)
 
 
 if __name__ == "__main__":
