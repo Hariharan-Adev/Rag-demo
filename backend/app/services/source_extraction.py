@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 import csv
+import re
+import tempfile
 from time import monotonic
 
 from app.config import settings
 from app.services.chunking import chunk_text
 from app.services.document_loader import DocumentParseError, extract_text
-from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text
+from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text, extract_image_text
 from app.services.pdf_layout import extract_pdf_page_texts
+
+DOCX_PARAGRAPH_CHUNK_WORDS = 800
 
 
 @dataclass(frozen=True)
@@ -61,11 +66,268 @@ def _split(text: str, source_type: str, location: dict[str, object]) -> list[Sou
     ]
 
 
+def _table_row_text(headers: list[str], cells: list[str], prefix: str, row_number: int) -> str:
+    """Keep table cells bound to their headers instead of flattening rows into prose."""
+    labels = [header.strip() or f"Column {index + 1}" for index, header in enumerate(headers)]
+    if row_number == 1:
+        return f"{prefix} | Headers: " + " | ".join(labels)
+    return f"{prefix} | " + " | ".join(
+        f"{labels[index] if index < len(labels) else f'Column {index + 1}'}: {value}"
+        for index, value in enumerate(cells)
+        if value
+    )
+
+
+def _ocr_text_is_duplicate(ocr_text: str, native_text: str) -> bool:
+    """Avoid indexing OCR text that repeats already extracted native text."""
+    ocr_tokens = set(re.findall(r"[a-z0-9]+", ocr_text.casefold()))
+    native_tokens = set(re.findall(r"[a-z0-9]+", native_text.casefold()))
+    if len(ocr_tokens) < 4 or not native_tokens:
+        return False
+    return len(ocr_tokens & native_tokens) / len(ocr_tokens) >= 0.80
+
+
+def _safe_image_suffix(name: str | None, content_type: str | None = None) -> str:
+    """Choose a Pillow-friendly extension without trusting archive names."""
+    suffix = Path(name or "").suffix.lower()
+    if suffix in IMAGE_EXTENSIONS:
+        return suffix
+    if content_type:
+        guessed = "." + content_type.split("/")[-1].lower().replace("jpeg", "jpg")
+        if guessed in IMAGE_EXTENSIONS:
+            return guessed
+    return ".png"
+
+
+def _image_chunks_from_bytes(
+    *,
+    blob: bytes,
+    filename_hint: str,
+    source_type: str,
+    location: dict[str, object],
+    native_text: str = "",
+) -> list[SourceChunk]:
+    """OCR one embedded image through the same bounded image pipeline used for uploads."""
+    if not blob or len(blob) > settings.embedded_ocr_max_decoded_bytes:
+        return []
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(blob)) as image:
+            width, height = image.size
+            frames = int(getattr(image, "n_frames", 1))
+            if width * height * max(frames, 1) > settings.embedded_ocr_max_pixels:
+                return []
+    except Exception:
+        return []
+    suffix = _safe_image_suffix(filename_hint)
+    try:
+        with tempfile.TemporaryDirectory(prefix="rag-embedded-ocr-") as temporary:
+            path = Path(temporary) / f"embedded{suffix}"
+            path.write_bytes(blob)
+            text = extract_image_text(path)
+    except Exception:
+        # Embedded OCR is best-effort; a bad image must not discard readable text.
+        return []
+    if _ocr_text_is_duplicate(text, native_text):
+        return []
+    return [
+        SourceChunk(value, source_type, {**location, "part": index})
+        for index, value in enumerate(chunk_image_text(text), start=1)
+    ]
+
+
+def _docx_paragraph_chunks(document) -> list[SourceChunk]:
+    """Batch short DOCX paragraphs so large prose documents do not trip chunk-count limits."""
+    result: list[SourceChunk] = []
+    buffer: list[str] = []
+    buffer_words = 0
+    paragraph_start: int | None = None
+    paragraph_end: int | None = None
+    section_index = 1
+    section_start = section_index
+    styles: set[str] = set()
+
+    def flush() -> None:
+        nonlocal buffer, buffer_words, paragraph_start, paragraph_end, section_start, styles
+        if not buffer or paragraph_start is None or paragraph_end is None:
+            return
+        result.append(SourceChunk(
+            "\n\n".join(buffer),
+            "word",
+            {
+                "section_number": section_start,
+                "paragraph_start": paragraph_start,
+                "paragraph_end": paragraph_end,
+                "styles": sorted(styles),
+                "content_type": "prose",
+            },
+        ))
+        buffer = []
+        buffer_words = 0
+        paragraph_start = None
+        paragraph_end = None
+        section_start = section_index
+        styles = set()
+
+    for paragraph_index, paragraph in enumerate(document.paragraphs, start=1):
+        text = paragraph.text.strip()
+        if paragraph._p.xpath("./w:pPr/w:sectPr"):
+            flush()
+            section_index += 1
+        if not text:
+            continue
+        words = len(text.split())
+        style = paragraph.style.name if paragraph.style else None
+        if style and style.casefold().startswith("heading"):
+            flush()
+        if words > DOCX_PARAGRAPH_CHUNK_WORDS:
+            flush()
+            result.extend(_split(text, "word", {
+                "section_number": section_index,
+                "paragraph_start": paragraph_index,
+                "paragraph_end": paragraph_index,
+                "style": style,
+                "content_type": "prose",
+            }))
+            continue
+        if buffer and buffer_words + words > DOCX_PARAGRAPH_CHUNK_WORDS:
+            flush()
+        if paragraph_start is None:
+            paragraph_start = paragraph_index
+            section_start = section_index
+        paragraph_end = paragraph_index
+        buffer.append(text)
+        buffer_words += words
+        if style:
+            styles.add(style)
+    flush()
+    return result
+
+
+def _docx_image_locations(document) -> dict[str, dict[str, object]]:
+    """Map embedded image relationship IDs to nearby paragraph provenance."""
+    locations: dict[str, dict[str, object]] = {}
+    section_index = 1
+    current_heading = ""
+    for paragraph_index, paragraph in enumerate(document.paragraphs, start=1):
+        if paragraph._p.xpath("./w:pPr/w:sectPr"):
+            section_index += 1
+        style = paragraph.style.name if paragraph.style else ""
+        if style.casefold().startswith("heading") and paragraph.text.strip():
+            current_heading = paragraph.text.strip()
+        for rel_id in re.findall(r'r:embed="([^"]+)"', paragraph._p.xml):
+            locations.setdefault(rel_id, {
+                "section_number": section_index,
+                "paragraph_start": paragraph_index,
+                "paragraph_end": paragraph_index,
+                "heading": current_heading,
+                "nearby_text": paragraph.text.strip(),
+            })
+    return locations
+
+
+def _docx_image_chunks(document) -> list[SourceChunk]:
+    """OCR internal DOCX media parts without following links or active content."""
+    if settings.embedded_ocr_max_images_per_document == 0:
+        return []
+    result: list[SourceChunk] = []
+    locations = _docx_image_locations(document)
+    image_index = 0
+    for rel_id, part in sorted(document.part.related_parts.items()):
+        content_type = str(getattr(part, "content_type", ""))
+        if not content_type.startswith("image/"):
+            continue
+        image_index += 1
+        if image_index > settings.embedded_ocr_max_images_per_document:
+            break
+        nearby = locations.get(rel_id, {})
+        location = {
+            **{key: value for key, value in nearby.items() if key != "nearby_text"},
+            "relationship_id": rel_id,
+            "image_index": image_index,
+            "content_type": "image_ocr",
+        }
+        result.extend(_image_chunks_from_bytes(
+            blob=bytes(getattr(part, "blob", b"")),
+            filename_hint=str(getattr(part, "partname", "")),
+            source_type="word",
+            location=location,
+            native_text=str(nearby.get("nearby_text") or ""),
+        ))
+    return result
+
+
+def _pdf_table_cells(line: str) -> list[str]:
+    """Recognize layout-preserved PDF table rows without treating prose as columns."""
+    value = line.strip().strip("|")
+    if "|" in value:
+        cells = [cell.strip() for cell in value.split("|")]
+    elif "\t" in value:
+        cells = [cell.strip() for cell in value.split("\t")]
+    else:
+        cells = [cell.strip() for cell in re.split(r"\s{2,}", value)]
+    cells = [cell for cell in cells if cell]
+    return cells if len(cells) >= 2 else []
+
+
+def _pdf_table_chunks(page_number: int, text: str) -> tuple[list[SourceChunk], set[int]]:
+    """Extract complete PDF table rows and report lines removed from prose chunking."""
+    lines = text.splitlines()
+    result: list[SourceChunk] = []
+    consumed: set[int] = set()
+    table_number = 0
+    cursor = 0
+    while cursor < len(lines):
+        cells = _pdf_table_cells(lines[cursor])
+        if not cells:
+            cursor += 1
+            continue
+        start = cursor
+        rows: list[tuple[int, list[str]]] = []
+        while cursor < len(lines):
+            row_cells = _pdf_table_cells(lines[cursor])
+            if not row_cells or len(row_cells) != len(cells):
+                break
+            rows.append((cursor, row_cells))
+            cursor += 1
+        if len(rows) < 2:
+            cursor = start + 1
+            continue
+        table_number += 1
+        headers = rows[0][1]
+        for table_row_index, (position, row_cells) in enumerate(rows, start=1):
+            row_number = position + 1
+            result.append(SourceChunk(
+                _table_row_text(headers, row_cells, f"PDF table {table_number}", table_row_index),
+                "pdf",
+                {
+                    "page_start": page_number,
+                    "page_end": page_number,
+                    "table_number": table_number,
+                    "row_start": row_number,
+                    "row_end": row_number,
+                    "header_context": headers,
+                    "content_type": "table",
+                },
+            ))
+            consumed.add(position)
+    return result, consumed
+
+
 def _pdf(path: Path) -> list[SourceChunk]:
     try:
         result: list[SourceChunk] = []
+        native_by_page: dict[int, str] = {}
         for page_text in extract_pdf_page_texts(path):
-            for block_index, value in enumerate(chunk_text(page_text.text), start=1):
+            native_by_page[page_text.page_number] = page_text.text
+            table_chunks, table_lines = _pdf_table_chunks(page_text.page_number, page_text.text)
+            result.extend(table_chunks)
+            prose = "\n".join(
+                line for index, line in enumerate(page_text.text.splitlines())
+                if index not in table_lines
+            )
+            for block_index, value in enumerate(chunk_text(prose), start=1):
                 result.append(SourceChunk(value, "pdf", {
                     "page_start": page_text.page_number,
                     "page_end": page_text.page_number,
@@ -73,9 +335,48 @@ def _pdf(path: Path) -> list[SourceChunk]:
                     "bounding_boxes": [],
                     "part": block_index,
                 }))
+        result.extend(_pdf_image_chunks(path, native_by_page))
         return result
     except Exception as error:
         raise DocumentParseError("The PDF file could not be read.") from error
+
+
+def _pdf_image_chunks(path: Path, native_by_page: dict[int, str]) -> list[SourceChunk]:
+    """OCR bounded internal PDF image XObjects with page provenance."""
+    if settings.embedded_ocr_max_images_per_document == 0:
+        return []
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+    result: list[SourceChunk] = []
+    image_count = 0
+    try:
+        pages = PdfReader(str(path)).pages
+        for page_number, page in enumerate(pages, start=1):
+            page_images = list(getattr(page, "images", []) or [])
+            for page_image_index, image in enumerate(page_images[:settings.embedded_ocr_max_images_per_page], start=1):
+                image_count += 1
+                if image_count > settings.embedded_ocr_max_images_per_document:
+                    return result
+                blob = bytes(getattr(image, "data", b"") or b"")
+                name = str(getattr(image, "name", "") or f"page-{page_number}-image-{page_image_index}.png")
+                result.extend(_image_chunks_from_bytes(
+                    blob=blob,
+                    filename_hint=name,
+                    source_type="pdf",
+                    location={
+                        "page_start": page_number,
+                        "page_end": page_number,
+                        "image_index": image_count,
+                        "page_image_index": page_image_index,
+                        "content_type": "image_ocr",
+                    },
+                    native_text=native_by_page.get(page_number, ""),
+                ))
+    except Exception:
+        return result
+    return result
 
 
 def _is_nonempty_cell(value: object) -> bool:
@@ -116,6 +417,20 @@ def _header_row_number(rows: list[tuple[int, list[object]]]) -> int | None:
     return best[1] if best else None
 
 
+def _deduplicated_headers(cells: list[tuple[int, object]]) -> dict[int, str]:
+    """Give repeated worksheet headers stable distinct labels for source chunks."""
+    headers: dict[int, str] = {}
+    used: dict[str, int] = {}
+    for column, raw_header in cells:
+        if not _is_nonempty_cell(raw_header):
+            continue
+        header = str(raw_header).strip()
+        key = header.casefold()
+        used[key] = used.get(key, 0) + 1
+        headers[column] = header if used[key] == 1 else f"{header} ({used[key]})"
+    return headers
+
+
 def _pptx(path: Path) -> list[SourceChunk]:
     try:
         from pptx import Presentation
@@ -147,12 +462,17 @@ def _pptx(path: Path) -> list[SourceChunk]:
                     "speaker_notes_included": False,
                 }
                 if getattr(shape, "has_table", False):
+                    headers = [cell.text.strip() for cell in shape.table.rows[0].cells]
                     for row_index, row in enumerate(shape.table.rows, start=1):
-                        text = "\t".join(cell.text.strip() for cell in row.cells).strip()
+                        cells = [cell.text.strip() for cell in row.cells]
+                        text = _table_row_text(
+                            headers, cells, f"Slide {slide_number} table {shape_index}", row_index
+                        )
                         if text:
                             result.append(SourceChunk(text, "powerpoint", {
                                 **common, "content_type": "table",
                                 "row_start": row_index, "row_end": row_index,
+                                "header_context": headers,
                             }))
                 elif getattr(shape, "has_text_frame", False):
                     text = "\n".join(
@@ -234,13 +554,13 @@ def _xlsx(
                     )
                     if _is_nonempty_cell(merged_values.get((cell.row, cell.column), cell.value))
                 ]
-                header_by_column = {
-                    cell.column: str(merged_values.get((cell.row, cell.column), cell.value)).strip()
-                    for cell in (
-                        worksheet[header_row_number] if header_row_number else []
+                header_by_column = _deduplicated_headers([
+                    (
+                        cell.column,
+                        merged_values.get((cell.row, cell.column), cell.value),
                     )
-                    if _is_nonempty_cell(merged_values.get((cell.row, cell.column), cell.value))
-                }
+                    for cell in (worksheet[header_row_number] if header_row_number else [])
+                ])
                 tables: list[tuple[str, tuple[int, int, int, int]]] = [
                     (table.name, range_boundaries(table.ref))
                     for table in worksheet.tables.values()
@@ -352,18 +672,10 @@ def _xls(
                     ]
                     if header_row else []
                 )
-                header_by_column = (
-                    {
-                        column: str(
-                            sheet.cell_value(header_row - 1, column)
-                        ).strip()
-                        for column in range(sheet.ncols)
-                        if sheet.cell_value(
-                            header_row - 1, column
-                        ) not in ("", None)
-                    }
-                    if header_row else {}
-                )
+                header_by_column = _deduplicated_headers([
+                    (column, sheet.cell_value(header_row - 1, column))
+                    for column in range(sheet.ncols)
+                ]) if header_row else {}
                 for row_index in range(sheet.nrows):
                     populated = [
                         column for column in range(sheet.ncols)
@@ -411,29 +723,21 @@ def _docx(path: Path) -> list[SourceChunk]:
         from docx import Document
 
         document = Document(str(path))
-        result: list[SourceChunk] = []
-        section_index = 1
-        for paragraph_index, paragraph in enumerate(document.paragraphs, start=1):
-            text = paragraph.text.strip()
-            if not text:
-                continue
-            if paragraph._p.xpath("./w:pPr/w:sectPr"):
-                section_index += 1
-            result.extend(_split(text, "word", {
-                "section_number": section_index,
-                "paragraph_start": paragraph_index,
-                "paragraph_end": paragraph_index,
-                "style": paragraph.style.name if paragraph.style else None,
-            }))
+        result = _docx_paragraph_chunks(document)
         for table_index, table in enumerate(document.tables, start=1):
+            headers = [cell.text.strip() for cell in table.rows[0].cells] if table.rows else []
             for row_index, row in enumerate(table.rows, start=1):
-                text = "\t".join(cell.text.strip() for cell in row.cells).strip()
+                cells = [cell.text.strip() for cell in row.cells]
+                text = _table_row_text(headers, cells, f"DOCX table {table_index}", row_index)
                 if text:
                     result.append(SourceChunk(text, "word", {
                         "table_number": table_index,
                         "row_start": row_index,
                         "row_end": row_index,
+                        "header_context": headers,
+                        "content_type": "table",
                     }))
+        result.extend(_docx_image_chunks(document))
         return result
     except Exception as error:
         raise DocumentParseError("The DOCX file could not be read.") from error

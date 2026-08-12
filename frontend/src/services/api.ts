@@ -128,6 +128,28 @@ export interface ChatResponse {
   sources: ChatSource[]
 }
 
+export interface ChatHistoryMessage {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  citations: ChatSource[]
+  created_at: string
+}
+
+export interface ChatHistoryConversation {
+  id: string
+  title: string
+  created_at: string
+  updated_at: string
+  is_pinned: boolean
+  pinned_at?: string | null
+  messages: ChatHistoryMessage[]
+}
+
+export interface ListChatHistoryResponse {
+  conversations: ChatHistoryConversation[]
+}
+
 export interface DeleteDocumentResponse {
   message: string
   document_id: number
@@ -481,6 +503,36 @@ export async function sendChatMessage(question: string, collectionId?: number | 
       collection_id: collectionId ?? null,
       document_id: documentId ?? null,
     }),
+  })
+}
+
+export async function listChatConversations() {
+  return requestJson<ListChatHistoryResponse>('/chat/conversations', {
+    method: 'GET',
+    headers: authHeaders(),
+  })
+}
+
+export async function createChatConversation(id: string, title: string) {
+  return requestJson<{ id: string }>('/chat/conversations', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify({ id, title }),
+  })
+}
+
+export async function updateChatConversation(id: string, patch: { title?: string; is_pinned?: boolean }) {
+  return requestJson<{ id: string; updated: boolean }>(`/chat/conversations/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(patch),
+  })
+}
+
+export async function deleteChatConversation(id: string) {
+  return requestJson<{ id: string; deleted: boolean }>(`/chat/conversations/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
   })
 }
 

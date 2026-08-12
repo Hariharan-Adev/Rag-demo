@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from app.config import settings
 from app.database import get_connection
@@ -12,11 +12,15 @@ from app.prompts.rag_prompt import UNAVAILABLE_ANSWER
 from app.services.document_access import READABLE_DOCUMENT_SQL
 from app.services.vector_search import search_chunks
 from app.services.workbook_analysis import (
+    _answer_employee_profiles,
     _load_scopes,
     _plan_for_scope,
     _source_evidence,
 )
 from app.utils.observability import log_event
+
+if TYPE_CHECKING:
+    from app.services.rag_diagnostics import RagRequestDiagnostic
 
 
 SelectionPath = Literal["structured", "retrieval", "unavailable", "clarification"]
@@ -239,16 +243,22 @@ def _structured_decisions(
     explicit_scope = document_id is not None
     for scope in _load_scopes(owner_id, collection_id, document_id):
         plan = _plan_for_scope(scope, question, explicit_scope=explicit_scope)
+        employee_answer = _answer_employee_profiles(scope, question)
         evidence_score, reasons = _source_evidence(scope, question)
         score = evidence_score
-        if plan.intent != "unavailable":
+        if employee_answer is not None:
+            score += 6
+            reasons.append("valid_employee_profile_plan")
+        elif plan.intent != "unavailable":
             score += 4
             reasons.append("valid_structured_plan")
         if plan.filters:
             score += 2
             reasons.append("validated_filter")
         rejection = None
-        if plan.intent == "unavailable":
+        if employee_answer is not None:
+            rejection = None
+        elif plan.intent == "unavailable":
             rejection = plan.rejection_reason or "schema_mismatch"
         elif score < MIN_STRUCTURED_SCORE:
             rejection = "insufficient_evidence"
@@ -290,6 +300,7 @@ def select_sources(
     version_id: int | None = None,
     structured_requested: bool = False,
     searcher=search_chunks,
+    diagnostic: "RagRequestDiagnostic | None" = None,
 ) -> SelectionResult:
     """Compare eligible structured and unstructured evidence before answering."""
     if document_id is not None and not _active_accessible_document(owner_id, document_id, version_id):
@@ -333,26 +344,39 @@ def select_sources(
                 diagnostics=structured,
             )
 
+    retrieval_limit = max(settings.rag_retrieval_limit, settings.rag_final_context_limit)
     retrieval_sources = searcher(
         question,
         owner_id=owner_id,
-        limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
+        limit=retrieval_limit,
         collection_id=collection_id,
         document_id=routed_document_id,
         version_id=version_id,
         min_score=settings.rag_min_score,
     )
+    if diagnostic is not None:
+        diagnostic.record_retrieval_attempt(
+            limit=retrieval_limit,
+            min_score=settings.rag_min_score,
+            sources=retrieval_sources,
+        )
     semantic = _semantic_decisions(question, retrieval_sources)
     if not _best_non_rejected(semantic) and (structured_requested or len(safe_tokens(question)) >= 2):
         fallback_sources = searcher(
             question,
             owner_id=owner_id,
-            limit=max(settings.rag_retrieval_limit, settings.rag_final_context_limit),
+            limit=retrieval_limit,
             collection_id=collection_id,
             document_id=routed_document_id,
             version_id=version_id,
             min_score=0.0,
         )
+        if diagnostic is not None:
+            diagnostic.record_retrieval_attempt(
+                limit=retrieval_limit,
+                min_score=0.0,
+                sources=fallback_sources,
+            )
         fallback_decisions = _semantic_decisions(question, fallback_sources)
         if _best_non_rejected(fallback_decisions):
             retrieval_sources = fallback_sources
@@ -414,7 +438,7 @@ def select_sources(
             selected_sources = [
                 source for source in retrieval_sources
                 if int(source["document_id"]) == best_semantic.document_id
-            ][:settings.rag_final_context_limit]
+            ]
             return SelectionResult(
                 path="retrieval",
                 document_id=best_semantic.document_id,
@@ -435,7 +459,7 @@ def select_sources(
     selected_sources = [
         source for source in retrieval_sources
         if int(source["document_id"]) == selected.document_id
-    ][:settings.rag_final_context_limit]
+    ]
     return SelectionResult(
         path="retrieval",
         document_id=selected.document_id,
@@ -450,28 +474,97 @@ def validate_grounded_result(
     *,
     selected_document_id: int | None,
     owner_id: int,
+    final_context_sources: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Reject answers whose selected source, plan, and citations diverge."""
     if not result.get("grounded"):
-        return result
+        return _unavailable("unavailable_with_citations") if result.get("sources") else result
     sources = [source for source in (result.get("sources") or []) if isinstance(source, dict)]
     if selected_document_id is None or not sources:
         return _unavailable("missing_citation")
     for source in sources:
         if int(source.get("document_id") or 0) != selected_document_id:
             return _unavailable("citation_document_mismatch")
+        if source.get("version_id") is None:
+            return _unavailable("citation_version_missing")
         if not _active_accessible_document(
             owner_id,
             selected_document_id,
-            int(source["version_id"]) if source.get("version_id") is not None else None,
+            int(source["version_id"]),
         ):
             return _unavailable("source_no_longer_accessible")
+    if final_context_sources is not None and not _citations_match_final_context(
+        sources, final_context_sources
+    ):
+        return _unavailable("citation_not_in_final_context")
     context = result.get("_context")
     if isinstance(context, dict):
         context_docs = {int(value) for value in context.get("document_ids") or []}
         if context_docs and context_docs != {selected_document_id}:
             return _unavailable("result_plan_document_mismatch")
+    provenance = result.get("provenance")
+    if isinstance(provenance, dict) and not _provenance_matches_sources(provenance, sources, selected_document_id):
+        return _unavailable("result_plan_source_mismatch")
+    if isinstance(context, dict):
+        result_plan = context.get("result_plan")
+        if isinstance(result_plan, dict) and result_plan != provenance:
+            return _unavailable("result_plan_provenance_mismatch")
     return result
+
+
+def _citations_match_final_context(
+    citations: list[dict[str, object]],
+    final_context_sources: list[dict[str, object]],
+) -> bool:
+    """Require retrieval citations to identify chunks that actually reached the model."""
+    for citation in citations:
+        if not any(
+            int(citation.get("document_id") or 0) == int(source.get("document_id") or 0)
+            and int(citation.get("version_id") or 0) == int(source.get("version_id") or 0)
+            and str(citation.get("filename") or "") == str(source.get("filename") or "")
+            and str(citation.get("source_type") or "text") == str(source.get("source_type") or "text")
+            and citation.get("source_location") == source.get("source_location")
+            and str(citation.get("text") or "") == str(source.get("content") or "")
+            for source in final_context_sources
+        ):
+            return False
+    return True
+
+
+def _provenance_matches_sources(
+    provenance: dict[str, object],
+    sources: list[dict[str, object]],
+    selected_document_id: int,
+) -> bool:
+    """Require compact structured provenance to stay within cited document ranges."""
+    if int(provenance.get("document_id") or 0) != selected_document_id:
+        return False
+    version_id = provenance.get("version_id")
+    if version_id is None or any(int(source.get("version_id") or 0) != int(version_id) for source in sources):
+        return False
+    by_sheet = {
+        str((source.get("source_location") or {}).get("sheet_name") or ""): source
+        for source in sources
+    }
+    sheets = provenance.get("sheets")
+    if not isinstance(sheets, list) or not sheets:
+        return False
+    for sheet in sheets:
+        if not isinstance(sheet, dict):
+            return False
+        source = by_sheet.get(str(sheet.get("sheet_name") or ""))
+        if source is None:
+            return False
+        source_ranges = (source.get("source_location") or {}).get("row_ranges") or []
+        for row_range in sheet.get("row_ranges") or []:
+            if not isinstance(row_range, dict) or not any(
+                int(source_range.get("row_start") or 0) <= int(row_range.get("row_start") or 0)
+                and int(row_range.get("row_end") or 0) <= int(source_range.get("row_end") or 0)
+                for source_range in source_ranges
+                if isinstance(source_range, dict)
+            ):
+                return False
+    return True
 
 
 def _unavailable(reason: str) -> dict[str, object]:

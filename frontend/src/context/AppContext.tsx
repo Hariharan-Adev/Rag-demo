@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ChatItem, Conversation, NotificationItem, PolicyDocument, ResponseMetadata, RetrievedDocument, Theme, User, View } from '../types'
-import { ApiError, deleteDocument, listCollections, listDocuments, sendChatMessage, uploadDocument, type ChatSource, type CollectionRecord, type DocumentRecord, type UploadResponse } from '../services/api'
+import { ApiError, createChatConversation, deleteChatConversation, deleteDocument, listChatConversations, listCollections, listDocuments, sendChatMessage, updateChatConversation, uploadDocument, type ChatHistoryConversation, type ChatHistoryMessage, type ChatSource, type CollectionRecord, type DocumentRecord, type UploadResponse } from '../services/api'
 
 const defaultSuggestions = [
   'What is this document about?',
@@ -171,14 +171,15 @@ function mapSource(source: ChatSource, index: number): RetrievedDocument {
   const locationData = source.source_location ?? {}
   const rowStart = locationData.row_start
   const rowEnd = locationData.row_end
-  const rowRanges = Array.isArray(locationData.row_ranges) ? locationData.row_ranges : []
+  const hideRowRange = locationData.hide_row_range === true
+  const rowRanges = !hideRowRange && Array.isArray(locationData.row_ranges) ? locationData.row_ranges : []
   const rowLabel = rowRanges.length
     ? rowRanges.map((range) => {
         const start = Number((range as { row_start?: number }).row_start)
         const end = Number((range as { row_end?: number }).row_end)
         return end > start ? `Rows ${start}-${end}` : `Row ${start}`
       }).join(', ')
-    : rowStart
+    : !hideRowRange && rowStart
       ? rowEnd && rowEnd !== rowStart
         ? `Rows ${rowStart}-${rowEnd}`
         : `Row ${rowStart}`
@@ -196,6 +197,33 @@ function mapSource(source: ChatSource, index: number): RetrievedDocument {
     section: location || `Retrieved source ${index + 1}`,
     score: sourceScore(source),
     category: 'Uploaded Documents',
+  }
+}
+
+function stableMessageId(value: string, index: number) {
+  let hash = 0
+  for (const character of value) hash = (hash * 31 + character.charCodeAt(0)) >>> 0
+  return Math.max(1, hash + index)
+}
+
+function mapHistoryMessage(message: ChatHistoryMessage, index: number): ChatItem {
+  return {
+    id: stableMessageId(`${message.id}:${message.created_at}`, index),
+    role: message.role,
+    content: message.content,
+    source: message.citations.length ? mapSource(message.citations[0], 0) : undefined,
+  }
+}
+
+function mapHistoryConversation(conversation: ChatHistoryConversation): Conversation {
+  return {
+    id: conversation.id,
+    title: conversation.title,
+    createdAt: conversation.created_at,
+    updatedAt: conversation.updated_at,
+    messages: conversation.messages.map(mapHistoryMessage),
+    isPinned: conversation.is_pinned,
+    pinnedAt: conversation.pinned_at ?? null,
   }
 }
 
@@ -272,6 +300,18 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     }
   }, [logout, showToast])
 
+  const refreshConversations = useCallback(async () => {
+    try {
+      const result = await listChatConversations()
+      const serverConversations = result.conversations.map(mapHistoryConversation)
+      setConversations(serverConversations)
+      setActiveConversationId(current => current && serverConversations.some(conversation => conversation.id === current) ? current : null)
+    } catch (error) {
+      showToast(apiErrorMessage(error, 'Unable to load chat history.'))
+      if (error instanceof ApiError && error.status === 401) logout()
+    }
+  }, [logout, showToast])
+
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
     localStorage.setItem('rag-theme', JSON.stringify(theme))
@@ -298,6 +338,10 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
   useEffect(() => {
     void refreshDocuments()
   }, [refreshDocuments])
+
+  useEffect(() => {
+    void refreshConversations()
+  }, [refreshConversations])
 
   const setSelectedCategory = useCallback((category: string) => {
     setCategory(category)
@@ -328,7 +372,11 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     const normalized = title.replace(/\s+/g, ' ').trim()
     if (!normalized) return
     setConversations(previous => previous.map(conversation => conversation.id === id ? { ...conversation, title: normalized.slice(0, 48) } : conversation))
-  }, [])
+    void updateChatConversation(id, { title: normalized.slice(0, 48) }).catch(error => {
+      showToast(apiErrorMessage(error, 'Unable to rename conversation.'))
+      if (error instanceof ApiError && error.status === 401) logout()
+    })
+  }, [logout, showToast])
 
   const deleteConversation = useCallback((id: string) => {
     setConversations(previous => previous.filter(conversation => conversation.id !== id))
@@ -340,15 +388,25 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
       setView('chat')
     }
     showToast('Conversation deleted')
-  }, [showToast])
+    void deleteChatConversation(id).catch(error => {
+      showToast(apiErrorMessage(error, 'Unable to delete conversation.'))
+      if (error instanceof ApiError && error.status === 401) logout()
+    })
+  }, [logout, showToast])
 
   const toggleConversationPin = useCallback((id: string) => {
+    let nextPinned = false
     setConversations(previous => previous.map(conversation => {
       if (conversation.id !== id) return conversation
       const isPinned = !conversation.isPinned
+      nextPinned = isPinned
       return { ...conversation, isPinned, pinnedAt: isPinned ? new Date().toISOString() : null }
     }))
-  }, [])
+    void updateChatConversation(id, { is_pinned: nextPinned }).catch(error => {
+      showToast(apiErrorMessage(error, 'Unable to update conversation.'))
+      if (error instanceof ApiError && error.status === 401) logout()
+    })
+  }, [logout, showToast])
 
   const sendMessage = useCallback(async (question: string, replaceMessageId?: number) => {
     const trimmed = question.trim()
@@ -382,6 +440,11 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
       if (replaceMessageId !== undefined) return previous
       return [{ id: conversationId, title: createConversationTitle(trimmed), createdAt: now, updatedAt: now, messages: [userMessage], isPinned: false, pinnedAt: null }, ...previous]
     })
+    if (replaceMessageId === undefined) {
+      void createChatConversation(conversationId, createConversationTitle(trimmed)).catch(() => {
+        // The chat POST also creates the session, so a racing create failure can be ignored.
+      })
+    }
     setRecentQuestions(previous => [trimmed, ...previous.filter(item => item !== trimmed)].slice(0, 8))
     setLoadingConversationId(conversationId)
     setRetrievedDocuments([])
@@ -451,7 +514,13 @@ export function AppProvider({ children, userEmail, onLogout }: AppProviderProps)
     setMetadata(null)
     setSuggestions(defaultSuggestions)
     showToast('Conversation cleared')
-  }, [showToast])
+    if (currentId) {
+      void deleteChatConversation(currentId).catch(error => {
+        showToast(apiErrorMessage(error, 'Unable to clear conversation.'))
+        if (error instanceof ApiError && error.status === 401) logout()
+      })
+    }
+  }, [logout, showToast])
 
   const uploadDocuments = useCallback(async (files: File[]) => {
     const results: UploadResponse[] = []

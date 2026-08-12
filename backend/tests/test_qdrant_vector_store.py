@@ -52,6 +52,9 @@ class QdrantVectorStoreTests(unittest.TestCase):
                     VectorPoint(**{**points[0].__dict__, "vector": [1.0, 0.0]})
                 ])
             self.assertTrue(store.contains_points([point.point_id for point in points]))
+            self.assertEqual(store.delete_points([points[1].point_id]), 1)
+            self.assertFalse(store.contains_points([points[1].point_id]))
+            self.assertTrue(store.contains_points([points[0].point_id, points[2].point_id]))
             self.assertEqual(
                 store.get_vectors([points[0].point_id]),
                 {points[0].point_id: vector},

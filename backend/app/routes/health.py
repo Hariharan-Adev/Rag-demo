@@ -5,13 +5,14 @@ from fastapi.responses import PlainTextResponse
 
 from app.config import settings
 from app.database import get_connection
-from app.services.vector_store import get_vector_store
+from app.services.embeddings import embedding_health
+from app.services.vector_store import get_vector_store, vector_store_statistics
 
 router = APIRouter(tags=["operations"])
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, object]:
     try:
         with get_connection() as connection:
             connection.execute("SELECT 1").fetchone()
@@ -29,6 +30,7 @@ def health() -> dict[str, str]:
             if vector.get("provider") == "qdrant"
             else "standby"
         ),
+        "embedding": embedding_health(),
     }
 
 
@@ -46,7 +48,12 @@ def readiness() -> dict[str, object]:
             raise RuntimeError("Production requires a remote persistent Qdrant deployment.")
     except Exception as error:
         raise HTTPException(status_code=503, detail="A required dependency is unavailable.") from error
-    return {"status": "ready", "database": "ok", "vector_store": vector}
+    return {
+        "status": "ready",
+        "database": "ok",
+        "vector_store": {**vector, **vector_store_statistics()},
+        "embedding": embedding_health(),
+    }
 
 
 @router.get("/metrics", response_class=PlainTextResponse)

@@ -49,6 +49,29 @@ Search and chat use the current version by default. Authorized callers may pass
 `version_id` (optionally with `document_id`) to retrieve one successfully indexed
 older version; the same tenant, ACL, and soft-delete predicates are applied.
 
+## Development RAG diagnostics
+
+`POST /chat/diagnostics` runs the normal RAG orchestration with an internal,
+content-free trace. It requires the same bearer authentication and hourly chat
+rate limit as `POST /chat`. The capability is disabled by default and returns
+`404` unless `RAG_DIAGNOSTICS_ENABLED=true` is explicitly configured. Keep the
+flag disabled in production except during an approved diagnostic window.
+
+The request body uses the normal chat fields: `question`, optional
+`conversation_id`, `collection_id`, `document_id`, and `version_id`. An explicit
+document is checked with the central read ACL before RAG execution. All traced
+document and chunk IDs are checked again against the authenticated user's
+organization, ownership, visibility, sharing permissions, and soft-delete state
+before the response is returned. Unauthorized documents receive the same safe
+`404` used by other document APIs.
+
+The response is marked with `capability: "rag_diagnostic"` and includes routing
+reason codes, authorized source IDs, retrieval limits and score arrays,
+structured-analysis path, final context chunk IDs, and grounded/unavailable
+status. Query text, answers, document text, filenames, source locations,
+authentication data, configuration, and secrets are omitted. The
+`retrieved_chunks.text_previews` list is intentionally empty.
+
 ## Asynchronous ingestion
 
 The API performs bounded preflight validation, stores the upload, creates the
@@ -178,6 +201,11 @@ chunk survives, chat returns a deterministic ungrounded response without calling
 the LLM. The RAG prompt also forbids general knowledge and unsupported inference.
 No reranker is enabled; add one only with an evaluated model and corpus-specific
 quality tests, including a separate post-rerank relevance threshold.
+
+The local embedding model is loaded lazily. Concurrent retrieval requests share
+one loader and wait at most `EMBEDDING_MODEL_LOAD_TIMEOUT_SECONDS` (default 60)
+before receiving a clear initialization error. `/health` and `/health/ready`
+report only the safe embedding state and never trigger model loading.
 
 Each chunk has a globally unique `vector_point_id`, per-chunk
 `indexing_status`, and `qdrant_indexed_at` confirmation timestamp in SQLite.

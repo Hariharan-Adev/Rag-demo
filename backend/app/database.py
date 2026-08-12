@@ -528,6 +528,9 @@ def _migrate_multitenant_architecture(connection: sqlite3.Connection) -> None:
             owner_id INTEGER NOT NULL,
             title TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            is_pinned INTEGER NOT NULL DEFAULT 0,
+            pinned_at TEXT,
             deleted_at TEXT,
             FOREIGN KEY (owner_id) REFERENCES users(id)
         );
@@ -1093,6 +1096,47 @@ def _migrate_chat_context_v11(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_chat_history_v12(connection: sqlite3.Connection) -> None:
+    """Add persisted chat-history metadata used by the React conversation list."""
+    _add_column(
+        connection,
+        "chat_sessions",
+        "updated_at",
+        "TEXT",
+    )
+    _add_column(
+        connection,
+        "chat_sessions",
+        "is_pinned",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column(connection, "chat_sessions", "pinned_at", "TEXT")
+    connection.execute(
+        """UPDATE chat_sessions
+              SET updated_at = COALESCE(
+                    (SELECT MAX(created_at)
+                       FROM chat_messages
+                      WHERE chat_messages.organization_id = chat_sessions.organization_id
+                        AND chat_messages.session_id = chat_sessions.id
+                        AND chat_messages.deleted_at IS NULL),
+                    created_at
+                  )
+            WHERE updated_at IS NULL OR updated_at = ''"""
+    )
+    connection.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_sessions_owner_updated
+            ON chat_sessions(organization_id, owner_id, deleted_at, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_chat_messages_session_created
+            ON chat_messages(organization_id, session_id, deleted_at, created_at);
+        """
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('012_chat_history_metadata')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1166,6 +1210,7 @@ def initialize_database() -> None:
             _migrate_chunk_vector_sync_v9(connection)
             _migrate_structured_csv_indexing_v10(connection)
             _migrate_chat_context_v11(connection)
+            _migrate_chat_history_v12(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

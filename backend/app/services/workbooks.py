@@ -130,6 +130,114 @@ def _headers(values: list[object], width: int) -> list[str]:
     return output
 
 
+FORM_HELPER_VALUES = {
+    "pick from list",
+    "prompt",
+    "prompt text",
+}
+FORM_HELPER_PREFIXES = (
+    "what are your ",
+    "please ",
+    "select ",
+)
+FORM_KEY_ALIASES = {
+    "career goals": "Career Goals",
+    "career goal": "Career Goals",
+    "experience": "Experience Level",
+    "experience level": "Experience Level",
+    "expected responsibilities": "Expected Responsibilities",
+    "expected responsibility": "Expected Responsibilities",
+    "primary skill": "Primary Skills",
+    "primary skills": "Primary Skills",
+    "project allocation": "Project Allocation",
+    "role": "Role",
+    "secondary skill": "Secondary Skills",
+    "secondary skills": "Secondary Skills",
+    "training completed": "Training Completed",
+}
+
+
+def _looks_like_form_helper(value: object) -> bool:
+    """Identify prompt/helper cells that explain data entry but are not user data."""
+    normalized = _canonical_cell(value)
+    return (
+        not normalized
+        or normalized in FORM_HELPER_VALUES
+        or normalized.startswith(FORM_HELPER_PREFIXES)
+        or re.fullmatch(r"columns?\s*\d+", normalized) is not None
+    )
+
+
+def _form_field_name(value: object) -> str | None:
+    """Normalize employee-profile labels while ignoring spreadsheet scaffolding."""
+    normalized = _canonical_cell(value)
+    if not normalized or _looks_like_form_helper(value):
+        return None
+    if normalized in {"name", "employee", "employee name"}:
+        return "Employee"
+    return FORM_KEY_ALIASES.get(normalized)
+
+
+def _make_employee_profile_sheet(
+    name: str,
+    state: str,
+    nonempty: list[tuple[int, list[object]]],
+) -> WorkbookSheet | None:
+    """Convert form-style employee sheets into one clean profile record."""
+    fields: dict[str, object] = {}
+    field_rows: dict[str, int] = {}
+    detected_rows = 0
+    for row_number, values in nonempty:
+        for index, cell in enumerate(values[:-1]):
+            field = _form_field_name(cell)
+            if field is None:
+                continue
+            value = next(
+                (
+                    candidate
+                    for candidate in values[index + 1 :]
+                    if _is_nonempty(candidate) and not _looks_like_form_helper(candidate)
+                ),
+                None,
+            )
+            if value is None:
+                continue
+            fields[field] = value
+            field_rows.setdefault(field, row_number)
+            detected_rows += 1
+            break
+    meaningful = [field for field in fields if field != "Employee"]
+    if detected_rows < 2 or not meaningful:
+        return None
+    employee = fields.get("Employee")
+    if not _is_nonempty(employee):
+        fields["Employee"] = name
+    ordered_names = [
+        "Employee",
+        "Role",
+        "Experience Level",
+        "Primary Skills",
+        "Secondary Skills",
+        "Project Allocation",
+        "Training Completed",
+        "Career Goals",
+        "Expected Responsibilities",
+    ]
+    ordered = {
+        field: fields[field]
+        for field in [*ordered_names, *sorted(fields)]
+        if field in fields and _is_nonempty(fields[field])
+    }
+    return WorkbookSheet(
+        name=name,
+        state=state,
+        status="processed",
+        header_row=min(field_rows.values(), default=nonempty[0][0]),
+        headers=list(ordered),
+        rows=[WorkbookRow(row_number=min(field_rows.values(), default=nonempty[0][0]), values=ordered)],
+    )
+
+
 def _repair_parent_headers(
     headers: list[str],
     nonempty: list[tuple[int, list[object]]],
@@ -163,6 +271,66 @@ def _repair_parent_headers(
     return _headers(repaired, len(repaired))
 
 
+def _looks_like_repeated_header(row: dict[str, object], headers: list[str]) -> bool:
+    """Skip in-sheet section headers that repeat column names as row values."""
+    matches = 0
+    nonempty = 0
+    for header, value in row.items():
+        if not _is_nonempty(value):
+            continue
+        nonempty += 1
+        if _canonical_cell(value) == _canonical_cell(header):
+            matches += 1
+    return matches >= 2 and matches >= nonempty - 1
+
+
+def _structured_rows_for_block(
+    headers: list[str],
+    data_rows: list[tuple[int, list[object]]],
+) -> list[WorkbookRow]:
+    """Create structured rows for one detected table block."""
+    structured = []
+    width = len(headers)
+    canonical_headers = [_canonical_cell(header) for header in headers]
+    for row_number, values in data_rows:
+        comparable = [_canonical_cell(values[index] if index < len(values) else None) for index in range(width)]
+        if comparable == canonical_headers:
+            continue
+        row = {
+            header: values[index] if index < len(values) else None
+            for index, header in enumerate(headers)
+        }
+        if any(_is_nonempty(value) for value in row.values()) and not _looks_like_repeated_header(row, headers):
+            structured.append(WorkbookRow(row_number=row_number, values=row))
+    return structured
+
+
+def _leading_table_block(
+    nonempty: list[tuple[int, list[object]]],
+    primary_header_index: int,
+) -> tuple[list[str], list[WorkbookRow]]:
+    """Preserve a smaller table that appears above the detected primary table."""
+    leading = nonempty[:primary_header_index]
+    if len(leading) < 3:
+        return [], []
+    header_index = _detect_header(leading)
+    header_number, header_values = leading[header_index]
+    data_rows = [
+        (row_number, values)
+        for row_number, values in leading[header_index + 1 :]
+        if row_number > header_number
+    ]
+    if len(data_rows) < 2:
+        return [], []
+    text_headers = sum(1 for value in header_values if isinstance(value, str) and value.strip())
+    if text_headers < 2:
+        return [], []
+    width = max([len(header_values), *(len(values) for _, values in data_rows)])
+    headers = _headers(header_values, width)
+    rows = _structured_rows_for_block(headers, data_rows)
+    return (headers, rows) if rows else ([], [])
+
+
 def _vertical_merged_values(worksheet) -> dict[tuple[int, int], object]:
     """Copy labels down vertically merged ranges without spreading title rows."""
     values: dict[tuple[int, int], object] = {}
@@ -184,24 +352,21 @@ def _make_sheet(name: str, state: str, rows: list[tuple[int, list[object]]]) -> 
     if not nonempty:
         return WorkbookSheet(name=name, state=state, status="empty")
 
+    profile_sheet = _make_employee_profile_sheet(name, state, nonempty)
+    if profile_sheet is not None:
+        return profile_sheet
+
     header_index = _detect_header(nonempty)
     header_number, header_values = nonempty[header_index]
     data_rows = nonempty[header_index + 1 :]
     width = max([len(header_values), *(len(values) for _, values in data_rows)])
     headers = _headers(header_values, width)
     headers = _repair_parent_headers(headers, nonempty, header_index, data_rows)
-    structured = []
-    canonical_headers = [_canonical_cell(header) for header in headers]
-    for row_number, values in data_rows:
-        comparable = [_canonical_cell(values[index] if index < len(values) else None) for index in range(width)]
-        if comparable == canonical_headers:
-            continue
-        row = {
-            header: values[index] if index < len(values) else None
-            for index, header in enumerate(headers)
-        }
-        if any(_is_nonempty(value) for value in row.values()):
-            structured.append(WorkbookRow(row_number=row_number, values=row))
+    structured = _structured_rows_for_block(headers, data_rows)
+    leading_headers, leading_rows = _leading_table_block(nonempty, header_index)
+    if leading_rows:
+        headers = list(dict.fromkeys([*leading_headers, *headers]))
+        structured = [*leading_rows, *structured]
     return WorkbookSheet(
         name=name,
         state=state,

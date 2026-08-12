@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from app.services.source_extraction import (
     extract_source_metadata,
     validate_source_location,
 )
+from app.services.pdf_layout import PdfPageText
 
 
 class DocumentParserTests(unittest.TestCase):
@@ -115,22 +117,213 @@ class DocumentParserTests(unittest.TestCase):
         slide = presentation.slides.add_slide(presentation.slide_layouts[1])
         slide.shapes.title.text = "Located title"
         table = slide.shapes.add_table(
-            1, 2, Inches(1), Inches(4), Inches(6), Inches(1)
+            2, 2, Inches(1), Inches(4), Inches(6), Inches(1)
         ).table
         table.cell(0, 0).text = "Region"
         table.cell(0, 1).text = "Revenue"
+        table.cell(1, 0).text = "West"
+        table.cell(1, 1).text = "120"
         presentation.save(path)
         chunks = extract_source_chunks(path)
         title = next(chunk for chunk in chunks if "Located title" in chunk.text)
-        table_chunk = next(chunk for chunk in chunks if "Region" in chunk.text)
+        table_chunk = next(chunk for chunk in chunks if "West" in chunk.text)
         self.assertEqual(title.location["slide_number"], 1)
         self.assertEqual(title.location["slide_start"], 1)
         self.assertEqual(title.location["slide_end"], 1)
         self.assertIn("shape_index", title.location)
         self.assertEqual(title.location["shape_ids"], ["shape-1"])
         self.assertFalse(title.location["speaker_notes_included"])
-        self.assertEqual(table_chunk.location["row_start"], 1)
+        self.assertIn("Region: West", table_chunk.text)
+        self.assertIn("Revenue: 120", table_chunk.text)
+        self.assertEqual(table_chunk.location["row_start"], 2)
+        self.assertEqual(table_chunk.location["header_context"], ["Region", "Revenue"])
         self.assertEqual(table_chunk.location["content_type"], "table")
+
+    def test_docx_table_rows_include_headers_and_table_provenance(self):
+        """DOCX data rows remain structured when header and values are separate cells."""
+        from docx import Document
+
+        path = self.root / "regional.docx"
+        document = Document()
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "Region"
+        table.cell(0, 1).text = "Revenue"
+        table.cell(1, 0).text = "West"
+        table.cell(1, 1).text = "120"
+        document.save(path)
+
+        chunks = extract_source_chunks(path)
+        data = next(chunk for chunk in chunks if "Region: West" in chunk.text)
+        self.assertIn("Revenue: 120", data.text)
+        self.assertEqual(data.location["table_number"], 1)
+        self.assertEqual(data.location["row_start"], 2)
+        self.assertEqual(data.location["header_context"], ["Region", "Revenue"])
+
+    def test_docx_short_paragraphs_are_batched_into_retrieval_chunks(self):
+        """Many short DOCX paragraphs should not create one retrieval chunk each."""
+        from docx import Document
+
+        path = self.root / "large-prose.docx"
+        document = Document()
+        for index in range(600):
+            document.add_paragraph(f"Requirement {index}: verify account handling.")
+        document.save(path)
+
+        chunks = extract_source_chunks(path)
+
+        self.assertLess(len(chunks), 20)
+        self.assertEqual(chunks[0].source_type, "word")
+        self.assertEqual(chunks[0].location["paragraph_start"], 1)
+        self.assertGreater(chunks[0].location["paragraph_end"], 1)
+        self.assertIn("Requirement 0", chunks[0].text)
+        self.assertIn("Requirement 599", chunks[-1].text)
+
+    def test_docx_headings_split_batched_prose_sections(self):
+        """Section-heading questions should retrieve the matching DOCX section."""
+        from docx import Document
+
+        path = self.root / "sectioned.docx"
+        document = Document()
+        document.add_heading("Purpose", level=2)
+        document.add_paragraph("The document purpose is validation support.")
+        document.add_heading("Product Scope", level=2)
+        document.add_paragraph("The product scope includes bonus reports and exports.")
+        document.save(path)
+
+        chunks = extract_source_chunks(path)
+        purpose = next(chunk for chunk in chunks if "Purpose" in chunk.text)
+        scope = next(chunk for chunk in chunks if "Product Scope" in chunk.text)
+
+        self.assertNotEqual(purpose.location["paragraph_start"], scope.location["paragraph_start"])
+        self.assertIn("validation support", purpose.text)
+        self.assertNotIn("Product Scope", purpose.text)
+        self.assertIn("bonus reports and exports", scope.text)
+
+    def test_docx_embedded_image_ocr_creates_image_chunk_with_provenance(self):
+        """DOCX embedded media should contribute OCR chunks without losing text/table chunks."""
+        from docx import Document
+        from PIL import Image
+
+        image_path = self.root / "embedded.png"
+        Image.new("RGB", (120, 40), "white").save(image_path)
+        path = self.root / "embedded.docx"
+        document = Document()
+        document.add_heading("Project Alpha", level=1)
+        document.add_paragraph("Project Alpha paragraph evidence.")
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "Project"
+        table.cell(0, 1).text = "Current rate"
+        table.cell(1, 0).text = "Alpha"
+        table.cell(1, 1).text = "17.5"
+        document.add_picture(str(image_path))
+        document.save(path)
+
+        with patch("app.services.source_extraction.extract_image_text", return_value="OCR text:\nEmbedded approval code is IMG-42."):
+            chunks = extract_source_chunks(path)
+
+        self.assertTrue(any("Project Alpha paragraph evidence" in chunk.text for chunk in chunks))
+        self.assertTrue(any("Current rate: 17.5" in chunk.text for chunk in chunks))
+        image = next(chunk for chunk in chunks if "IMG-42" in chunk.text)
+        self.assertEqual(image.source_type, "word")
+        self.assertEqual(image.location["content_type"], "image_ocr")
+        self.assertIn("relationship_id", image.location)
+        self.assertIn("image_index", image.location)
+
+    def test_pdf_scanned_page_ocr_creates_page_image_chunk(self):
+        """A PDF page with only an image should still yield OCR text with page provenance."""
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (120, 40), "white").save(buffer, format="PNG")
+        path = self.root / "scanned.pdf"
+        path.write_bytes(b"%PDF-test")
+        fake_image = SimpleNamespace(data=buffer.getvalue(), name="scan.png")
+        fake_page = SimpleNamespace(images=[fake_image])
+        with (
+            patch("app.services.source_extraction.extract_pdf_page_texts", return_value=[]),
+            patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[fake_page])),
+            patch("app.services.source_extraction.extract_image_text", return_value="OCR text:\nScanned approval code is PDF-42."),
+        ):
+            chunks = extract_source_chunks(path)
+
+        scanned = next(chunk for chunk in chunks if "PDF-42" in chunk.text)
+        self.assertEqual(scanned.source_type, "pdf")
+        self.assertEqual(scanned.location["page_start"], 1)
+        self.assertEqual(scanned.location["content_type"], "image_ocr")
+
+    def test_pdf_native_and_image_ocr_are_both_preserved_when_distinct(self):
+        """Native text pages and distinct embedded-image OCR stay complementary."""
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (120, 40), "white").save(buffer, format="PNG")
+        path = self.root / "native-image.pdf"
+        path.write_bytes(b"%PDF-test")
+        fake_page = SimpleNamespace(images=[SimpleNamespace(data=buffer.getvalue(), name="embedded.png")])
+        with (
+            patch("app.services.source_extraction.extract_pdf_page_texts", return_value=[PdfPageText(1, "Native text says base rate is 12.")]),
+            patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[fake_page])),
+            patch("app.services.source_extraction.extract_image_text", return_value="OCR text:\nImage note says approval is required."),
+        ):
+            chunks = extract_source_chunks(path)
+
+        self.assertTrue(any("base rate is 12" in chunk.text for chunk in chunks))
+        image = next(chunk for chunk in chunks if "approval is required" in chunk.text)
+        self.assertEqual(image.location["page_start"], 1)
+        self.assertEqual(image.location["content_type"], "image_ocr")
+
+    def test_pdf_ocr_duplicate_text_is_suppressed(self):
+        """Native/OCR duplicate suppression avoids indexing the same text twice."""
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (120, 40), "white").save(buffer, format="PNG")
+        path = self.root / "duplicate.pdf"
+        path.write_bytes(b"%PDF-test")
+        native = "Alpha rate requires approval from finance team before release."
+        fake_page = SimpleNamespace(images=[SimpleNamespace(data=buffer.getvalue(), name="duplicate.png")])
+        with (
+            patch("app.services.source_extraction.extract_pdf_page_texts", return_value=[PdfPageText(1, native)]),
+            patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[fake_page])),
+            patch("app.services.source_extraction.extract_image_text", return_value=f"OCR text:\n{native}"),
+        ):
+            chunks = extract_source_chunks(path)
+
+        self.assertEqual(sum("Alpha rate requires approval" in chunk.text for chunk in chunks), 1)
+
+    def test_embedded_ocr_limit_can_reject_otherwise_unreadable_scanned_pdf(self):
+        """A disabled embedded-OCR limit keeps unreadable scanned PDFs safely rejected."""
+        from PIL import Image
+
+        buffer = BytesIO()
+        Image.new("RGB", (120, 40), "white").save(buffer, format="PNG")
+        path = self.root / "limited.pdf"
+        path.write_bytes(b"%PDF-test")
+        fake_page = SimpleNamespace(images=[SimpleNamespace(data=buffer.getvalue(), name="scan.png")])
+        with (
+            patch("app.services.source_extraction.extract_pdf_page_texts", return_value=[]),
+            patch("pypdf.PdfReader", return_value=SimpleNamespace(pages=[fake_page])),
+            patch("app.services.source_extraction.extract_image_text", return_value="OCR text should be blocked."),
+            patch("app.services.source_extraction.settings.embedded_ocr_max_images_per_document", 0),
+        ):
+            with self.assertRaisesRegex(DocumentParseError, "No readable content"):
+                extract_source_chunks(path)
+
+    def test_pdf_table_rows_include_headers_and_page_provenance(self):
+        """Layout-preserved PDF tables do not leave values in headerless prose chunks."""
+        path = self.root / "regional.pdf"
+        path.write_bytes(b"%PDF-test")
+        with patch(
+            "app.services.source_extraction.extract_pdf_page_texts",
+            return_value=[PdfPageText(3, "Region | Revenue\nWest | 120\nEast | 140")],
+        ):
+            chunks = extract_source_chunks(path)
+
+        west = next(chunk for chunk in chunks if "Region: West" in chunk.text)
+        self.assertIn("Revenue: 120", west.text)
+        self.assertEqual(west.location["page_start"], 3)
+        self.assertEqual(west.location["table_number"], 1)
+        self.assertEqual(west.location["header_context"], ["Region", "Revenue"])
 
     def test_xlsx_chunks_retain_sheet_cell_range_table_and_formula(self):
         from openpyxl import Workbook

@@ -23,35 +23,94 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
   const [search, setSearch] = useState('')
   const [tab, setTab] = useState<'all' | 'documents'>('all')
   const [documentToDelete, setDocumentToDelete] = useState<PolicyDocument | null>(null)
+  const [selectedDocumentIds, setSelectedDocumentIds] = useState<string[]>([])
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState('')
   const deleteTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const headerSelectAllRef = useRef<HTMLInputElement | null>(null)
+  const toolbarSelectAllRef = useRef<HTMLInputElement | null>(null)
   const filtered = useMemo(() => [...documents]
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
     .filter(document => selectedCollectionId === null || document.collectionId === selectedCollectionId)
     .filter(document => document.name.toLowerCase().includes(search.trim().toLowerCase())), [documents, search, selectedCollectionId])
+  const visibleDocumentIds = useMemo(() => filtered.map(document => document.id), [filtered])
+  const visibleDocumentIdSet = useMemo(() => new Set(visibleDocumentIds), [visibleDocumentIds])
+  const selectedVisibleCount = selectedDocumentIds.filter(id => visibleDocumentIdSet.has(id)).length
+  const allVisibleSelected = filtered.length > 0 && selectedVisibleCount === filtered.length
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected
+
+  useEffect(() => {
+    if (headerSelectAllRef.current) headerSelectAllRef.current.indeterminate = someVisibleSelected
+    if (toolbarSelectAllRef.current) toolbarSelectAllRef.current.indeterminate = someVisibleSelected
+  }, [someVisibleSelected])
+
+  useEffect(() => {
+    setSelectedDocumentIds(previous => previous.filter(id => visibleDocumentIdSet.has(id)))
+  }, [visibleDocumentIdSet])
 
   const requestDelete = (document: PolicyDocument, event: MouseEvent<HTMLButtonElement>) => {
     event.stopPropagation()
     deleteTriggerRef.current = event.currentTarget
     setDeleteError('')
+    setBulkDeleteOpen(false)
     setDocumentToDelete(document)
+  }
+
+  const toggleDocumentSelection = (documentId: string, checked: boolean) => {
+    setSelectedDocumentIds(previous => {
+      if (checked) return previous.includes(documentId) ? previous : [...previous, documentId]
+      return previous.filter(id => id !== documentId)
+    })
+  }
+
+  const toggleAllVisibleDocuments = (checked: boolean) => {
+    setSelectedDocumentIds(checked ? visibleDocumentIds : [])
+  }
+
+  const requestBulkDelete = (event: MouseEvent<HTMLButtonElement>) => {
+    event.stopPropagation()
+    if (selectedVisibleCount === 0) return
+    deleteTriggerRef.current = event.currentTarget
+    setDeleteError('')
+    setDocumentToDelete(null)
+    setBulkDeleteOpen(true)
   }
 
   const cancelDelete = () => {
     if (isDeleting) return
     setDocumentToDelete(null)
+    setBulkDeleteOpen(false)
     setDeleteError('')
     window.setTimeout(() => deleteTriggerRef.current?.focus(), 0)
   }
 
   const confirmDelete = async () => {
-    if (!documentToDelete || isDeleting) return
+    if (isDeleting) return
     setIsDeleting(true)
     setDeleteError('')
     try {
-      await removeDocument(documentToDelete.id)
-      setDocumentToDelete(null)
+      if (bulkDeleteOpen) {
+        const targets = selectedDocumentIds.filter(id => visibleDocumentIdSet.has(id))
+        const failedIds: string[] = []
+        for (const id of targets) {
+          try {
+            await removeDocument(id)
+          } catch {
+            failedIds.push(id)
+          }
+        }
+        setSelectedDocumentIds(failedIds)
+        if (failedIds.length > 0) {
+          const deletedCount = targets.length - failedIds.length
+          setDeleteError(deletedCount > 0 ? `${deletedCount} deleted. ${failedIds.length} could not be deleted.` : 'Unable to delete the selected documents. Please try again.')
+          return
+        }
+        setBulkDeleteOpen(false)
+      } else if (documentToDelete) {
+        await removeDocument(documentToDelete.id)
+        setDocumentToDelete(null)
+      }
     } catch (error) {
       setDeleteError(error instanceof Error && error.message ? error.message : 'Unable to delete the document. Please try again.')
     } finally {
@@ -87,21 +146,34 @@ export default function LibraryPage({ onUpload }: { onUpload: () => void }) {
         <NewMenu onUpload={onUpload} />
       </div>
 
-      <div className="hidden grid-cols-[minmax(0,1fr)_150px_110px_44px] gap-3 border-b border-[#e6ecf5] px-3 pb-2 text-[10px] font-semibold uppercase tracking-[.08em] text-slate-400 sm:grid"><span>Name</span><span>Modified</span><span>Size</span><span /></div>
+      {selectedVisibleCount > 0 && <div className="mb-2 flex min-h-11 items-center gap-3 rounded-xl border border-blue-100 bg-blue-50/70 px-3 text-[12px] font-semibold text-slate-700">
+        <input ref={toolbarSelectAllRef} type="checkbox" checked={allVisibleSelected} onChange={event => toggleAllVisibleDocuments(event.currentTarget.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label="Select all documents" />
+        <span className="min-w-0 flex-1">{selectedVisibleCount} selected</span>
+        <button type="button" disabled={isDeleting} onClick={requestBulkDelete} className="grid h-8 w-8 place-items-center rounded-lg text-slate-500 hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50" aria-label="Delete selected documents"><Trash2 size={15} /></button>
+      </div>}
+
+      <div className="hidden grid-cols-[28px_minmax(0,1fr)_150px_110px_44px] gap-3 border-b border-[#e6ecf5] px-3 pb-2 text-[10px] font-semibold uppercase tracking-[.08em] text-slate-400 sm:grid">
+        <input ref={headerSelectAllRef} type="checkbox" checked={allVisibleSelected} disabled={!filtered.length} onChange={event => toggleAllVisibleDocuments(event.currentTarget.checked)} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 disabled:opacity-40" aria-label="Select all documents" />
+        <span>Name</span><span>Modified</span><span>Size</span><span />
+      </div>
       <div className="mt-2 space-y-2">
-        {filtered.map(document => <article key={document.id} className="relative grid gap-2 rounded-2xl border border-[#eef2f7] bg-white p-3 shadow-[0_5px_18px_rgba(37,99,235,.04)] transition hover:-translate-y-0.5 hover:border-blue-100 hover:shadow-[0_8px_24px_rgba(37,99,235,.07)] sm:grid-cols-[minmax(0,1fr)_150px_110px_44px] sm:items-center sm:gap-3">
-          <button type="button" onClick={() => setSelectedDocument(document)} className="flex min-w-0 items-center gap-3 text-left">
-            <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-600"><FileText size={18} /></span>
-            <span className="min-w-0"><span className="block truncate text-[12px] font-semibold text-slate-800">{document.name}</span><span className="mt-0.5 block text-[10px] text-slate-400 sm:hidden">{relativeDate(document.updatedAt)} · {document.size}</span></span>
-          </button>
-          <span className="hidden text-[11px] text-slate-500 sm:block">{relativeDate(document.updatedAt)}</span>
-          <span className="hidden text-[11px] text-slate-500 sm:block">{document.size}</span>
-          <button type="button" disabled={isDeleting && documentToDelete?.id === document.id} onClick={event => requestDelete(document, event)} className="absolute right-6 mt-1 grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-50 sm:static sm:mt-0" aria-label={`Delete ${document.name}`}><Trash2 size={14} /></button>
-        </article>)}
+        {filtered.map(document => {
+          const isSelected = selectedDocumentIds.includes(document.id)
+          return <article key={document.id} className={`relative grid grid-cols-[28px_minmax(0,1fr)_44px] items-center gap-3 rounded-2xl border p-3 shadow-[0_5px_18px_rgba(37,99,235,.04)] transition hover:-translate-y-0.5 hover:border-blue-100 hover:shadow-[0_8px_24px_rgba(37,99,235,.07)] sm:grid-cols-[28px_minmax(0,1fr)_150px_110px_44px] ${isSelected ? 'border-blue-100 bg-blue-50/60' : 'border-[#eef2f7] bg-white'}`}>
+            <input type="checkbox" checked={isSelected} onChange={event => toggleDocumentSelection(document.id, event.currentTarget.checked)} onClick={event => event.stopPropagation()} className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" aria-label={`Select document ${document.name}`} />
+            <button type="button" onClick={() => setSelectedDocument(document)} className="flex min-w-0 items-center gap-3 text-left">
+              <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-600"><FileText size={18} /></span>
+              <span className="min-w-0"><span className="block truncate text-[12px] font-semibold text-slate-800">{document.name}</span><span className="mt-0.5 block text-[10px] text-slate-400 sm:hidden">{relativeDate(document.updatedAt)} - {document.size}</span></span>
+            </button>
+            <span className="hidden text-[11px] text-slate-500 sm:block">{relativeDate(document.updatedAt)}</span>
+            <span className="hidden text-[11px] text-slate-500 sm:block">{document.size}</span>
+            <button type="button" disabled={isDeleting && documentToDelete?.id === document.id} onClick={event => requestDelete(document, event)} className="grid h-8 w-8 place-items-center rounded-lg text-slate-400 hover:bg-red-50 hover:text-red-600 disabled:opacity-50" aria-label={`Delete ${document.name}`}><Trash2 size={14} /></button>
+          </article>
+        })}
         {!filtered.length && <div className="rounded-2xl border border-dashed border-[#d9e3f1] bg-white/60 px-4 py-16 text-center"><FileText className="mx-auto text-slate-300" size={28} /><p className="mt-3 text-[13px] font-semibold text-slate-600">No documents found.</p></div>}
       </div>
     </div>
-    <DocumentDeleteModal open={documentToDelete !== null} documentName={documentToDelete?.name ?? ''} isDeleting={isDeleting} error={deleteError} onCancel={cancelDelete} onConfirm={() => void confirmDelete()} />
+    <DocumentDeleteModal open={documentToDelete !== null || bulkDeleteOpen} documentName={documentToDelete?.name ?? ''} documentCount={bulkDeleteOpen ? selectedVisibleCount : undefined} isDeleting={isDeleting} error={deleteError} onCancel={cancelDelete} onConfirm={() => void confirmDelete()} />
   </section>
 }
 

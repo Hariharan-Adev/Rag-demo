@@ -73,6 +73,10 @@ class VectorStore(ABC):
         """Return active point payloads for operational reconciliation."""
         return {}
 
+    def delete_points(self, point_ids: list[str]) -> int:
+        """Physically remove explicitly confirmed point IDs when the provider supports it."""
+        return 0
+
     @abstractmethod
     def search(
         self,
@@ -339,6 +343,23 @@ class QdrantVectorStore(VectorStore):
             if should_close:
                 client.close()
 
+    def delete_points(self, point_ids: list[str]) -> int:
+        """Delete only explicit point IDs after the repair workflow has revalidated them."""
+        point_ids = sorted(set(point_ids))
+        if not point_ids:
+            return 0
+        client, should_close = self._open_client()
+        try:
+            client.delete(
+                collection_name=self.collection,
+                points_selector=self.models.PointIdsList(points=point_ids),
+                wait=True,
+            )
+            return len(point_ids)
+        finally:
+            if should_close:
+                client.close()
+
     def search(
         self,
         vector: list[float],
@@ -577,6 +598,8 @@ class QdrantVectorStore(VectorStore):
             "mode": self.mode,
             "collection": self.collection,
             "points_count": collection.points_count,
+            # Keep the older field while making its all-history meaning explicit.
+            "total_points": collection.points_count,
             "vector_size": getattr(collection.config.params.vectors, "size", None),
             "payload_indexes": sorted((collection.payload_schema or {}).keys()),
             "status": "ok",
@@ -804,11 +827,15 @@ class SQLiteVectorStore(VectorStore):
                 """SELECT COUNT(*) FROM chunks
                    WHERE embedding IS NOT NULL AND deleted_at IS NULL"""
             ).fetchone()[0])
+            total = int(connection.execute(
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL"
+            ).fetchone()[0])
         return {
             "provider": "sqlite",
             "mode": "rollback",
             "collection": "chunks.embedding",
             "points_count": count,
+            "total_points": total,
             "status": "ok",
         }
 
@@ -840,3 +867,48 @@ def reset_vector_store_for_tests() -> None:
     global _store
     with _store_lock:
         _store = None
+
+
+def _current_sqlite_vector_point_ids() -> set[str]:
+    """Return vector IDs backed by current, completed, non-deleted SQLite chunks."""
+    from app.database import get_connection
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """SELECT c.vector_point_id
+               FROM chunks c
+               JOIN documents d
+                 ON d.id = c.document_id
+                AND d.organization_id = c.organization_id
+               JOIN document_versions dv
+                 ON dv.id = c.version_id
+                AND dv.document_id = d.id
+                AND dv.organization_id = d.organization_id
+               WHERE c.vector_point_id IS NOT NULL
+                 AND c.deleted_at IS NULL
+                 AND d.deleted_at IS NULL
+                 AND d.current_version_id = c.version_id
+                 AND d.processing_status = 'completed'
+                 AND dv.status = 'completed'
+                 AND dv.deleted_at IS NULL"""
+        ).fetchall()
+    return {str(row["vector_point_id"]) for row in rows}
+
+
+def vector_store_statistics(store: VectorStore | None = None) -> dict[str, object]:
+    """Report stored versus current vector counts without returning document data."""
+    store = store or get_vector_store()
+    status = store.health()
+    total_points = int(status.get("total_points", status.get("points_count", 0)) or 0)
+    provider_active_ids = set(store.list_active_points())
+    sqlite_current_ids = _current_sqlite_vector_point_ids()
+    active_points = len(provider_active_ids & sqlite_current_ids)
+    missing_current = sqlite_current_ids - provider_active_ids
+    stale_provider = provider_active_ids - sqlite_current_ids
+    return {
+        "total_points": total_points,
+        "active_points": active_points,
+        "deleted_or_stale_points": max(total_points - active_points, 0),
+        "sqlite_current_chunks": len(sqlite_current_ids),
+        "sync_status": "in_sync" if not missing_current and not stale_provider else "out_of_sync",
+    }

@@ -1,0 +1,131 @@
+[
+  {
+    "id": "factual_lookup_policy_owner",
+    "category": "factual_lookup",
+    "query": "What does the policy say about document ownership?",
+    "expected_route": "unstructured",
+    "expected_document": {
+      "filename": "policy-handbook.pdf"
+    },
+    "expected_answer_facts": [
+      "documents remain owned by the uploader"
+    ],
+    "expected_unavailable": false,
+    "expected_keywords": [
+      "ownership",
+      "uploader"
+    ]
+  },
+  {
+    "id": "exact_name_lookup_employee",
+    "category": "exact_name_lookup",
+    "query": "Show the record for Jordan Lee.",
+    "expected_route": "structured",
+    "expected_document": {
+      "filename": "employee-directory.xlsx"
+    },
+    "expected_answer_facts": [
+      "Jordan Lee"
+    ],
+    "expected_unavailable": false,
+    "expected_keywords": [
+      "Jordan Lee"
+    ]
+  },
+  {
+    "id": "exact_number_lookup_rating",
+    "category": "exact_number_lookup",
+    "query": "What score means meets expectations?",
+    "expected_route": "structured",
+    "expected_document": {
+      "filename": "performance-scale.xlsx"
+    },
+    "expected_answer_facts": [
+      "3"
+    ],
+    "expected_unavailable": false,
+    "expected_source_ids": {
+      "document_id": 1601
+    },
+    "expected_keywords": [
+      "meets expectations"
+    ]
+  },
+  {
+    "id": "workbook_lookup_objectives_percentage",
+    "category": "workbook_lookup",
+    "query": "What is the objectives percentage for meets expectations?",
+    "expected_route": "structured",
+    "expected_document": {
+      "filename": "performance-scale.xlsx"
+    },
+    "expected_answer_facts": [
+      "0.5"
+    ],
+    "expected_unavailable": false,
+    "expected_keywords": [
+      "Objectives"
+    ]
+  },
+  {
+    "id": "aggregation_employee_count",
+    "category": "aggregation",
+    "query": "How many employee attendance records are present?",
+    "expected_route": "structured",
+    "expected_document": {
+      "filename": "attendance-register.xlsx"
+    },
+    "expected_answer_facts": [
+      "12"
+    ],
+    "expected_unavailable": false
+  },
+  {
+    "id": "comparison_plan_models",
+    "category": "comparison",
+    "query": "Compare Model A and Model B rejection counts.",
+    "expected_route": "structured",
+    "expected_document": {
+      "filename": "final-inspection.xlsx"
+    },
+    "expected_answer_facts": [
+      "Model A",
+      "Model B"
+    ],
+    "expected_unavailable": false,
+    "expected_keywords": [
+      "rejection"
+    ]
+  },
+  {
+    "id": "ambiguous_source_attendance",
+    "category": "ambiguous_source",
+    "query": "What does the attendance file say?",
+    "expected_route": "clarification",
+    "expected_document": null,
+    "expected_answer_facts": [],
+    "expected_unavailable": false
+  },
+  {
+    "id": "unanswerable_salary_policy",
+    "category": "unanswerable_query",
+    "query": "What is the CEO salary in the uploaded files?",
+    "expected_route": "unavailable",
+    "expected_document": null,
+    "expected_answer_facts": [],
+    "expected_unavailable": true
+  },
+  {
+    "id": "follow_up_name_them",
+    "category": "follow_up_query",
+    "query": "Name them.",
+    "expected_route": "follow_up",
+    "expected_document": {
+      "filename": "attendance-register.xlsx"
+    },
+    "expected_answer_facts": [
+      "prior grounded result"
+    ],
+    "expected_unavailable": false
+  }
+]

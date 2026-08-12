@@ -68,10 +68,27 @@ class Settings(BaseSettings):
     embedding_dimension: int = 384
     embedding_batch_size: int = 64
     embedding_model_version: str = "all-MiniLM-L6-v2"
+    embedding_model_load_timeout_seconds: float = Field(default=60.0, ge=1.0, le=600.0)
+    chat_follow_up_context_minutes: int = Field(default=30, ge=1, le=360)
     rag_retrieval_limit: int = Field(default=15, ge=1, le=100)
     rag_final_context_limit: int = Field(default=5, ge=1, le=20)
-    rag_min_score: float = Field(default=0.35, ge=-1.0, le=1.0)
+    rag_final_context_token_budget: int = Field(default=6000, ge=256, le=32000)
+    rag_complementary_context_limit: int = Field(default=3, ge=1, le=10)
+    rag_complementary_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
+    rag_neighbor_expansion_min_score: float = Field(default=0.50, ge=0.0)
+    rag_neighbor_expansion_max_neighbors: int = Field(default=2, ge=0, le=4)
+    # A weak-evidence floor for vector candidates; source evidence still decides grounding.
+    rag_min_score: float = Field(default=0.30, ge=-1.0, le=1.0)
+    rag_retrieval_mode: str = "hybrid"
+    rag_vector_candidate_limit: int = Field(default=30, ge=1, le=200)
+    rag_keyword_candidate_limit: int = Field(default=30, ge=1, le=200)
+    rag_rrf_k: int = Field(default=60, ge=1, le=1000)
     rag_structured_result_limit: int = Field(default=100, ge=1, le=1000)
+    rag_diagnostics_enabled: bool = False
+    embedded_ocr_max_images_per_document: int = Field(default=25, ge=0, le=500)
+    embedded_ocr_max_images_per_page: int = Field(default=5, ge=0, le=100)
+    embedded_ocr_max_pixels: int = Field(default=16_000_000, ge=1, le=100_000_000)
+    embedded_ocr_max_decoded_bytes: int = Field(default=20_000_000, ge=1, le=200_000_000)
     opensearch_url: str = ""
     opensearch_username: str = ""
     opensearch_password: str = ""

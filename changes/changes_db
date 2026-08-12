@@ -502,3 +502,23 @@ removed. Audit events are retained.
   Qdrant, or `TemporaryDirectory()`-backed Qdrant local storage only.
 - The vector-store singleton reset change affects only cached in-process test
   state and does not alter persisted database data.
+
+## Local hybrid retrieval DB note - 2026-08-10
+
+- Date: 2026-08-10.
+- Task name: Add keyword/BM25 retrieval alongside vector search.
+- Affected files: `changes/changes_db` only; no database migration files changed.
+- What changed: no persistence schema, indexes, triggers, or production records were changed. Keyword scoring reads the existing authorized `chunks`, `documents`, and `document_versions` data.
+- Why: the lightweight lexical path can use current local data without a separate search service or duplicate index.
+- Validation performed: temporary-database integration tests verified private-document ACL, soft deletion, and non-completed current-version exclusion.
+- Known limitations: keyword scoring is query-time computation over eligible local chunks; it does not create a persistent full-text index.
+
+## Confirmed orphan Qdrant point repair - 2026-08-10
+
+- Date: 2026-08-10.
+- Task name: Remove confirmed stale local-Qdrant points.
+- Affected files: changes/changes_db; no SQLite schema or migration changed.
+- What changed: physically removed Qdrant point IDs 5e6a91d4-dc43-539e-bd0f-1d275db56d2b and 64edf488-6065-5ec8-9292-f84d31b3bc4c after a dry-run verified that each had no same-organization SQLite chunk, no active/current equivalent, and no active ingestion job.
+- Why: both legacy/default-organization points remained marked active even though their matching SQLite lifecycle records had been soft-deleted under a different organization and their current vector IDs had changed.
+- Validation performed: before: 95 active SQLite chunks and 97 active vectors with two named orphans. After: 95 active SQLite chunks and 95 active vectors; zero orphan, missing, duplicate, wrong-version, or deleted-document active vectors.
+- Known limitations: this was a point-ID-only repair; no SQLite records, schemas, ACLs, document contents, or valid vectors were changed.

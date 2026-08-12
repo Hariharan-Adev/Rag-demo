@@ -4,19 +4,22 @@ import { useEffect, useId, useRef } from 'react'
 
 interface DocumentDeleteModalProps {
   open: boolean
-  documentName: string
+  documentName?: string
+  documentCount?: number
   isDeleting: boolean
   error: string
   onCancel: () => void
   onConfirm: () => void
 }
 
-export default function DocumentDeleteModal({ open, documentName, isDeleting, error, onCancel, onConfirm }: DocumentDeleteModalProps) {
+export default function DocumentDeleteModal({ open, documentName = '', documentCount, isDeleting, error, onCancel, onConfirm }: DocumentDeleteModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null)
   const cancelButtonRef = useRef<HTMLButtonElement>(null)
   const titleId = useId()
   const descriptionId = useId()
   const reducedMotion = useReducedMotion()
+  const isBulkDelete = typeof documentCount === 'number'
+  const title = isBulkDelete ? (documentCount === 1 ? 'Delete this document?' : `Delete ${documentCount} documents?`) : 'Delete document?'
 
   useEffect(() => {
     if (!open) return
@@ -77,9 +80,9 @@ export default function DocumentDeleteModal({ open, documentName, isDeleting, er
             <div className="grid h-[42px] w-[42px] place-items-center rounded-xl bg-[#fef2f2] text-[#dc2626]">
               <Trash2 size={20} />
             </div>
-            <h2 id={titleId} className="mt-3.5 text-[18px] font-bold tracking-[-.02em] text-slate-900">Delete document?</h2>
+            <h2 id={titleId} className="mt-3.5 text-[18px] font-bold tracking-[-.02em] text-slate-900">{title}</h2>
             <div id={descriptionId} className="mt-2 text-[14px] leading-[1.6] text-slate-500">
-              <p>Are you sure you want to delete <strong className="font-semibold text-slate-900 [overflow-wrap:anywhere]">“{documentName}”</strong>?</p>
+              {!isBulkDelete && <p>Are you sure you want to delete <strong className="font-semibold text-slate-900 [overflow-wrap:anywhere]">"{documentName}"</strong>?</p>}
               <p className="mt-2">This action cannot be undone.</p>
             </div>
 

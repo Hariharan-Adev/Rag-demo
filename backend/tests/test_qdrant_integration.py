@@ -158,6 +158,11 @@ class QdrantIntegrationTests(unittest.TestCase):
                 "status": "healthy",
                 "database": "connected",
                 "qdrant": "connected",
+                "embedding": {
+                    "status": "uninitialized",
+                    "loaded": False,
+                    "error_type": None,
+                },
             })
 
     def test_upload_indexes_chunks(self) -> None:
@@ -187,6 +192,24 @@ class QdrantIntegrationTests(unittest.TestCase):
             consistency["sqlite_indexed_chunks"],
             consistency["vector_store_active_points"],
         )
+
+    def test_readiness_distinguishes_total_and_current_vector_points(self) -> None:
+        """Soft-deleted Qdrant points remain stored but are never reported active."""
+        accepted = self._upload()
+        before_delete = self.client.get("/health/ready").json()["vector_store"]
+        self.assertEqual(before_delete["total_points"], 3)
+        self.assertEqual(before_delete["active_points"], 3)
+        self.assertEqual(before_delete["deleted_or_stale_points"], 0)
+        self.assertEqual(before_delete["sqlite_current_chunks"], 3)
+        self.assertEqual(before_delete["sync_status"], "in_sync")
+
+        self.assertEqual(self.client.delete(f"/documents/{accepted['document_id']}").status_code, 200)
+        after_delete = self.client.get("/health/ready").json()["vector_store"]
+        self.assertEqual(after_delete["total_points"], 3)
+        self.assertEqual(after_delete["active_points"], 0)
+        self.assertEqual(after_delete["deleted_or_stale_points"], 3)
+        self.assertEqual(after_delete["sqlite_current_chunks"], 0)
+        self.assertEqual(after_delete["sync_status"], "in_sync")
 
     def test_search_returns_relevant_chunk(self) -> None:
         """A known question should retrieve its source chunk."""

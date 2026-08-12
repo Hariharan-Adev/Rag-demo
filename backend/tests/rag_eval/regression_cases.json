@@ -1,0 +1,244 @@
+[
+  {
+    "id": "multi_tab_inventory_lookup",
+    "pattern": "workbook_multi_tab",
+    "fixture": "multi_tab_inventory",
+    "query": "How many inventory records are there across all tabs?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["inventory.xlsx"],
+      "sheets": ["North", "South"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Count: 3"]
+    }
+  },
+  {
+    "id": "exact_person_name_lookup",
+    "pattern": "exact_name_lookup",
+    "fixture": "people_profiles",
+    "query": "What is Ravi's role?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["people-profiles.xlsx"],
+      "sheets": ["Ravi"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Ravi", "Data Engineer"],
+      "excluded_facts": ["Product Designer", "QA Analyst"]
+    }
+  },
+  {
+    "id": "generic_record_count",
+    "pattern": "count",
+    "fixture": "project_roster",
+    "query": "How many active projects are there?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["project-roster.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Count: 2"]
+    }
+  },
+  {
+    "id": "generic_percentage_aggregation",
+    "pattern": "percentage",
+    "fixture": "campaign_metrics",
+    "query": "What is the average completion rate?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["campaign-metrics.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Average Completion Rate: 75"]
+    }
+  },
+  {
+    "id": "generic_numeric_range",
+    "pattern": "numeric_range",
+    "fixture": "agriculture_csv",
+    "query": "Show equipment priced between 50000 and 200000.",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["agriculture_dataset.csv"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Power Tiller", "Irrigation Pump", "Harvester"],
+      "excluded_facts": ["Tractor", "Agricultural Drone"]
+    }
+  },
+  {
+    "id": "generic_exact_value_lookup",
+    "pattern": "exact_value_lookup",
+    "fixture": "agriculture_csv",
+    "query": "What is the price of Irrigation Pump?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["agriculture_dataset.csv"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["75000"]
+    }
+  },
+  {
+    "id": "named_workbook_source_scope",
+    "pattern": "source_specific",
+    "fixture": "source_specific_workbooks",
+    "query": "How many attendance records are in attendance-summary.xlsx?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["attendance-summary.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Count: 2"],
+      "excluded_facts": ["Gear"]
+    }
+  },
+  {
+    "id": "missing_fact_is_unavailable",
+    "pattern": "unanswerable",
+    "fixture": "multi_tab_inventory",
+    "query": "What is the chief executive salary?",
+    "expected_retrieval": {
+      "route": "unavailable",
+      "documents": []
+    },
+    "expected_answer": {
+      "grounded": false,
+      "unavailable": true,
+      "facts": []
+    }
+  },
+  {
+    "id": "follow_up_name_them",
+    "pattern": "follow_up",
+    "fixture": "project_roster",
+    "prior_turns": [
+      {
+        "query": "How many active projects are there?",
+        "expected_facts": ["Count: 2"],
+        "expected_documents": ["project-roster.xlsx"]
+      }
+    ],
+    "query": "name them",
+    "expected_retrieval": {
+      "route": "follow_up",
+      "documents": ["project-roster.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["P-100", "P-200"],
+      "excluded_facts": ["P-300"]
+    }
+  },
+  {
+    "id": "follow_up_other_ones",
+    "pattern": "follow_up",
+    "fixture": "people_profiles",
+    "prior_turns": [
+      {
+        "query": "Compare Asha and Ravi.",
+        "expected_facts": ["Asha", "Ravi"],
+        "expected_documents": ["people-profiles.xlsx"]
+      }
+    ],
+    "query": "what about the other ones?",
+    "expected_retrieval": {
+      "route": "follow_up",
+      "documents": ["people-profiles.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Mei", "QA Analyst"],
+      "excluded_facts": ["Asha", "Ravi"]
+    }
+  },
+  {
+    "id": "follow_up_show_those",
+    "pattern": "follow_up",
+    "fixture": "agriculture_csv",
+    "prior_turns": [
+      {
+        "query": "How many equipment records are priced between 50000 and 200000?",
+        "expected_facts": ["3"],
+        "expected_documents": ["agriculture_dataset.csv"]
+      }
+    ],
+    "query": "show those",
+    "expected_retrieval": {
+      "route": "follow_up",
+      "documents": ["agriculture_dataset.csv"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["Power Tiller", "Irrigation Pump", "Harvester"],
+      "excluded_facts": ["Tractor", "Agricultural Drone"]
+    }
+  },
+  {
+    "id": "follow_up_without_context_stays_local",
+    "pattern": "missing_follow_up_context",
+    "fixture": "agriculture_csv",
+    "query": "show those",
+    "expected_retrieval": {
+      "route": "unavailable",
+      "documents": [],
+      "forbid_global_search": true
+    },
+    "expected_answer": {
+      "grounded": false,
+      "unavailable": true,
+      "facts": []
+    }
+  },
+  {
+    "id": "multiple_workbook_schema_selection",
+    "pattern": "multiple_workbooks",
+    "fixture": "catalog_and_ledger",
+    "query": "What is the total amount for March?",
+    "expected_retrieval": {
+      "route": "structured",
+      "documents": ["ledger.xlsx"]
+    },
+    "expected_answer": {
+      "grounded": true,
+      "unavailable": false,
+      "facts": ["25"],
+      "excluded_facts": ["Alpha"]
+    }
+  },
+  {
+    "id": "ambiguous_workbook_requires_selection",
+    "pattern": "ambiguous_workbook",
+    "fixture": "ambiguous_budgets",
+    "query": "What is the total amount?",
+    "expected_retrieval": {
+      "route": "clarification",
+      "documents": []
+    },
+    "expected_answer": {
+      "grounded": false,
+      "unavailable": false,
+      "facts": [],
+      "question_type": "clarification"
+    }
+  }
+]

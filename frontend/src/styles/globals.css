@@ -177,9 +177,14 @@
   .markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { @apply mb-2 mt-5 font-semibold leading-tight text-slate-900 first:mt-0; }
   .markdown-content h1 { @apply text-xl; }
   .markdown-content h2 { @apply text-lg; }
-  .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6 { @apply text-base; }
+  .markdown-content h3 { @apply border-t border-slate-200 pt-5 text-[17px] first:border-t-0 first:pt-0; }
+  .markdown-content h4, .markdown-content h5, .markdown-content h6 { @apply text-base; }
   .markdown-content ul { @apply my-3 list-disc space-y-1 pl-5; }
   .markdown-content ol { @apply my-3 list-decimal space-y-1 pl-5; }
+  .markdown-content ol > li { @apply my-5 pl-2; }
+  .markdown-content ol > li::marker { @apply font-semibold text-blue-600; }
+  .markdown-content li > ul { @apply mt-2; }
+  .markdown-content strong { @apply font-semibold text-slate-950; }
   .markdown-content a { @apply text-blue-600 underline decoration-blue-200 underline-offset-2 hover:text-blue-700; }
   .markdown-content :not(pre) > code { @apply rounded-md bg-slate-100 px-1.5 py-0.5 font-mono text-[12px] text-slate-800; }
   .markdown-content pre { @apply my-4 max-w-full overflow-x-auto rounded-xl bg-slate-900 p-4 text-slate-100; }

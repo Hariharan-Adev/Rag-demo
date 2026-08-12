@@ -108,6 +108,67 @@ class RagRetrievalPolicyTests(unittest.TestCase):
             "Information not available in the uploaded files.",
         )
 
+    def test_irrelevant_retrieved_context_never_reaches_answer_generation(self) -> None:
+        """A citable chunk still needs query relevance before it can ground an answer."""
+        source = {
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "weather-notes.txt",
+            "content": "The forecast predicts rain and wind through Friday.",
+            "source_type": "text",
+            "source_location": {"line_start": 1, "line_end": 1},
+            "score": 0.10,
+        }
+        with patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval", document_id=12, sources=[source]
+            ),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            side_effect=AssertionError("irrelevant context must not reach the model"),
+        ), patch(
+            "app.services.rag_service.log_audit_event",
+        ):
+            result = answer_question("What is the employee bonus amount?", 7)
+
+        self.assertEqual(result["answer"], UNAVAILABLE_ANSWER)
+        self.assertFalse(result["grounded"])
+        self.assertEqual(result["sources"], [])
+
+    def test_uncitable_retrieved_context_never_reaches_answer_generation(self) -> None:
+        """Missing version provenance cannot be repaired by a model response."""
+        source = {
+            "document_id": 12,
+            "filename": "bonus.txt",
+            "content": "The employee bonus amount is 500.",
+            "source_type": "text",
+            "source_location": {"line_start": 1, "line_end": 1},
+            "score": 0.91,
+        }
+        with patch(
+            "app.services.rag_service.is_analytical_question",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.select_sources",
+            return_value=SelectionResult(
+                path="retrieval", document_id=12, sources=[source]
+            ),
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            side_effect=AssertionError("uncitable context must not reach the model"),
+        ), patch(
+            "app.services.rag_service.log_audit_event",
+        ):
+            result = answer_question("What is the employee bonus amount?", 7)
+
+        self.assertEqual(result["answer"], UNAVAILABLE_ANSWER)
+        self.assertFalse(result["grounded"])
+        self.assertEqual(result["sources"], [])
+
     def test_chat_retrieves_candidates_then_limits_grounded_context(self) -> None:
         candidates = [
             {
@@ -346,3 +407,55 @@ class RagRetrievalPolicyTests(unittest.TestCase):
         self.assertEqual(result["sources"], [])
         self.assertFalse(result["grounded"])
         self.assertNotRegex(result["answer"].casefold(), r"select|type.*file|filename")
+
+    def test_unstructured_follow_up_retrieves_inside_prior_document(self) -> None:
+        candidate = {
+            "chunk_id": 501,
+            "content_id": 50,
+            "document_id": 12,
+            "version_id": 34,
+            "filename": "UARD-Hunt-BMT.docx",
+            "content": "SAB change request items include approval workflow and export validation.",
+            "source_type": "word",
+            "source_location": {"paragraph_start": 11, "paragraph_end": 11},
+            "score": 0.42,
+        }
+        calls = []
+
+        def searcher(*args, **kwargs):
+            calls.append(kwargs)
+            return [candidate]
+
+        with patch(
+            "app.services.rag_service.scoped_unstructured_follow_up_document",
+            return_value=(12, 34),
+        ), patch(
+            "app.services.rag_service.has_structured_workbook",
+            return_value=False,
+        ), patch(
+            "app.services.rag_service.search_chunks",
+            side_effect=searcher,
+        ), patch(
+            "app.services.rag_service.generate_answer",
+            return_value={
+                "answer": "SAB change request items include approval workflow and export validation.",
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        ), patch(
+            "app.services.rag_service.reserve_groq_call"
+        ), patch(
+            "app.services.rag_service.record_groq_tokens"
+        ), patch(
+            "app.services.rag_service.log_audit_event"
+        ):
+            result = answer_question(
+                "Change Request Items: in SAB",
+                7,
+                conversation_id="bmt-chat",
+            )
+
+        self.assertTrue(result["grounded"])
+        self.assertEqual(calls[0]["document_id"], 12)
+        self.assertEqual(calls[0]["version_id"], 34)
+        self.assertEqual(result["sources"][0]["filename"], "UARD-Hunt-BMT.docx")

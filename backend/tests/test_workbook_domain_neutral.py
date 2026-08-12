@@ -556,10 +556,105 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
 
         self.assertTrue(answer["grounded"])
         self.assertEqual(answer["question_type"], "structured_analysis")
-        self.assertEqual(answer["answer"], f"Business Analyst: {responsibilities}")
+        self.assertIn("Keerthana", answer["answer"])
+        self.assertIn("Role: Business Analyst", answer["answer"])
+        self.assertIn(responsibilities, answer["answer"])
         self.assertNotIn("Matching records", answer["answer"])
         self.assertNotIn("Source", answer["answer"])
         self.assertEqual(answer["sources"][0]["source_location"]["sheet_name"], "Keerthana")
+
+        with database.get_connection() as connection:
+            content = connection.execute(
+                "SELECT content_id FROM documents WHERE id = ?",
+                (int(result["document_id"]),),
+            ).fetchone()
+            row = connection.execute(
+                """SELECT ws.headers_json, wr.values_json
+                   FROM workbook_sheets ws
+                   JOIN workbook_rows wr ON wr.sheet_id = ws.id
+                   WHERE ws.content_id = ?""",
+                (int(content["content_id"]),),
+            ).fetchone()
+        self.assertIn("Employee", row["headers_json"])
+        self.assertIn("Expected Responsibilities", row["headers_json"])
+        self.assertNotIn("Column 1", row["headers_json"])
+        self.assertNotIn("Pick from list", row["values_json"])
+
+    def test_employee_skill_comparison_uses_all_profile_sheets(self) -> None:
+        result = self.upload_workbook(
+            [
+                ("Keerthana", [["Role", "Business Analyst", "Pick from list"], ["Experience Level", "Junior"], ["Primary Skills", "BRD/FRD * UAT coordination"], ["Secondary Skills", "SQL"]], "visible"),
+                ("Sandhiya", [["Role", "UI/UX Designer", "Pick from list"], ["Experience Level", "Mid"], ["Primary Skills", "Wireframes; React"], ["Secondary Skills", "Figma"]], "visible"),
+                ("Kirubba", [["Role", "Developer"], ["Experience Level", "Junior"], ["Primary Skills", "Python"], ["Secondary Skills", "FastAPI"]], "visible"),
+                ("Bathmaraj", [["Role", "DevOps Engineer"], ["Experience Level", "Senior"], ["Primary Skills", "CI/CD"], ["Secondary Skills", "Azure"]], "visible"),
+                ("Aparna", [["Role", "QA Analyst"], ["Experience Level", "Mid"], ["Primary Skills", "Test planning"], ["Secondary Skills", "Automation"]], "visible"),
+                ("Hari", [["Role", "Data Analyst"], ["Experience Level", "Senior"], ["Primary Skills", "Dashboards"], ["Secondary Skills", "SQL"]], "visible"),
+                ("Nandhini", [["Role", "QA Associate"], ["Experience Level", "Mid"], ["Primary Skills", "1. Manual testing 2.Regression testing 3.5+ years in QA"], ["Secondary Skills", "1.Mentoring 2. Knowledge sharing"]], "visible"),
+            ],
+            "Employee Skill Matrix (1).xlsx",
+        )
+
+        answer = answer_question(
+            "compare skills of all employees in skill matrix",
+            1,
+            document_id=int(result["document_id"]),
+            conversation_id="skill-chat",
+        )
+
+        self.assertTrue(answer["grounded"])
+        self.assertEqual(answer["question_type"], "structured_analysis")
+        for name in ("Keerthana", "Sandhiya", "Kirubba", "Bathmaraj", "Aparna", "Hari", "Nandhini"):
+            self.assertIn(name, answer["answer"])
+        self.assertIn("1. **Keerthana**", answer["answer"])
+        self.assertIn("7. **Nandhini**", answer["answer"])
+        self.assertIn("**Primary skills**", answer["answer"])
+        self.assertIn("**Secondary skills**", answer["answer"])
+        self.assertIn("- BRD/FRD", answer["answer"])
+        self.assertIn("- UAT coordination", answer["answer"])
+        self.assertIn("- Manual testing", answer["answer"])
+        self.assertIn("- Regression testing", answer["answer"])
+        self.assertIn("- Regression testing 3.5+ years in QA", answer["answer"])
+        self.assertNotIn("- 5+ years in QA", answer["answer"])
+        self.assertNotRegex(answer["answer"], r"-\s+\d+\.")
+        self.assertNotIn("1. Manual testing 2.Regression testing", answer["answer"])
+        self.assertNotIn(" more", answer["answer"])
+        self.assertNotIn("| Employee | Role | Experience | Primary skills | Secondary skills |", answer["answer"])
+        self.assertNotIn("Role:", answer["answer"])
+        self.assertNotIn("Experience:", answer["answer"])
+
+    def test_employee_name_fuzzy_matching_and_follow_up_stay_structured(self) -> None:
+        result = self.upload_workbook(
+            [
+                ("Sandhiya", [["Role", "UI/UX Designer"], ["Primary Skills", "Wireframes"]], "visible"),
+                ("Kirubba", [["Role", "Developer"], ["Primary Skills", "Python"]], "visible"),
+                ("Bathmaraj", [["Role", "DevOps Engineer"], ["Primary Skills", "CI/CD"]], "visible"),
+                ("Aparna", [["Role", "QA Analyst"], ["Primary Skills", "Test planning"]], "visible"),
+            ],
+            "Employee Skill Matrix (1).xlsx",
+        )
+
+        first = answer_question(
+            "compare skills of Sandhiya and Aparna",
+            1,
+            document_id=int(result["document_id"]),
+            conversation_id="employee-followup",
+        )
+        follow_up = answer_question(
+            "what about Sandhiya, Kiruba, Bathmaraj?",
+            1,
+            conversation_id="employee-followup",
+        )
+
+        self.assertTrue(first["grounded"])
+        self.assertTrue(follow_up["grounded"])
+        self.assertEqual(follow_up["question_type"], "follow_up")
+        self.assertIn("1. **Sandhiya**", follow_up["answer"])
+        self.assertIn("Kirubba", follow_up["answer"])
+        self.assertIn("Bathmaraj", follow_up["answer"])
+        self.assertIn("**Primary skills**", follow_up["answer"])
+        self.assertNotIn("Aparna", follow_up["answer"])
+        self.assertNotIn("| Employee | Role | Experience |", follow_up["answer"])
+        self.assertNotIn("Role:", follow_up["answer"])
 
     def test_named_document_routes_before_mixed_semantic_search(self) -> None:
         attendance = self.upload_merged_attendance_workbook()
@@ -698,6 +793,47 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertEqual(location["row_start"], 2)
         self.assertEqual(location["row_end"], 3)
 
+    def test_rating_label_lookup_returns_score_from_exact_row(self) -> None:
+        result = self.upload_workbook(
+            [
+                (
+                    "Review",
+                    [
+                        [None, None, "Review Ratio", None, None, None, "Rating", "Rating Score", "Minimum", "Maximum"],
+                        [None, None, "Objective %", 0.5, None, None, "Unsatisfactory", 1, 0, 1.49],
+                        [None, None, "Competency %", 0.5, None, None, "Needs Improvement", 2, 1.5, 2.49],
+                        [None, None, None, None, None, None, "Meets Expectations", 3, 2.5, 3.49],
+                        [None, None, None, None, None, None, "Exceeds Expectations", 4, 3.5, 4.49],
+                        [None, None, None, None, None, None, "Exceptional", 5, 4.5, 5],
+                        [None, "Objectives", "Rating", "Rating Score", None, None, "Review summary", "AvgRatingScore", "Rating", "Ratio of Rating Score"],
+                        [None, "G1", "Meets Expectations", 3, None, None, "Objectives", 3.2, "Meets Expectations", 1.6],
+                        [None, "G2", "Exceptional", 5, None, None, "Competency", 1, "Unsatisfactory", 0.5],
+                        [None, "G3", "Unsatisfactory", 1, None, None, None, None, None, None],
+                        [None, "Competency", "Rating", "Rating Score", None, None, None, None, None, None],
+                        [None, "C1", "Unsatisfactory", 1, None, None, None, None, None, None],
+                    ],
+                    "visible",
+                )
+            ],
+            "Review_Calculation.xlsx",
+        )
+        document_id = int(result["document_id"])
+
+        objective = analyze_workbook_question("objectives percentage", 1, document_id=document_id)
+        unsatisfactory = analyze_workbook_question("unsatisfactory rating", 1, document_id=document_id)
+        meets = analyze_workbook_question("give me the meets expectation rating score", 1, document_id=document_id)
+        exceeds = analyze_workbook_question("give me the Exceeds Expectations rating score", 1, document_id=document_id)
+
+        self.assertIn("Objective %: 0.5", objective["answer"])
+        self.assertEqual(objective["sources"][0]["source_location"]["row_start"], 2)
+        self.assertIn("Rating Score: 1", unsatisfactory["answer"])
+        self.assertIn("Rating Score: 3", meets["answer"])
+        self.assertIn("Rating Score: 4", exceeds["answer"])
+        self.assertNotIn("Rating Score: Rating Score", unsatisfactory["answer"])
+        self.assertNotIn("Review summary: Objectives", meets["answer"])
+        self.assertEqual(meets["sources"][0]["source_location"]["row_start"], 4)
+        self.assertEqual(exceeds["sources"][0]["source_location"]["row_start"], 5)
+
     def test_unavailable_and_acl_isolation_have_no_sources(self) -> None:
         result = self.upload_workbook(
             [("Private", [["Reference", "Value"], ["SECRET", 500]], "visible")],
@@ -727,6 +863,28 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
 
         answer = answer_question("show them", 1, conversation_id="mismatch")
 
+        self.assertEqual(answer["sources"], [])
+
+    def test_invalid_provenance_row_reference_is_not_reused_for_follow_up(self) -> None:
+        """Persisted follow-up plans must stay inside their structured provenance range."""
+        uploaded = self.upload_workbook(
+            [("Ledger", [["Period", "Amount"], ["March", 25]], "visible")],
+            "ledger.xlsx",
+        )
+        result = analyze_workbook_question("What is the total amount for March?", 1, document_id=int(uploaded["document_id"]))
+        result["_context"]["row_refs"] = [{
+            "document_id": int(uploaded["document_id"]), "sheet": "Ledger", "row_number": 999,
+        }]
+        save_grounded_context(
+            owner_id=1,
+            conversation_id="invalid-provenance",
+            question="What is the total amount for March?",
+            result=result,
+        )
+
+        answer = answer_question("show those", 1, conversation_id="invalid-provenance")
+
+        self.assertFalse(answer["grounded"])
         self.assertEqual(answer["sources"], [])
 
     def test_reindex_preserves_vectors_and_sheet_locations(self) -> None:
@@ -770,6 +928,99 @@ class WorkbookDomainNeutralTests(unittest.TestCase):
         self.assertEqual(status.status, "completed")
         self.assertEqual(len(store.batches), 1)
         self.assertEqual(matches[0]["sheet_name"], "Final")
+
+    def test_complete_multitab_aggregations_do_not_use_vector_or_llm(self) -> None:
+        """All arithmetic uses complete persisted workbook rows across eligible tabs."""
+        result = self.upload_workbook(
+            [
+                ("January", [["Category", "Amount", "Rate"], ["Hardware", 10, "10%"], ["Software", 20, "20%"]], "visible"),
+                ("February", [["Category", "Amount", "Rate"], ["Hardware", 30, "30%"], ["Software", 40, "40%"]], "visible"),
+            ],
+            "metrics.xlsx",
+        )
+        document_id = int(result["document_id"])
+
+        cases = {
+            "How many records?": "Count: 4",
+            "How many distinct categories?": "Unique Category: 2",
+            "What is the total amount for Hardware?": "Total Amount: 40",
+            "What is the average rate?": "Average Rate: 25",
+            "What is the minimum amount?": "Minimum Amount: 10",
+            "What is the maximum amount?": "Maximum Amount: 40",
+            "What is the overall rate?": "Average Rate: 25",
+            "Group amount by category": "Hardware: 40",
+            "What is the total amount for February?": "Total Amount: 70",
+        }
+        for question, expected in cases.items():
+            with self.subTest(question=question):
+                answer = analyze_workbook_question(question, 1, document_id=document_id)
+                self.assertTrue(answer["grounded"])
+                self.assertIn(expected, answer["answer"])
+
+        with patch("app.services.rag_service.search_chunks", side_effect=AssertionError("must not vector search")), patch(
+            "app.services.rag_service.generate_answer", side_effect=AssertionError("must not call LLM")
+        ), patch("app.services.rag_service.log_audit_event"):
+            answer = answer_question("What is the total amount for February?", 1, document_id=document_id)
+        self.assertTrue(answer["grounded"])
+        self.assertIn("Total Amount: 70", answer["answer"])
+        self.assertEqual(
+            {source["source_location"]["sheet_name"] for source in answer["sources"]},
+            {"February"},
+        )
+
+    def test_structured_provenance_is_compact_and_explains_aggregation(self) -> None:
+        """Answers expose calculation provenance, never serialized worksheet row contents."""
+        result = self.upload_workbook(
+            [("April", [["Region", "Amount"], ["North", 12], ["South", 18]], "visible")],
+            "regional.xlsx",
+        )
+        answer = analyze_workbook_question("What is the total amount for North?", 1, document_id=int(result["document_id"]))
+
+        provenance = answer["provenance"]
+        self.assertEqual(provenance["document_id"], int(result["document_id"]))
+        self.assertEqual(provenance["workbook_filename"], "regional.xlsx")
+        self.assertEqual(provenance["sheets"], [{"sheet_name": "April", "row_ranges": [{"row_start": 2, "row_end": 2}]}])
+        self.assertEqual(provenance["columns_used"], ["Amount", "Region"])
+        self.assertEqual(provenance["filters_applied"], {"Region": ["north"]})
+        self.assertEqual(provenance["aggregation"], "total")
+        self.assertEqual(provenance["contributing_row_count"], 1)
+        self.assertNotIn("rows", provenance)
+        self.assertNotIn("North", str(provenance))
+        self.assertEqual(answer["_context"]["result_plan"], provenance)
+
+    def test_aggregation_selects_matching_workbook_and_respects_acl_lifecycle(self) -> None:
+        """Structured aggregation honors document selection, ACLs, deletion, and current status."""
+        self.upload_workbook(
+            [("Catalog", [["Code", "Label"], ["A-1", "Alpha"]], "visible")],
+            "catalog.xlsx",
+        )
+        target = self.upload_workbook(
+            [("Ledger", [["Period", "Amount"], ["March", 25], ["April", 35]], "visible")],
+            "ledger.xlsx",
+        )
+        document_id = int(target["document_id"])
+
+        selected = analyze_workbook_question("What is the total amount for March?", 1)
+        self.assertTrue(selected["grounded"])
+        self.assertIn("25", selected["answer"])
+        self.assertEqual(selected["sources"][0]["document_id"], document_id)
+
+        self.assertFalse(analyze_workbook_question("What is the total amount?", 2, document_id=document_id)["grounded"])
+        with database.get_connection() as connection:
+            connection.execute("UPDATE documents SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?", (document_id,))
+        self.assertFalse(analyze_workbook_question("What is the total amount?", 1, document_id=document_id)["grounded"])
+
+        replacement = self.upload_workbook(
+            [("Ledger", [["Period", "Amount"], ["March", 99]], "visible")],
+            "replacement.xlsx",
+        )
+        replacement_id = int(replacement["document_id"])
+        with database.get_connection() as connection:
+            connection.execute(
+                "UPDATE document_versions SET status = 'failed' WHERE id = (SELECT current_version_id FROM documents WHERE id = ?)",
+                (replacement_id,),
+            )
+        self.assertFalse(analyze_workbook_question("What is the total amount?", 1, document_id=replacement_id)["grounded"])
 
 
 if __name__ == "__main__":

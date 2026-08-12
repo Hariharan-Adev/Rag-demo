@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from difflib import SequenceMatcher
 from html import escape
 from json import loads
 import re
@@ -20,7 +21,8 @@ INTENT_PATTERNS = (
     r"\b(average|avg|mean)\b", r"\b(minimum|min|lowest|smallest)\b",
     r"\b(maximum|max|highest|largest)\b", r"\b(unique|distinct)\b",
     r"\b(percent|percentage|rate|overall)\b",
-    r"\b(list|show|which|what are|give)\b", r"\bgroup\b.+\bby\b",
+    r"\b(list|show|which|what are|give)\b", r"\b(compare|comparison|versus|vs)\b",
+    r"\bgroup\b.+\bby\b",
     r"\bbetween\b.+\band\b", r"\bfrom\b.+\bto\b",
     r"\b(below|under|less than|above|over|greater than|at least|at most)\b",
 )
@@ -86,7 +88,8 @@ def is_structured_lookup_question(
     """Return whether accessible structured rows can answer the question."""
     scopes = _load_scopes(owner_id, collection_id, document_id)
     return any(
-        _plan_for_scope(scope, question, explicit_scope=document_id is not None).intent != "unavailable"
+        _answer_employee_profiles(scope, question) is not None
+        or _plan_for_scope(scope, question, explicit_scope=document_id is not None).intent != "unavailable"
         for scope in scopes
     )
 
@@ -135,13 +138,16 @@ def analyze_workbook_question(
     if not ranked or ranked[0][0] < 2:
         return _unavailable("no_relevant_structured_source")
     scope = ranked[0][1]
+    employee_answer = _answer_employee_profiles(scope, question)
+    if employee_answer is not None:
+        return employee_answer
     plan = _plan_for_scope(scope, question, explicit_scope=document_id is not None)
     if plan.intent == "unavailable":
         return _unavailable(plan.rejection_reason or "invalid_structured_plan")
     rows = _apply_filters(scope.rows, plan.filters or {}, plan.numeric_filter)
     if not rows:
         return _unavailable("structured_filters_matched_no_rows")
-    return _answer_from_rows(scope, rows, plan)
+    return _answer_from_rows(scope, rows, plan, question)
 
 
 def _organization_id(owner_id: int) -> str:
@@ -246,12 +252,270 @@ def _tokens(value: object) -> set[str]:
         if token in STOP_WORDS or len(token) <= 1:
             continue
         tokens.add(token)
+        if len(token) > 4 and token.endswith("ies"):
+            tokens.add(f"{token[:-3]}y")
         if len(token) > 3 and token.endswith("s"):
             tokens.add(token[:-1])
         if len(token) > 4 and token.endswith("ed"):
             tokens.add(token[:-1])
             tokens.add(token[:-2])
     return tokens
+
+
+EMPLOYEE_PROFILE_FIELDS = (
+    "Role",
+    "Experience Level",
+    "Primary Skills",
+    "Secondary Skills",
+    "Project Allocation",
+    "Training Completed",
+    "Career Goals",
+    "Expected Responsibilities",
+)
+EMPLOYEE_COMPARE_TOKENS = {"compare", "comparison", "cumulative", "matrix", "skill", "skills", "employee", "employees"}
+
+
+def _employee_profiles(scope: WorkbookScope) -> list[RowRecord]:
+    """Return normalized employee-profile records produced from form-style sheets."""
+    profiles = []
+    seen_names: set[str] = set()
+    for row in scope.rows:
+        headers = set(row.values)
+        name_key = _name_key(row.values.get("Employee") or row.sheet)
+        if "Employee" in headers and headers & set(EMPLOYEE_PROFILE_FIELDS) and name_key not in seen_names:
+            profiles.append(row)
+            seen_names.add(name_key)
+    return profiles
+
+
+def _name_key(value: object) -> str:
+    """Normalize employee names for exact and fuzzy matching."""
+    return "".join(re.findall(r"[a-z0-9]+", str(value).casefold()))
+
+
+def _resolve_employee_names(question: str, profiles: list[RowRecord]) -> list[RowRecord]:
+    """Match employee names case-insensitively and tolerate small misspellings."""
+    if not profiles:
+        return []
+    words = re.findall(r"[a-z0-9]+", question.casefold())
+    candidates = []
+    for index in range(len(words)):
+        for width in (2, 1):
+            phrase = "".join(words[index:index + width])
+            if phrase:
+                candidates.append(phrase)
+    matched: list[RowRecord] = []
+    seen: set[str] = set()
+    for profile in profiles:
+        name = str(profile.values.get("Employee") or profile.sheet)
+        key = _name_key(name)
+        if not key:
+            continue
+        exact = any(
+            candidate == key
+            or (len(candidate) >= 4 and candidate in key)
+            or (len(key) >= 4 and key in candidate)
+            for candidate in candidates
+        )
+        fuzzy = any(
+            len(candidate) >= 4 and SequenceMatcher(None, candidate, key).ratio() >= 0.82
+            for candidate in candidates
+        )
+        if (exact or fuzzy) and key not in seen:
+            matched.append(profile)
+            seen.add(key)
+    return matched
+
+
+def _is_employee_comparison_question(question: str) -> bool:
+    """Detect all-employee skill-matrix comparison requests."""
+    tokens = _tokens(question)
+    normalized = _normalized(question)
+    return (
+        bool(tokens & EMPLOYEE_COMPARE_TOKENS)
+        and bool(tokens & {"skill", "skills", "employee", "employees", "matrix"})
+        and (
+            "all employees" in normalized
+            or "skill comparison" in normalized
+            or "compare" in tokens
+            or "comparison" in tokens
+            or "cumulative" in tokens
+        )
+    )
+
+
+def _is_skills_only_question(question: str) -> bool:
+    """Detect when the user asked for skills without profile metadata."""
+    tokens = _tokens(question)
+    metadata_tokens = {"role", "roles", "experience", "level", "responsibility", "responsibilities", "goals", "training", "allocation"}
+    return bool(tokens & {"skill", "skills"}) and not bool(tokens & metadata_tokens)
+
+
+def _skill_bullets(value: object) -> str:
+    """Normalize free-form skill text into Markdown bullets without raw asterisks."""
+    text = " ".join(str(value or "").replace("\x00", "").split())
+    text = re.sub(r"\s*[*•]\s*", "\n", text)
+    # Excel profile cells often contain inline numbered points. Split those
+    # into real bullets while keeping decimal experience values like 3.5 intact.
+    text = re.sub(r"(?<![\d.])(?:^|\s)\d{1,2}\.\s*(?=[A-Za-z])", "\n", text)
+    parts = [
+        re.sub(r"^\d{1,2}\.\s*", "", part.strip(" -;\t")).strip()
+        for part in re.split(r"\n|;|,(?=\s*[A-Z][A-Za-z ]{2,})", text)
+        if part.strip(" -;\t")
+    ]
+    if not parts:
+        return ""
+    return "\n".join(f"- {_display(part)}" for part in parts)
+
+
+def _skill_items(value: object) -> list[str]:
+    """Return every readable skill item without hiding evidence behind counts."""
+    bullets = _skill_bullets(value)
+    items = [
+        line.removeprefix("- ").strip()
+        for line in bullets.splitlines()
+        if line.strip().startswith("- ")
+    ]
+    if not items and value is not None and str(value).strip():
+        items = [_display(value)]
+    return items
+
+
+def _skill_section(label: str, value: object) -> list[str]:
+    """Render a skill field as a clear labeled bullet section."""
+    items = _skill_items(value)
+    if not items:
+        return []
+    return [f"   **{label}**", *[f"   - {item}" for item in items]]
+
+
+def _employee_profile_answer(profile: RowRecord) -> str:
+    """Format one employee profile without exposing spreadsheet helper columns."""
+    name = _display(profile.values.get("Employee") or profile.sheet)
+    lines = [name, ""]
+    role = profile.values.get("Role")
+    experience = profile.values.get("Experience Level")
+    if role is not None and str(role).strip():
+        lines.append(f"Role: {_display(role)}")
+    if experience is not None and str(experience).strip():
+        lines.append(f"Experience: {_display(experience)}")
+    for field in EMPLOYEE_PROFILE_FIELDS:
+        if field in {"Role", "Experience Level"}:
+            continue
+        value = profile.values.get(field)
+        if value is None or not str(value).strip():
+            continue
+        label = field.replace(" Skills", " skills").replace("Completed", "completed").replace("Goals", "goals").replace("Responsibilities", "responsibilities")
+        bullets = _skill_bullets(value) if "Skills" in field else ""
+        if not bullets:
+            cleaned = re.sub(r"\s*[*•]\s*", " ", str(value)).strip()
+            bullets = f"- {_display(cleaned)}"
+        lines.extend(["", f"{label}:", bullets or f"- {_display(value)}"])
+    return "\n".join(line for line in lines if line != "")
+
+
+def _employee_skills_answer(profiles: list[RowRecord]) -> str:
+    """Render skills-only comparisons without narrow table cells."""
+    sections = []
+    for index, profile in enumerate(profiles, start=1):
+        values = profile.values
+        lines = [f"{index}. **{_display(values.get('Employee') or profile.sheet)}**"]
+        primary = _skill_section("Primary skills", values.get("Primary Skills"))
+        secondary = _skill_section("Secondary skills", values.get("Secondary Skills"))
+        if primary:
+            lines.extend(["", *primary])
+        if secondary:
+            lines.extend(["", *secondary])
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+def _employee_comparison_answer(profiles: list[RowRecord], *, skills_only: bool = False) -> str:
+    """Build a compact complete comparison across all profile records."""
+    if skills_only:
+        return _employee_skills_answer(profiles)
+    headers = ["Employee", "Role", "Experience", "Primary skills", "Secondary skills"]
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
+    ]
+    for profile in profiles:
+        values = profile.values
+        lines.append("| " + " | ".join(
+            _display(value)
+            for value in (
+                values.get("Employee") or profile.sheet,
+                values.get("Role") or "",
+                values.get("Experience Level") or "",
+                values.get("Primary Skills") or "",
+                values.get("Secondary Skills") or "",
+            )
+        ) + " |")
+    return "\n".join(lines)
+
+
+def _employee_sources(scope: WorkbookScope, profiles: list[RowRecord]) -> list[dict[str, object]]:
+    """Create sheet-level citations for employee profiles while hiding cell scaffolding."""
+    sources = _sources(scope, profiles)
+    for source in sources:
+        location = source.get("source_location")
+        if isinstance(location, dict):
+            location["hide_row_range"] = True
+    return sources
+
+
+def _answer_employee_profiles(scope: WorkbookScope, question: str) -> dict[str, object] | None:
+    """Answer profile-specific employee matrix questions from complete structured rows."""
+    profiles = _employee_profiles(scope)
+    if not profiles:
+        return None
+    selected = _resolve_employee_names(question, profiles)
+    comparison = _is_employee_comparison_question(question)
+    if not selected and not comparison:
+        return None
+    rows = profiles if comparison and not selected else selected
+    if not rows:
+        return _unavailable("employee_profiles_matched_no_rows")
+    answer = (
+        _employee_comparison_answer(rows, skills_only=_is_skills_only_question(question))
+        if len(rows) > 1
+        else _employee_profile_answer(rows[0])
+    )
+    all_names = [str(row.values.get("Employee") or row.sheet) for row in profiles]
+    selected_names = [str(row.values.get("Employee") or row.sheet) for row in rows]
+    provenance = {
+        "document_id": scope.document_id,
+        "version_id": scope.version_id,
+        "workbook_filename": scope.filename,
+        "sheets": _row_ranges(rows),
+        "columns_used": ["Employee", "Primary Skills", "Secondary Skills"],
+        "filters_applied": {},
+        "numeric_filter": None,
+        "aggregation": "employee_profile",
+        "contributing_row_count": len(rows),
+    }
+    return {
+        "answer": answer,
+        "question_type": "structured_analysis",
+        "calculation_basis": f"{len(rows)} employee profile(s) from {scope.filename}.",
+        "sources": _employee_sources(scope, rows),
+        "provenance": provenance,
+        "grounded": True,
+        "_context": {
+            "kind": "employee_profiles",
+            "result_type": "employee_comparison" if len(rows) > 1 else "employee_profile",
+            "skills_only": _is_skills_only_question(question),
+            "document_ids": [scope.document_id],
+            "version_ids": [scope.version_id],
+            "result_plan": provenance,
+            "all_employee_names": all_names,
+            "selected_employee_names": selected_names,
+            "row_refs": [
+                {"document_id": scope.document_id, "sheet": row.sheet, "row_number": row.row_number}
+                for row in rows
+            ],
+        },
+    }
 
 
 def _number(value: object) -> Decimal | None:
@@ -286,14 +550,19 @@ def _question_numbers(question: str) -> list[Decimal]:
 
 
 def _numeric_condition(question: str) -> tuple[str, Decimal, Decimal | None] | None:
-    """Parse generic numeric comparisons without naming any document domain."""
+    """Parse explicit inclusive/exclusive numeric comparisons with Decimal bounds."""
     normalized = _normalized(question)
     numbers = _question_numbers(question)
     if not numbers:
         return None
-    if "between" in normalized and len(numbers) >= 2:
+    if (
+        "between" in normalized
+        or re.search(r"\bfrom\b.+\bto\b", normalized)
+    ) and len(numbers) >= 2:
         low, high = sorted((numbers[0], numbers[1]))
+        # "between" and "from ... to ..." include both endpoints.
         return "between", low, high
+    # below/less-than and above/greater-than exclude the boundary.
     if re.search(r"\b(below|under|less than)\b", normalized):
         return "lt", numbers[0], None
     if re.search(r"\b(at most|up to|no more than)\b", normalized):
@@ -303,6 +572,21 @@ def _numeric_condition(question: str) -> tuple[str, Decimal, Decimal | None] | N
     if re.search(r"\b(at least|minimum of|not less than)\b", normalized):
         return "ge", numbers[0], None
     return None
+
+
+def _percentage_condition_for_column(
+    condition: tuple[str, Decimal, Decimal | None],
+    values: list[object],
+    question: str,
+) -> tuple[str, Decimal, Decimal | None]:
+    """Match percentage-point questions against fraction-stored numeric columns."""
+    if not re.search(r"%|\b(?:percent|percentage)\b", question.casefold()):
+        return condition
+    numeric_values = [abs(value) for value in (_number(value) for value in values) if value is not None]
+    if not numeric_values or max(numeric_values) > Decimal(1):
+        return condition
+    operator, left, right = condition
+    return operator, left / Decimal(100), right / Decimal(100) if right is not None else None
 
 
 def _numeric_matches(value: object, condition: tuple[str, Decimal, Decimal | None]) -> bool:
@@ -383,14 +667,15 @@ def _row_filters(rows: list[RowRecord], question: str) -> dict[str, set[str]]:
             filters[header] = matched
     directional_value = _requested_direction_value(question)
     if directional_value:
-        for header, values in _column_values(rows).items():
-            header_tokens = _tokens(header)
-            value_set = {_canonical(value) for value in values}
-            if (
-                {"attendance", "direction"} & header_tokens
-                and directional_value in value_set
-            ):
-                filters.setdefault(header, set()).add(directional_value)
+        direction_columns = [
+            header
+            for header, values in _column_values(rows).items()
+            if directional_value in {_canonical(value) for value in values}
+        ]
+        # Apply an implicit IN/OUT filter only when the workbook supplies one
+        # unambiguous matching column; header names are domain-independent.
+        if len(direction_columns) == 1:
+            filters.setdefault(direction_columns[0], set()).add(directional_value)
     mentioned_months = {
         canonical for alias, canonical in MONTH_ALIASES.items()
         if re.search(rf"\b{re.escape(alias)}\b", _normalized(question))
@@ -452,20 +737,29 @@ def _resolve_filter_conflicts(
     filters: dict[str, set[str]],
 ) -> dict[str, set[str]]:
     """Drop one contradictory inferred filter when mixed sheet layouts collide."""
+    for header in list(filters):
+        match = re.fullmatch(r"(.+)\s+\(\d+\)", header)
+        if not match or match.group(1) not in filters:
+            continue
+        # Prefer the primary column when duplicate Excel headers create
+        # suffixed variants such as "Rating" and "Rating (2)".
+        candidate = {key: value for key, value in filters.items() if key != header}
+        if _apply_filters(rows, candidate):
+            filters = candidate
     if not filters or _apply_filters(rows, filters):
         return filters
-    candidates: list[tuple[int, int, dict[str, set[str]]]] = []
+    candidates: list[tuple[int, int, int, dict[str, set[str]]]] = []
     for header in filters:
         if header == "__sheet__":
             continue
         candidate = {key: value for key, value in filters.items() if key != header}
         matched = _apply_filters(rows, candidate)
         if matched:
-            candidates.append((len(candidate), len(matched), candidate))
+            candidates.append((len(candidate), len(matched), min(row.row_number for row in matched), candidate))
     if not candidates:
         return filters
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return candidates[0][2]
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    return candidates[0][3]
 
 
 def _operation(question: str) -> str:
@@ -480,6 +774,8 @@ def _operation(question: str) -> str:
         return "minimum"
     if re.search(r"\b(unique|distinct)\b", normalized):
         return "distinct"
+    if re.search(r"\b(compare|comparison|versus|vs)\b", normalized):
+        return "comparison"
     if re.search(r"\b(percent|percentage|rate|overall)\b", normalized):
         return "average"
     if re.search(r"\bhow many\b|\bcount\b|\bno\b|\bnumber of\b", normalized):
@@ -502,6 +798,9 @@ def _source_evidence(scope: WorkbookScope, question: str) -> tuple[int, list[str
     question_tokens = _tokens(question)
     reasons: list[str] = []
     score = 0
+    if _employee_profiles(scope) and (_tokens(question) & EMPLOYEE_COMPARE_TOKENS):
+        score += 6
+        reasons.append("employee_profile_match")
     filename_hits = _tokens(scope.filename) & question_tokens
     if filename_hits:
         score += len(filename_hits) * 4
@@ -539,8 +838,6 @@ def _choose_column(
         inferred = scope.schema.get(header, {}).get("type", "text")
         if numeric and not any(_number(value) is not None for value in values):
             continue
-        if numeric and inferred != "number" and not (_tokens(header) & {"amount", "cost", "price", "qty", "quantity", "count", "rate", "total"}):
-            continue
         score = _column_score(header, subject)
         if score > 0 and preferred_types and inferred in preferred_types:
             score += 2
@@ -567,17 +864,45 @@ def _candidate_columns(scope: WorkbookScope, *, numeric: bool = False, preferred
     return sorted(output, key=str.casefold)
 
 
+def _requested_value_column(scope: WorkbookScope, question: str, filters: dict[str, set[str]]) -> str | None:
+    """Choose the requested return column for a filtered row lookup."""
+    question_tokens = _tokens(question)
+    filter_tokens = set().union(*(_tokens(header) for header in filters if header != "__sheet__"), set())
+    candidates: list[tuple[int, int, str]] = []
+    for header, values in _column_values(scope.rows).items():
+        if header in filters or not any(str(value).strip() for value in values if value is not None):
+            continue
+        header_tokens = _tokens(header)
+        score = _column_score(header, question)
+        if "score" in header_tokens and (header_tokens & filter_tokens):
+            score += 4
+        if "score" in header_tokens and "score" in question_tokens:
+            score += 4
+        if score > 0:
+            candidates.append((score, len(header_tokens), header))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2].casefold()))
+    if len(candidates) > 1 and candidates[0][:2] == candidates[1][:2]:
+        return None
+    return candidates[0][2]
+
+
 def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool = False) -> Plan:
     operation = _operation(question)
     evidence_score, evidence_reasons = _source_evidence(scope, question)
     filters = _resolve_filter_conflicts(scope.rows, _row_filters(scope.rows, question))
     numeric_condition = _numeric_condition(question)
     numeric_column = _choose_column(scope, question, numeric=True) if numeric_condition else None
-    numeric_filter = (
-        (numeric_column, numeric_condition[0], numeric_condition[1], numeric_condition[2])
-        if numeric_column and numeric_condition
-        else None
-    )
+    if numeric_column and numeric_condition:
+        operator, left, right = _percentage_condition_for_column(
+            numeric_condition,
+            _column_values(scope.rows).get(numeric_column, []),
+            question,
+        )
+        numeric_filter = (numeric_column, operator, left, right)
+    else:
+        numeric_filter = None
     filtered = _apply_filters(scope.rows, filters, numeric_filter)
     if filters and not filtered:
         return Plan("unavailable", rejection_reason="filters_matched_no_rows")
@@ -585,6 +910,8 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
     if operation in {"total", "average", "minimum", "maximum"}:
         column = numeric_column or _choose_column(scope, question, numeric=True)
         if not column:
+            if filters:
+                return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
             return Plan("unavailable", rejection_reason="missing_numeric_column")
         if not has_source_evidence or _column_score(column, question) <= 0:
             return Plan("unavailable", rejection_reason="weak_numeric_source_evidence")
@@ -631,10 +958,17 @@ def _plan_for_scope(scope: WorkbookScope, question: str, *, explicit_scope: bool
         if not has_source_evidence:
             return Plan("unavailable", rejection_reason="weak_count_source_evidence")
         return Plan("count", entity_column=entity_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
+    if operation == "comparison":
+        if not has_source_evidence:
+            return Plan("unavailable", rejection_reason="weak_comparison_source_evidence")
+        return Plan("comparison", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if numeric_filter:
         return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     if _requests_time_records(question, filters):
         return Plan("records", filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
+    value_column = _requested_value_column(scope, question, filters) if filters else None
+    if value_column:
+        return Plan("records", value_column=value_column, filters=filters, numeric_filter=numeric_filter, confidence=evidence_score)
     list_column = _choose_column(scope, question, preferred_types={"text", "category", "identifier"})
     if list_column:
         if not has_source_evidence:
@@ -724,10 +1058,65 @@ def _sources(scope: WorkbookScope, rows: list[RowRecord]) -> list[dict[str, obje
     ]
 
 
+def _row_ranges(rows: list[RowRecord]) -> list[dict[str, object]]:
+    """Return compact worksheet row spans without serializing workbook cell values."""
+    grouped: dict[str, list[int]] = defaultdict(list)
+    for row in rows:
+        grouped[row.sheet].append(row.row_number)
+    spans = []
+    for sheet, numbers in grouped.items():
+        ordered = sorted(set(numbers))
+        start = previous = ordered[0]
+        ranges = []
+        for number in ordered[1:]:
+            if number == previous + 1:
+                previous = number
+                continue
+            ranges.append({"row_start": start, "row_end": previous})
+            start = previous = number
+        ranges.append({"row_start": start, "row_end": previous})
+        spans.append({"sheet_name": sheet, "row_ranges": ranges})
+    return spans
+
+
+def _provenance(scope: WorkbookScope, plan: Plan, rows: list[RowRecord], contributing_row_count: int) -> dict[str, object]:
+    """Describe the structured calculation inputs without exposing row contents."""
+    columns = [
+        column for column in (plan.value_column, plan.entity_column, plan.list_column, plan.group_column)
+        if column
+    ]
+    columns.extend(key for key in (plan.filters or {}) if key != "__sheet__")
+    if plan.numeric_filter:
+        columns.append(plan.numeric_filter[0])
+    return {
+        "document_id": scope.document_id,
+        "version_id": scope.version_id,
+        "workbook_filename": scope.filename,
+        "sheets": _row_ranges(rows),
+        "columns_used": list(dict.fromkeys(columns)),
+        "filters_applied": {
+            key: sorted(value) for key, value in (plan.filters or {}).items()
+        },
+        "numeric_filter": (
+            {
+                "column": plan.numeric_filter[0],
+                "operator": plan.numeric_filter[1],
+                "left": str(plan.numeric_filter[2]),
+                "right": str(plan.numeric_filter[3]) if plan.numeric_filter[3] is not None else None,
+            }
+            if plan.numeric_filter else None
+        ),
+        "aggregation": plan.intent,
+        "contributing_row_count": contributing_row_count,
+    }
+
+
 def _record_headers(rows: list[RowRecord], plan: Plan) -> list[str]:
     """Choose only the columns needed for a readable row-style answer."""
     if plan.list_column:
         return [plan.list_column]
+    if plan.value_column and plan.intent == "records":
+        return [plan.value_column]
     if plan.intent == "records" and len(rows) == 1 and plan.filters:
         filter_headers = [header for header in rows[0].values if header in plan.filters]
         if len(filter_headers) == 1:
@@ -764,14 +1153,67 @@ def _single_row_answer(rows: list[RowRecord], plan: Plan) -> str | None:
     value = rows[0].values.get(headers[0])
     if value is None or not str(value).strip():
         return None
-    return f"{_display(headers[0])}: {_display(value)}"
+    label: object = headers[0]
+    filter_headers = [header for header in (plan.filters or {}) if header != "__sheet__"]
+    if str(headers[0]).startswith("Column ") and len(filter_headers) == 1:
+        label = rows[0].values.get(filter_headers[0]) or headers[0]
+    return f"{_display(label)}: {_display(value)}"
 
 
-def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -> dict[str, object]:
+def _score_scale_rows(rows: list[RowRecord], value_column: str) -> list[RowRecord]:
+    """Prefer rating-scale rows over occurrence rows for score label lookups."""
+    value_tokens = _tokens(value_column)
+    if "score" not in value_tokens:
+        return []
+    scale_rows = []
+    for row in rows:
+        headers = set(row.values)
+        range_headers = {
+            header for header in headers
+            if _tokens(header) & {"minimum", "maximum", "min", "max"}
+            and row.values.get(header) is not None
+            and str(row.values.get(header)).strip()
+        }
+        if len(range_headers) >= 2:
+            scale_rows.append(row)
+    return scale_rows
+
+
+def _follow_up_display_column(scope: WorkbookScope, plan: Plan, question: str) -> str | None:
+    """Choose an explicitly referenced non-numeric entity column for result replay."""
+    if plan.list_column or plan.entity_column:
+        return plan.list_column or plan.entity_column
+    excluded = {plan.value_column}
+    if plan.numeric_filter:
+        excluded.add(plan.numeric_filter[0])
+    candidates = [
+        header
+        for header, values in _column_values(scope.rows).items()
+        if header not in excluded
+        and not all(_number(value) is not None for value in values if value is not None)
+        and _column_score(header, question) > 0
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _answer_from_rows(
+    scope: WorkbookScope,
+    rows: list[RowRecord],
+    plan: Plan,
+    question: str,
+) -> dict[str, object]:
     basis = f"{len(rows)} matching row(s) across {len({row.sheet for row in rows})} sheet(s)"
     answer: str
     contributing_values: list[object] = []
     if plan.intent == "count":
+        # Retain the counted entities so a later reference can display the same set.
+        if plan.entity_column:
+            contributing_values = [
+                row.values.get(plan.entity_column)
+                for row in rows
+                if row.values.get(plan.entity_column) is not None
+                and str(row.values.get(plan.entity_column)).strip()
+            ]
         if (
             plan.entity_column
             and "employee" in _tokens(plan.entity_column)
@@ -788,9 +1230,13 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
         else:
             answer = f"Count: {len(rows):,}. Calculation basis: {basis}."
     elif plan.intent == "distinct" and plan.list_column:
+        rows = [
+            row for row in rows
+            if row.values.get(plan.list_column) is not None and str(row.values.get(plan.list_column)).strip()
+        ]
         values = {
             str(row.values.get(plan.list_column)).strip().casefold()
-            for row in rows if row.values.get(plan.list_column) is not None and str(row.values.get(plan.list_column)).strip()
+            for row in rows
         }
         answer = f"Unique {plan.list_column}: {len(values):,}. Calculation basis: {basis}."
     elif plan.intent in {"total", "average", "minimum", "maximum"} and plan.value_column:
@@ -810,17 +1256,20 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
         rows = [row for row, _ in numeric]
     elif plan.intent == "group" and plan.value_column and plan.group_column:
         totals: dict[str, Decimal] = defaultdict(Decimal)
+        contributing_rows = []
         for row in rows:
             group = str(row.values.get(plan.group_column) or "").strip()
             value = _number(row.values.get(plan.value_column))
             if group and value is not None:
                 totals[group] += value
+                contributing_rows.append(row)
         if not totals:
             return _unavailable()
         answer = (
             f"{plan.value_column} by {plan.group_column}:\n"
             + "\n".join(f"- {_display(group)}: {_format_number(total)}" for group, total in sorted(totals.items()))
         )
+        rows = contributing_rows
     elif plan.list_column:
         values = [
             row.values.get(plan.list_column)
@@ -835,21 +1284,42 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
             + "\n".join(f"- {_display(value)}" for value in values[:settings.rag_structured_result_limit])
         )
     else:
+        if plan.intent == "records" and plan.value_column:
+            rows = [
+                row for row in rows
+                if row.values.get(plan.value_column) is not None
+                and str(row.values.get(plan.value_column)).strip()
+            ]
+            scale_rows = _score_scale_rows(rows, plan.value_column)
+            if scale_rows:
+                rows = scale_rows
+            if not rows:
+                return _unavailable()
         answer = _single_row_answer(rows, plan)
         if answer is None:
             answer = f"Matching records ({len(rows)}):\n\n{_records_table(rows, plan)}"
+    display_column = _follow_up_display_column(scope, plan, question)
+    if display_column:
+        # Follow-up replay needs the displayed entity set, not aggregate operands.
+        contributing_values = [
+            row.values.get(display_column)
+            for row in rows
+            if row.values.get(display_column) is not None
+            and str(row.values.get(display_column)).strip()
+        ]
     return {
         "answer": answer,
         "question_type": "structured_analysis",
         "calculation_basis": basis,
         "sources": _sources(scope, rows),
+        "provenance": _provenance(scope, plan, rows, len(rows)),
         "grounded": True,
         "_context": {
             "kind": "structured_rows",
             "result_type": plan.intent,
             "value_column": plan.value_column,
             "entity_column": plan.entity_column,
-            "display_column": plan.list_column or plan.value_column,
+            "display_column": display_column or plan.value_column,
             "group_column": plan.group_column,
             "filters": {key: sorted(value) for key, value in (plan.filters or {}).items()},
             "numeric_filter": (
@@ -865,6 +1335,7 @@ def _answer_from_rows(scope: WorkbookScope, rows: list[RowRecord], plan: Plan) -
             "document_ids": [scope.document_id],
             "version_ids": [scope.version_id],
             "confidence": plan.confidence,
+            "result_plan": _provenance(scope, plan, rows, len(rows)),
             "contributing_values": contributing_values[:settings.rag_structured_result_limit],
             "row_refs": [
                 {"document_id": scope.document_id, "sheet": row.sheet, "row_number": row.row_number}
