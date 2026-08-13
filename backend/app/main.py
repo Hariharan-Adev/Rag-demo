@@ -56,10 +56,12 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5174",
         "http://localhost:5174",
+        "http://docsenseai.recezy.ai",
+        "http://192.168.1.235"
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Organization-ID"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 app.include_router(auth_router)
 app.include_router(public_ingestion_router)

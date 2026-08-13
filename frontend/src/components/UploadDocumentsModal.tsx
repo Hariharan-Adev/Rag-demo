@@ -56,6 +56,13 @@ function extension(file: File) {
   return suffix
 }
 
+function uploadItemId() {
+  // Production may be served from plain HTTP, where randomUUID is unavailable.
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 export default function UploadDocumentsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { collections, documents, refreshDocuments, showToast } = useApp()
   const [mode, setMode] = useState<'files' | 'folder'>('files')
@@ -98,8 +105,8 @@ export default function UploadDocumentsModal({ open, onClose }: { open: boolean;
       else if (file.size > (isArchive ? maxZipBytes : maxBytes)) validation = 'Too large'
       else if (knownNames.has(file.name.toLowerCase())) validation = 'Duplicate candidate'
       return {
-        id: crypto.randomUUID(),
-        idempotencyKey: crypto.randomUUID(),
+        id: uploadItemId(),
+        idempotencyKey: uploadItemId(),
         file, relativePath, validation,
         status: validation === 'Unsupported' || validation === 'Too large' || validation === 'Empty' ? 'skipped' as const : 'pending' as const,
       }
