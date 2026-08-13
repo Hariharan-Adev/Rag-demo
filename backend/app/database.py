@@ -1137,6 +1137,33 @@ def _migrate_chat_history_v12(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_password_reset_v13(connection: sqlite3.Connection) -> None:
+    """Add one-time password reset tokens without storing raw token values."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            organization_id TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            used_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (organization_id) REFERENCES organizations(id),
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_lookup
+            ON password_reset_tokens(token_hash, expires_at, used_at);
+        CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_user_active
+            ON password_reset_tokens(organization_id, user_id, used_at);
+        """
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('013_password_reset_tokens')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1211,6 +1238,7 @@ def initialize_database() -> None:
             _migrate_structured_csv_indexing_v10(connection)
             _migrate_chat_context_v11(connection)
             _migrate_chat_history_v12(connection)
+            _migrate_password_reset_v13(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

@@ -23,6 +23,10 @@ export interface LoginResponse {
   token_type: string
 }
 
+export interface ForgotPasswordResponse {
+  message: string
+}
+
 export interface UploadResponse {
   message: string
   document_id: number
@@ -210,6 +214,22 @@ export async function login(email: string, password: string) {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: formData,
+  })
+}
+
+export async function requestPasswordReset(email: string) {
+  return requestJson<ForgotPasswordResponse>('/auth/forgot-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+}
+
+export async function resetPassword(token: string, newPassword: string) {
+  return requestJson<{ message: string }>('/auth/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token, new_password: newPassword }),
   })
 }
 

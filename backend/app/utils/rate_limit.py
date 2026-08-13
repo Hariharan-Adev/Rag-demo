@@ -7,7 +7,7 @@ from time import time
 from fastapi import HTTPException, status
 
 from app.config import settings
-from app.database import get_connection
+from app.database import DEFAULT_ORGANIZATION_ID, get_connection
 from app.utils.audit import log_audit_event
 
 WINDOW_SECONDS = 60 * 60  # One-hour fixed window.
@@ -17,6 +17,70 @@ def _ip_scope(client_ip: str) -> str:
     """Hash the IP so raw addresses are not stored in SQLite."""
     value = f"{settings.rate_limit_salt}:{client_ip}"
     return f"ip:{sha256(value.encode()).hexdigest()}"
+
+
+def _anonymous_scope(kind: str, value: str) -> str:
+    """Hash pre-authentication identifiers before using them as quota keys."""
+    normalized = value.lower().strip()
+    digest = sha256(f"{settings.rate_limit_salt}:{kind}:{normalized}".encode()).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def enforce_anonymous_request_limit(
+    client_ip: str,
+    endpoint: str,
+    maximum: int,
+    *,
+    identifier: str = "",
+) -> None:
+    """Limit unauthenticated flows by IP and optional account identifier."""
+    window_start = int(time() // WINDOW_SECONDS) * WINDOW_SECONDS
+    scopes = [_ip_scope(client_ip)]
+    if identifier:
+        scopes.append(_anonymous_scope("account", identifier))
+    blocked = False
+
+    with get_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for scope in scopes:
+            row = connection.execute(
+                """
+                SELECT request_count
+                FROM rate_limit_windows
+                WHERE scope = ? AND endpoint = ? AND window_start = ?
+                  AND organization_id = ?
+                """,
+                (scope, endpoint, window_start, DEFAULT_ORGANIZATION_ID),
+            ).fetchone()
+            if row is not None and row["request_count"] >= maximum:
+                blocked = True
+                break
+
+        if not blocked:
+            for scope in scopes:
+                connection.execute(
+                    """
+                    INSERT INTO rate_limit_windows
+                        (organization_id, scope, endpoint, window_start, request_count)
+                    VALUES (?, ?, ?, ?, 1)
+                    ON CONFLICT(organization_id, scope, endpoint, window_start)
+                    DO UPDATE SET request_count = request_count + 1
+                    """,
+                    (DEFAULT_ORGANIZATION_ID, scope, endpoint, window_start),
+                )
+
+    if blocked:
+        log_audit_event(
+            event_type="rate_limit.blocked",
+            endpoint=endpoint,
+            outcome="blocked",
+            client_ip=client_ip,
+            metadata={"category": "pre_auth_hourly_request"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Request limit exceeded. Try again later.",
+        )
 
 
 def enforce_request_limit(

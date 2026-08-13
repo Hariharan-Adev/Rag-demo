@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     chat_requests_per_hour: int = 20
     search_requests_per_hour: int = 60
     uploads_per_hour: int = 5
+    password_reset_requests_per_hour: int = 5
+    password_reset_token_minutes: int = Field(default=30, ge=5, le=120)
     groq_calls_per_day: int = 50
     groq_daily_token_budget: int = 200000
     groq_daily_cost_cap_usd: float = 5.0
