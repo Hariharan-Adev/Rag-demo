@@ -181,7 +181,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
                 [
                     (10, "owner@example.com", "org-a", "organization_admin"),
                     (11, "reader@example.com", "org-a", "member"),
-                    (20, "owner@example.com", "org-b", "organization_admin"),
+                    (20, "owner-b@example.com", "org-b", "organization_admin"),
                 ],
             )
         self.current_user = {
@@ -465,7 +465,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.assertEqual(deleted_row["deleted_by"], 10)
 
         self.current_user = {
-            "id": 20, "email": "owner@example.com",
+            "id": 20, "email": "owner-b@example.com",
             "organization_id": "org-b", "role": "organization_admin",
         }
         self.assertEqual(self.client.get("/documents").json()["documents"], [])
@@ -621,7 +621,7 @@ class MultitenantArchitectureTests(unittest.TestCase):
 
         self.current_user = {
             "id": 20,
-            "email": "owner@example.com",
+            "email": "owner-b@example.com",
             "organization_id": "org-b",
             "role": "organization_admin",
         }

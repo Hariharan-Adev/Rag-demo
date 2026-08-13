@@ -14,7 +14,7 @@ from app.main import app
 
 
 class PasswordResetFlowTests(unittest.TestCase):
-    """Exercise forgot-password and reset-password without an email service."""
+    """Exercise forgot-password and reset-password with mocked SMTP delivery."""
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -46,7 +46,10 @@ class PasswordResetFlowTests(unittest.TestCase):
 
     def request_reset_token(self) -> str:
         """Request reset while controlling the generated one-time token."""
-        with patch("app.routes.auth.token_urlsafe", return_value="known-reset-token-value-1234567890"):
+        with (
+            patch("app.routes.auth.token_urlsafe", return_value="known-reset-token-value-1234567890"),
+            patch("app.routes.auth.send_password_reset_email", return_value=True) as mailer,
+        ):
             response = self.client.post(
                 "/auth/forgot-password",
                 json={"email": "owner@example.com"},
@@ -56,14 +59,18 @@ class PasswordResetFlowTests(unittest.TestCase):
             response.json(),
             {"message": "If this email exists, we sent password reset instructions."},
         )
+        mailer.assert_called_once()
+        reset_url = mailer.call_args.kwargs["reset_url"]
+        self.assertIn("?token=known-reset-token-value-1234567890", reset_url)
         return "known-reset-token-value-1234567890"
 
     def test_forgot_password_uses_generic_response_for_unknown_email(self) -> None:
         """Unknown emails get the same safe message and no reset token."""
-        response = self.client.post(
-            "/auth/forgot-password",
-            json={"email": "missing@example.com"},
-        )
+        with patch("app.routes.auth.send_password_reset_email") as mailer:
+            response = self.client.post(
+                "/auth/forgot-password",
+                json={"email": "missing@example.com"},
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -71,6 +78,29 @@ class PasswordResetFlowTests(unittest.TestCase):
             "If this email exists, we sent password reset instructions.",
         )
         self.assertNotIn("reset_token", response.json())
+        mailer.assert_not_called()
+
+    def test_failed_email_delivery_invalidates_created_token(self) -> None:
+        """Undelivered reset links are invalidated without changing the response."""
+        with (
+            patch("app.routes.auth.token_urlsafe", return_value="known-reset-token-value-1234567890"),
+            patch("app.routes.auth.send_password_reset_email", return_value=False),
+        ):
+            response = self.client.post(
+                "/auth/forgot-password",
+                json={"email": "owner@example.com"},
+            )
+
+        reset = self.client.post(
+            "/auth/reset-password",
+            json={
+                "token": "known-reset-token-value-1234567890",
+                "new_password": "new-password-value",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(reset.status_code, 400)
 
     def test_valid_reset_token_changes_password_and_invalidates_token(self) -> None:
         """A valid token changes the password once and blocks reuse."""

@@ -8,6 +8,7 @@ import sqlite3
 from pathlib import Path
 
 from app.config import settings
+from app.models.user_accounts import merge_duplicate_active_users
 from app.utils.document_content import normalize_extracted_text
 
 DATABASE_PATH = Path(__file__).resolve().parent.parent / "data" / "rag_new.db"
@@ -1164,6 +1165,52 @@ def _migrate_password_reset_v13(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_unique_active_user_email_v14(connection: sqlite3.Connection) -> None:
+    """Merge duplicate active accounts before enforcing one active email."""
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS user_merge_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            primary_user_id INTEGER NOT NULL,
+            merged_user_id INTEGER NOT NULL,
+            primary_organization_id TEXT NOT NULL,
+            merged_organization_id TEXT NOT NULL,
+            merged_at TEXT NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (primary_user_id) REFERENCES users(id),
+            FOREIGN KEY (merged_user_id) REFERENCES users(id),
+            FOREIGN KEY (primary_organization_id) REFERENCES organizations(id),
+            FOREIGN KEY (merged_organization_id) REFERENCES organizations(id)
+        );
+        """
+    )
+    merge_duplicate_active_users(connection)
+    remaining_duplicates = int(connection.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT lower(email)
+             FROM users
+             WHERE deleted_at IS NULL
+             GROUP BY lower(email)
+             HAVING COUNT(*) > 1
+           )"""
+    ).fetchone()[0])
+    if remaining_duplicates:
+        raise RuntimeError(
+            "Migration 014 could not resolve duplicate active user emails."
+        )
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS ux_users_active_email
+           ON users(lower(email))
+           WHERE deleted_at IS NULL"""
+    )
+    connection.execute(
+        """INSERT OR IGNORE INTO schema_migrations (version)
+           VALUES ('014_unique_active_user_email')"""
+    )
+
+
 def initialize_database() -> None:
     """Create current tables and migrate legacy document-owned chunks once."""
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1239,6 +1286,7 @@ def initialize_database() -> None:
             _migrate_chat_context_v11(connection)
             _migrate_chat_history_v12(connection)
             _migrate_password_reset_v13(connection)
+            _migrate_unique_active_user_email_v14(connection)
             _validate_database_integrity(connection)
             connection.commit()
         except Exception:

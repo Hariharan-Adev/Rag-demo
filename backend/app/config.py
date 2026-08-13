@@ -25,6 +25,15 @@ class Settings(BaseSettings):
     uploads_per_hour: int = 5
     password_reset_requests_per_hour: int = 5
     password_reset_token_minutes: int = Field(default=30, ge=5, le=120)
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_from_name: str = "Docsense AI"
+    smtp_use_tls: bool = True
+    smtp_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    frontend_base_url: str = "http://localhost:5173"
     groq_calls_per_day: int = 50
     groq_daily_token_budget: int = 200000
     groq_daily_cost_cap_usd: float = 5.0

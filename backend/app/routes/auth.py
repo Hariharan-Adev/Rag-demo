@@ -6,13 +6,20 @@ from secrets import token_urlsafe
 import sqlite3
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, EmailStr, Field
 
 from app.auth import create_access_token, hash_password, verify_password
 from app.config import settings
 from app.database import get_connection
+from app.models.user_accounts import (
+    active_email_exists,
+    get_active_user_by_email,
+    insert_user_account,
+    normalize_email,
+)
+from app.services.email import send_password_reset_email
 from app.utils.audit import log_audit_event
 from app.utils.rate_limit import enforce_anonymous_request_limit
 
@@ -57,6 +64,13 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _password_reset_url(token: str) -> str:
+    """Build the frontend reset URL without logging or persisting the raw token."""
+    base_url = settings.frontend_base_url.rstrip("/")
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}token={token}"
+
+
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 def register_user(
     api_request: Request,
@@ -64,20 +78,24 @@ def register_user(
 ) -> dict[str, object]:
     """Create a local user with a securely hashed password."""
     client_ip = api_request.client.host if api_request.client else ""
+    email = normalize_email(request.email)
 
     try:
         with get_connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if active_email_exists(connection, email):
+                raise sqlite3.IntegrityError("active email already exists")
             organization_id = str(uuid4())
             connection.execute(
                 "INSERT INTO organizations (id, name) VALUES (?, ?)",
                 (organization_id, request.organization_name.strip()),
             )
-            cursor = connection.execute(
-                """INSERT INTO users
-                   (email, password_hash, organization_id, role)
-                   VALUES (?, ?, ?, 'organization_admin')""",
-                (request.email.lower(), hash_password(request.password), organization_id),
+            user_id = insert_user_account(
+                connection,
+                email=email,
+                password_hash=hash_password(request.password),
+                organization_id=organization_id,
+                role="organization_admin",
             )
     except sqlite3.IntegrityError as error:
         log_audit_event(
@@ -92,14 +110,14 @@ def register_user(
         event_type="auth.register",
         endpoint="auth/register",
         outcome="success",
-        user_id=cursor.lastrowid,
+        user_id=user_id,
         organization_id=organization_id,
         client_ip=client_ip,
     )
 
     return {
-        "id": cursor.lastrowid,
-        "email": request.email.lower(),
+        "id": user_id,
+        "email": email,
         "organization_id": organization_id,
     }
 
@@ -111,7 +129,7 @@ def forgot_password(
 ) -> ForgotPasswordResponse:
     """Create short-lived reset tokens without revealing account existence."""
     client_ip = api_request.client.host if api_request.client else ""
-    email = request.email.lower().strip()
+    email = normalize_email(request.email)
     enforce_anonymous_request_limit(
         client_ip,
         "auth/forgot-password",
@@ -121,18 +139,11 @@ def forgot_password(
 
     expires_at = (_utc_now() + timedelta(minutes=settings.password_reset_token_minutes)).isoformat()
 
-    matched_accounts = 0
+    reset_messages: list[tuple[int, str, str]] = []
     with get_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        users = connection.execute(
-            """SELECT id, organization_id
-               FROM users
-               WHERE email = ? AND deleted_at IS NULL""",
-            (email,),
-        ).fetchall()
-        matched_accounts = len(users)
-
-        for user in users:
+        user = get_active_user_by_email(connection, email)
+        if user is not None:
             token = token_urlsafe(32)
             token_hash = _hash_reset_token(token)
             # Supersede older active reset links for this account so only the
@@ -149,13 +160,40 @@ def forgot_password(
                    VALUES (?, ?, ?, ?)""",
                 (user["organization_id"], user["id"], token_hash, expires_at),
             )
+            reset_messages.append((int(user["id"]), str(user["organization_id"]), token))
+
+    email_sent = 0
+    email_failed = 0
+    for user_id, organization_id, token in reset_messages:
+        sent = send_password_reset_email(
+            recipient_email=email,
+            reset_url=_password_reset_url(token),
+            expires_in_minutes=settings.password_reset_token_minutes,
+        )
+        if sent:
+            email_sent += 1
+            continue
+        email_failed += 1
+        with get_connection() as connection:
+            # Invalidate unsent reset tokens so an undelivered link cannot remain useful.
+            connection.execute(
+                """UPDATE password_reset_tokens
+                   SET used_at = COALESCE(used_at, ?)
+                   WHERE organization_id = ? AND user_id = ?
+                     AND token_hash = ? AND used_at IS NULL""",
+                (_utc_now().isoformat(), organization_id, user_id, _hash_reset_token(token)),
+            )
 
     log_audit_event(
         event_type="auth.forgot_password",
         endpoint="auth/forgot-password",
         outcome="accepted",
         client_ip=client_ip,
-        metadata={"matched_accounts": matched_accounts},
+        metadata={
+            "matched_accounts": len(reset_messages),
+            "email_sent": email_sent,
+            "email_failed": email_failed,
+        },
     )
 
     return ForgotPasswordResponse(message=RESET_RESPONSE_MESSAGE)
@@ -234,29 +272,12 @@ def reset_password(
 def login_user(
     api_request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
-    x_organization_id: str | None = Header(default=None),
 ) -> dict[str, str]:
     """Return a JWT access token for valid credentials."""
     client_ip = api_request.client.host if api_request.client else ""
 
     with get_connection() as connection:
-        users = connection.execute(
-            """SELECT id, password_hash, organization_id
-               FROM users
-               WHERE email = ? AND deleted_at IS NULL
-                 AND (? IS NULL OR organization_id = ?)""",
-            (
-                form_data.username.lower().strip(),
-                x_organization_id,
-                x_organization_id,
-            ),
-        ).fetchall()
-    if len(users) > 1:
-        raise HTTPException(
-            status_code=409,
-            detail="Organization identifier is required for this email.",
-        )
-    user = users[0] if users else None
+        user = get_active_user_by_email(connection, form_data.username)
 
     if user is None or not verify_password(form_data.password, user["password_hash"]):
         log_audit_event(
