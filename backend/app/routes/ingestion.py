@@ -82,7 +82,10 @@ async def queue_document_upload(
     organization_id = str(current_user["organization_id"])
     explicit_version = request.url.path.rstrip("/").endswith("/versions")
     client_ip = request.client.host if request.client else "unknown"
-    enforce_request_limit(owner_id, client_ip, "upload", settings.uploads_per_hour)
+    # The batch itself is rate-limited at creation; counting every member would
+    # make the configured folder limit unreachable under the default quota.
+    if upload_batch_id is None:
+        enforce_request_limit(owner_id, client_ip, "upload", settings.uploads_per_hour)
     try:
         original_filename = sanitize_filename(
             file.filename or "", set(SUPPORTED_EXTENSIONS)

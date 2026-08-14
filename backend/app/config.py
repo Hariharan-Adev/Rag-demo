@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     rate_limit_salt: str = ""
     chat_requests_per_hour: int = 20
     search_requests_per_hour: int = 60
-    uploads_per_hour: int = 5
+    uploads_per_hour: int = 25
     password_reset_requests_per_hour: int = 5
     password_reset_token_minutes: int = Field(default=30, ge=5, le=120)
     smtp_host: str = ""

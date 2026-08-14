@@ -224,6 +224,42 @@ class MultitenantArchitectureTests(unittest.TestCase):
             headers={"Idempotency-Key": key},
         )
 
+    def test_batch_member_upload_does_not_consume_standalone_upload_quota(self) -> None:
+        with database.get_connection() as connection:
+            connection.execute(
+                """INSERT INTO document_collections
+                   (id, owner_id, organization_id, name)
+                   VALUES (100, 10, 'org-a', 'Folder')"""
+            )
+            connection.execute(
+                """INSERT INTO upload_batches
+                   (id, owner_id, organization_id, collection_id,
+                    original_folder_name, total_files)
+                   VALUES (200, 10, 'org-a', 100, 'Folder', 1)"""
+            )
+
+        with patch("app.routes.ingestion.enforce_request_limit") as limiter:
+            response = self.client.post(
+                "/api/documents/upload",
+                files={"file": ("folder-note.txt", b"folder evidence", "text/plain")},
+                data={"collection_id": "100", "upload_batch_id": "200"},
+                headers={"Idempotency-Key": "folder-member-quota"},
+            )
+
+        self.assertEqual(response.status_code, 202)
+        limiter.assert_not_called()
+
+    def test_standalone_upload_still_consumes_upload_quota(self) -> None:
+        with patch("app.routes.ingestion.enforce_request_limit") as limiter:
+            response = self.upload_named(
+                "standalone-note.txt",
+                b"standalone evidence",
+                "standalone-quota",
+            )
+
+        self.assertEqual(response.status_code, 202)
+        limiter.assert_called_once()
+
     def test_schema_has_tenant_lifecycle_and_source_metadata(self) -> None:
         tenant_tables = {
             "users", "documents", "document_versions", "document_contents",
