@@ -13,7 +13,12 @@ from time import monotonic
 from app.config import settings
 from app.services.chunking import chunk_text
 from app.services.document_loader import DocumentParseError, extract_text
-from app.services.image_processor import IMAGE_EXTENSIONS, chunk_image_text, extract_image_text
+from app.services.image_processor import (
+    IMAGE_EXTENSIONS,
+    ImageProcessingError,
+    chunk_image_text,
+    extract_image_text,
+)
 from app.services.pdf_layout import extract_pdf_page_texts
 
 DOCX_PARAGRAPH_CHUNK_WORDS = 800
@@ -126,8 +131,12 @@ def _image_chunks_from_bytes(
             path = Path(temporary) / f"embedded{suffix}"
             path.write_bytes(blob)
             text = extract_image_text(path)
+    except ImageProcessingError as error:
+        if error.code in {"ocr_unavailable", "ocr_timeout", "ocr_processing_failed"}:
+            raise DocumentParseError(str(error), code=error.code) from error
+        return []
     except Exception:
-        # Embedded OCR is best-effort; a bad image must not discard readable text.
+        # Embedded OCR is best-effort for malformed image data, not infrastructure failures.
         return []
     if _ocr_text_is_duplicate(text, native_text):
         return []
@@ -337,6 +346,8 @@ def _pdf(path: Path) -> list[SourceChunk]:
                 }))
         result.extend(_pdf_image_chunks(path, native_by_page))
         return result
+    except DocumentParseError:
+        raise
     except Exception as error:
         raise DocumentParseError("The PDF file could not be read.") from error
 
@@ -374,6 +385,8 @@ def _pdf_image_chunks(path: Path, native_by_page: dict[int, str]) -> list[Source
                     },
                     native_text=native_by_page.get(page_number, ""),
                 ))
+    except DocumentParseError:
+        raise
     except Exception:
         return result
     return result
@@ -739,6 +752,8 @@ def _docx(path: Path) -> list[SourceChunk]:
                     }))
         result.extend(_docx_image_chunks(document))
         return result
+    except DocumentParseError:
+        raise
     except Exception as error:
         raise DocumentParseError("The DOCX file could not be read.") from error
 
@@ -816,7 +831,11 @@ def extract_source_chunks(
         text = extract_text(path)
         if extension in IMAGE_EXTENSIONS:
             chunks = [
-                SourceChunk(value, "image", {"page_start": 1, "page_end": 1, "part": index})
+                SourceChunk(
+                    value,
+                    "image",
+                    {"page_start": 1, "page_end": 1, "part": index, "content_type": "image_ocr"},
+                )
                 for index, value in enumerate(chunk_image_text(text), start=1)
             ]
         else:

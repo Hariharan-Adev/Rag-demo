@@ -165,6 +165,15 @@ In-process/local Qdrant is a development and test fallback only.
 OpenSearch connection settings are reserved in configuration for a future
 provider implementation; Qdrant is the only enabled provider in this release.
 
+Image OCR requires Tesseract 5.x with the `eng` language pack. Local Windows
+development can install the official Tesseract package, then either add
+`tesseract.exe` to the service `PATH` or set `TESSERACT_CMD`, for example
+`TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe`. Production images
+or servers must install Tesseract and required language data during deployment.
+The application fails fast in production when OCR is unavailable, and health
+responses expose only `ocr.status` as `ready` or `unavailable`, never executable
+paths, stack traces, document text, or secrets.
+
 The Compose development ports bind only to `127.0.0.1`; production Qdrant must
 not expose unauthenticated public ports.
 
@@ -215,11 +224,12 @@ generating a new UUIDv4 on each attempt: repeating a job updates the same Qdrant
 point. Migration `009_chunk_vector_sync` adds the synchronization columns and
 partial unique index without replacing historical IDs.
 
-`GET /health/ready` checks SQLite and Qdrant. `GET /metrics` exposes per-tenant
-document/job gauges plus retries, terminal failures, chunks created, vector
-upsert failures, lifecycle counts, and average extraction/embedding/indexing
-durations. Structured logs correlate request, organization, user, job, document,
-and version identifiers without document content or storage paths.
+`GET /health/ready` checks SQLite, Qdrant, embeddings, and safe OCR readiness.
+`GET /metrics` exposes per-tenant document/job gauges plus retries, terminal
+failures, chunks created, vector upsert failures, lifecycle counts, and average
+extraction/embedding/indexing durations. Structured logs correlate request,
+organization, user, job, document, and version identifiers without document
+content or storage paths.
 `python -m app.reindex` backfills vector payloads after migrating existing data.
 It can read historical SQLite embedding JSON for backward compatibility and
 regenerates vectors from chunk text when that legacy value is absent.
@@ -300,14 +310,19 @@ the response is:
 {
   "status": "healthy",
   "database": "connected",
-  "qdrant": "connected"
+  "qdrant": "connected",
+  "ocr": {
+    "status": "ready"
+  }
 }
 ```
 
 `GET /health/ready` additionally returns collection mode, point count, vector
-size, and payload-index names. Embedded Qdrant persists locally but documents
-that payload indexes have no effect; server/Cloud mode creates and reports the
-tenant and ACL payload indexes used by production queries.
+size, payload-index names, embedding status, and safe OCR readiness. Embedded
+Qdrant persists locally but documents that payload indexes have no effect;
+server/Cloud mode creates and reports the tenant and ACL payload indexes used by
+production queries. If OCR is not configured, health responses report
+`{"ocr":{"status":"unavailable"}}` without internal path details.
 
 Run the read-only active-point reconciliation from `backend`:
 
@@ -358,5 +373,16 @@ The isolated Qdrant lifecycle suite can be run independently:
 ```
 
 Image OCR requires the Tesseract executable on `PATH`, in a standard Windows
-install location, or configured through `TESSERACT_CMD`. Optional vision
-analysis falls back to OCR when the external provider is unavailable.
+install location, or configured through `TESSERACT_CMD`. Required languages are
+configured with `OCR_REQUIRED_LANGUAGES` and default to `eng`. Verify local OCR
+from `backend` with:
+
+```powershell
+.\venv\Scripts\python.exe -c "from app.services.image_processor.ocr import ocr_health; print(ocr_health())"
+```
+
+For containers or servers, run the same check as part of deployment health
+validation and budget CPU/memory for concurrent OCR work. OCR uses bounded
+timeouts, image-count, byte-size, and pixel limits; production parser execution
+also runs in a bounded subprocess. Optional vision analysis remains an
+enhancement and must not be used to hide required local OCR dependency failures.

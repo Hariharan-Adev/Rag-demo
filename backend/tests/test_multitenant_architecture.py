@@ -16,6 +16,7 @@ from app import database
 from app.auth import get_current_user
 from app.main import app
 from app.services import ingestion_jobs, vector_search
+from app.services.document_loader import DocumentParseError
 from app.services.rag_service import answer_question
 from app.services.source_extraction import SourceChunk
 from app.services.vector_store import VectorPoint, VectorStore
@@ -549,6 +550,68 @@ class MultitenantArchitectureTests(unittest.TestCase):
             self.client.get(f"/api/jobs/{failed['job_id']}").json()["status"],
             "completed",
         )
+
+    def test_ocr_failure_does_not_index_and_retry_can_complete(self) -> None:
+        image = self.upload_named(
+            "scan.png",
+            b"\x89PNG\r\n\x1a\nocr bytes",
+            "ocr-retry",
+        ).json()
+        ocr_error = DocumentParseError(
+            "OCR is currently unavailable. Please contact the administrator or try again later.",
+            code="ocr_unavailable",
+        )
+        successful = (
+            [
+                SourceChunk(
+                    "OCR text: approved retry evidence",
+                    "image",
+                    {
+                        "page_start": 1,
+                        "page_end": 1,
+                        "content_type": "image_ocr",
+                    },
+                )
+            ],
+            {},
+            None,
+        )
+        with patch.object(
+            ingestion_jobs,
+            "_extract_bundle",
+            side_effect=[ocr_error, successful],
+        ):
+            self.assertTrue(ingestion_jobs.run_one("worker-ocr-failure"))
+            failed = self.client.get(f"/api/jobs/{image['job_id']}").json()
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["error"]["code"], "ocr_unavailable")
+            self.assertIn("OCR is currently unavailable", failed["error"]["message"])
+            with database.get_connection() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+                    0,
+                )
+                version = connection.execute(
+                    "SELECT status, extraction_status, indexing_status FROM document_versions WHERE id = ?",
+                    (image["version_id"],),
+                ).fetchone()
+            self.assertEqual(version["status"], "failed")
+            self.assertEqual(version["extraction_status"], "failed")
+            self.assertEqual(version["indexing_status"], "failed")
+
+            retry = self.client.post(f"/api/jobs/{image['job_id']}/retry")
+            self.assertEqual(retry.status_code, 202)
+            self.assertTrue(ingestion_jobs.run_one("worker-ocr-retry"))
+
+        completed = self.client.get(f"/api/jobs/{image['job_id']}").json()
+        self.assertEqual(completed["status"], "completed")
+        with database.get_connection() as connection:
+            chunk = connection.execute(
+                "SELECT text, source_type, source_location_json FROM chunks"
+            ).fetchone()
+        self.assertIn("approved retry evidence", chunk["text"])
+        self.assertEqual(chunk["source_type"], "image")
+        self.assertIn("image_ocr", chunk["source_location_json"])
 
     def test_duplicate_versioning_reuse_and_storage_are_tenant_safe(self) -> None:
         first = self.upload(b"alpha", "duplicate-v1").json()

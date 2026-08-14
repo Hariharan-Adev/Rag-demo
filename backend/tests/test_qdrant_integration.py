@@ -154,16 +154,16 @@ class QdrantIntegrationTests(unittest.TestCase):
         with TestClient(app) as started_backend:
             health = started_backend.get("/health")
             self.assertEqual(health.status_code, 200)
-            self.assertEqual(health.json(), {
-                "status": "healthy",
-                "database": "connected",
-                "qdrant": "connected",
-                "embedding": {
-                    "status": "uninitialized",
-                    "loaded": False,
-                    "error_type": None,
-                },
+            payload = health.json()
+            self.assertEqual(payload["status"], "healthy")
+            self.assertEqual(payload["database"], "connected")
+            self.assertEqual(payload["qdrant"], "connected")
+            self.assertEqual(payload["embedding"], {
+                "status": "uninitialized",
+                "loaded": False,
+                "error_type": None,
             })
+            self.assertIn(payload["ocr"]["status"], {"ready", "unavailable"})
 
     def test_upload_indexes_chunks(self) -> None:
         """Successful ingestion should store vectors in Qdrant."""

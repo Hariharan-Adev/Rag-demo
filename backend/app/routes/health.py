@@ -6,6 +6,7 @@ from fastapi.responses import PlainTextResponse
 from app.config import settings
 from app.database import get_connection
 from app.services.embeddings import embedding_health
+from app.services.image_processor.ocr import ocr_health
 from app.services.vector_store import get_vector_store, vector_store_statistics
 
 router = APIRouter(tags=["operations"])
@@ -31,6 +32,7 @@ def health() -> dict[str, object]:
             else "standby"
         ),
         "embedding": embedding_health(),
+        "ocr": ocr_health(),
     }
 
 
@@ -53,6 +55,7 @@ def readiness() -> dict[str, object]:
         "database": "ok",
         "vector_store": {**vector, **vector_store_statistics()},
         "embedding": embedding_health(),
+        "ocr": ocr_health(),
     }
 
 

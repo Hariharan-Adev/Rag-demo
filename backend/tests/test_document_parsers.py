@@ -25,6 +25,15 @@ from app.services.source_extraction import (
     extract_source_metadata,
     validate_source_location,
 )
+from app.services.image_processor.image_parser import ImageProcessingError
+from app.services.image_processor.ocr import (
+    OCR_FAILED_MESSAGE,
+    OCR_TIMEOUT_MESSAGE,
+    OCR_UNAVAILABLE_MESSAGE,
+    OcrResult,
+    ocr_health,
+    require_ocr_ready_for_startup,
+)
 from app.services.pdf_layout import PdfPageText
 
 
@@ -229,6 +238,60 @@ class DocumentParserTests(unittest.TestCase):
         self.assertIn("relationship_id", image.location)
         self.assertIn("image_index", image.location)
 
+    def test_image_only_docx_ocr_creates_image_chunk(self):
+        """Image-only DOCX files should index embedded OCR instead of being rejected."""
+        from docx import Document
+        from PIL import Image
+
+        image_path = self.root / "only-image.png"
+        Image.new("RGB", (120, 40), "white").save(image_path)
+        path = self.root / "image-only.docx"
+        document = Document()
+        document.add_picture(str(image_path))
+        document.save(path)
+
+        with patch("app.services.source_extraction.extract_image_text", return_value="OCR text:\nImage-only approval IMG-77."):
+            chunks = extract_source_chunks(path)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("IMG-77", chunks[0].text)
+        self.assertEqual(chunks[0].location["content_type"], "image_ocr")
+
+    def test_docx_embedded_ocr_dependency_failure_is_preserved(self):
+        """OCR infrastructure failures must not become generic no-readable-content errors."""
+        from docx import Document
+        from PIL import Image
+
+        image_path = self.root / "dependency.png"
+        Image.new("RGB", (120, 40), "white").save(image_path)
+        path = self.root / "dependency.docx"
+        document = Document()
+        document.add_picture(str(image_path))
+        document.save(path)
+
+        with patch(
+            "app.services.source_extraction.extract_image_text",
+            side_effect=ImageProcessingError(OCR_UNAVAILABLE_MESSAGE, code="ocr_unavailable"),
+        ):
+            with self.assertRaises(DocumentParseError) as raised:
+                extract_source_chunks(path)
+
+        self.assertEqual(raised.exception.code, "ocr_unavailable")
+        self.assertEqual(str(raised.exception), OCR_UNAVAILABLE_MESSAGE)
+        self.assertNotIn("No readable content", str(raised.exception))
+
+    def test_docx_mixed_text_survives_corrupt_embedded_image(self):
+        """Malformed embedded images are skipped when native DOCX text is readable."""
+        from app.services.source_extraction import _image_chunks_from_bytes
+
+        chunks = _image_chunks_from_bytes(
+            blob=b"not an image",
+            filename_hint="broken.png",
+            source_type="word",
+            location={"content_type": "image_ocr"},
+        )
+        self.assertEqual(chunks, [])
+
     def test_pdf_scanned_page_ocr_creates_page_image_chunk(self):
         """A PDF page with only an image should still yield OCR text with page provenance."""
         from PIL import Image
@@ -403,8 +466,90 @@ class DocumentParserTests(unittest.TestCase):
                 return_value=False,
             ),
         ):
-            with self.assertRaisesRegex(DocumentParseError, "Tesseract service is not installed"):
+            with self.assertRaisesRegex(DocumentParseError, "OCR is currently unavailable"):
                 extract_text(path)
+
+    def test_direct_png_and_jpeg_ocr_chunks_include_image_metadata(self):
+        """Direct image ingestion should retain OCR source metadata for PNG and JPEG."""
+        from PIL import Image
+
+        for filename, image_format in (("scan.png", "PNG"), ("scan.jpg", "JPEG")):
+            path = self.root / filename
+            Image.new("RGB", (30, 20), "white").save(path)
+            with (
+                patch(
+                    "app.services.image_processor.image_parser.extract_ocr",
+                    return_value=OcrResult("Readable approval text", image_format, 30, 20, 1),
+                ),
+                patch(
+                    "app.services.image_processor.image_parser.vision_is_configured",
+                    return_value=False,
+                ),
+            ):
+                chunks = extract_source_chunks(path)
+            self.assertTrue(chunks)
+            self.assertEqual(chunks[0].source_type, "image")
+            self.assertEqual(chunks[0].location["content_type"], "image_ocr")
+
+    def test_invalid_tesseract_cmd_returns_sanitized_unavailable_error(self):
+        import pytesseract
+        from PIL import Image
+
+        path = self.root / "invalid-cmd.png"
+        Image.new("RGB", (30, 20), "white").save(path)
+        with (
+            patch("app.services.image_processor.ocr.settings.tesseract_cmd", "C:/missing/tesseract.exe"),
+            patch("pytesseract.image_to_string", side_effect=pytesseract.TesseractNotFoundError()),
+            patch("app.services.image_processor.image_parser.vision_is_configured", return_value=False),
+        ):
+            with self.assertRaises(DocumentParseError) as raised:
+                extract_text(path)
+        self.assertEqual(raised.exception.code, "ocr_unavailable")
+        self.assertEqual(str(raised.exception), OCR_UNAVAILABLE_MESSAGE)
+        self.assertNotIn("C:/missing", str(raised.exception))
+
+    def test_ocr_timeout_and_no_text_have_specific_messages(self):
+        from PIL import Image
+
+        path = self.root / "timeout.png"
+        Image.new("RGB", (30, 20), "white").save(path)
+        with (
+            patch("pytesseract.image_to_string", side_effect=RuntimeError("timeout")),
+            patch("app.services.image_processor.image_parser.vision_is_configured", return_value=False),
+        ):
+            with self.assertRaises(DocumentParseError) as timed_out:
+                extract_text(path)
+        self.assertEqual(timed_out.exception.code, "ocr_timeout")
+        self.assertEqual(str(timed_out.exception), OCR_TIMEOUT_MESSAGE)
+
+        with (
+            patch(
+                "app.services.image_processor.image_parser.extract_ocr",
+                return_value=OcrResult("", "PNG", 30, 20, 1),
+            ),
+            patch("app.services.image_processor.image_parser.vision_is_configured", return_value=False),
+        ):
+            with self.assertRaises(DocumentParseError) as no_text:
+                extract_text(path)
+        self.assertEqual(no_text.exception.code, "ocr_no_text")
+        self.assertEqual(str(no_text.exception), "No readable text was detected in the image.")
+
+    def test_ocr_health_and_production_startup_are_safe(self):
+        """Health exposes only ready/unavailable and production startup fails fast."""
+        with (
+            patch("pytesseract.get_tesseract_version", return_value="5.3.0"),
+            patch("pytesseract.get_languages", return_value=["eng"]),
+            patch("app.services.image_processor.ocr.shutil.which", return_value="tesseract"),
+        ):
+            self.assertEqual(ocr_health(), {"status": "ready"})
+
+        with (
+            patch("pytesseract.get_tesseract_version", side_effect=RuntimeError("path C:/secret failed")),
+            patch("app.services.image_processor.ocr.settings.app_environment", "production"),
+        ):
+            self.assertEqual(ocr_health(), {"status": "unavailable"})
+            with self.assertRaisesRegex(RuntimeError, "OCR dependency is unavailable"):
+                require_ocr_ready_for_startup()
 
     def test_corrupt_excel_and_powerpoint_return_format_errors(self):
         xlsx = self.root / "broken.xlsx"

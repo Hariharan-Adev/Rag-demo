@@ -2235,3 +2235,115 @@ were exposed to the frontend.
 - Database and migration: no schema change and no migration required. Existing uploaded DOCX/PDF files need reprocess/reupload to gain new embedded OCR chunks.
 - Validation performed: focused Phase 2 tests passed with `venv\Scripts\python.exe -m unittest tests.test_final_context_selection tests.test_chat_context tests.test_document_parsers -v` (54 tests). A full discovery run initially exposed that the new elliptical follow-up detector was too broad and intercepted fresh questions such as revenue/career-goal lookups; the detector was tightened to require short context-modifier language before using prior chat scope. The exact impacted regression cases then passed with `venv\Scripts\python.exe -m unittest tests.test_chat.RagRetrievalPolicyTests.test_metric_question_uses_report_pdf_evidence tests.test_chat.RagRetrievalPolicyTests.test_structured_lookup_uses_selected_source_without_llm tests.test_workbook_domain_neutral.WorkbookDomainNeutralTests.test_follow_up_uses_latest_grounded_context_within_same_chat tests.test_workbook_domain_neutral.WorkbookDomainNeutralTests.test_person_sheet_career_goal_lookup_handles_mixed_layouts tests.test_workbook_domain_neutral.WorkbookDomainNeutralTests.test_relevant_pdf_style_retrieval_wins_over_unrelated_workbook tests.test_rag_prompt_injection.RagPromptInjectionTests.test_embedded_commands_remain_data_and_cannot_remove_citations tests.test_qdrant_integration.QdrantIntegrationTests.test_qdrant_search_failure_returns_safe_error -v` (7 tests). Final full backend discovery passed with `venv\Scripts\python.exe -m unittest discover -s tests -v` (332 tests). Python compilation passed with `venv\Scripts\python.exe -m compileall app`, and `git diff --check` passed with only existing LF-to-CRLF warnings.
 - Remaining limitations: PDF support uses pypdf-exposed page images rather than a full page renderer because no safe renderer dependency is currently present. If a scanned PDF stores content in a form not exposed through pypdf images, it may still be unavailable until a bounded renderer is added. OCR quality still depends on the configured local OCR/vision availability.
+
+## 2026-08-14 - OCR failure root-cause investigation
+
+- Date: 2026-08-14.
+- Task name: Investigate image OCR and image-only DOCX OCR failures without changing application code.
+- Affected files: `changes/changes_backend` only for this report. Temporary reproduction fixtures were generated under `changes/ocr_investigation_fixtures` for local evidence; no backend, frontend, database schema, prompt, dependency, or configuration code was changed.
+- Chronology:
+  1. Inspected current branch/status and the RAG Project engineering-loop instructions. Worktree was on `codex/fix-rag-followups-docx-ingestion`; no application-code edits were made.
+  2. Located the canonical queued upload endpoint in `backend/app/routes/ingestion.py::queue_document_upload` and the legacy inline upload path in `backend/app/routes/upload.py::_process_document_upload`. The image endpoint `backend/app/routes/images.py::upload_image` delegates to the legacy inline upload path.
+  3. Traced extraction through `backend/app/services/ingestion_jobs.py::_extract_bundle`, `backend/app/services/source_extraction.py::extract_source_chunks`, `backend/app/services/document_loader.py::extract_text`, and `backend/app/services/image_processor`.
+  4. Verified runtime OCR configuration from the backend virtualenv. `pytesseract==0.3.13` imports successfully, but `tesseract --version` fails, `where.exe tesseract` finds no executable, `TESSERACT_CMD` is not set, `_configure_tesseract()` leaves `pytesseract.pytesseract.tesseract_cmd` as `tesseract`, `shutil.which('tesseract')` is false, and common Windows install paths did not contain `tesseract.exe`.
+  5. Confirmed Tesseract language-pack discovery cannot run: `pytesseract.get_languages(config='')` raises `TesseractNotFoundError` because the executable is not found.
+  6. Confirmed live API/worker launch commands through a read-only process query: API and worker are running from `backend\venv\Scripts\python.exe`, with Python child processes executing `uvicorn app.main:app --reload` and `app.worker`.
+  7. Checked available local logs (`backend/api*.log`, `backend/worker*.log`); they had no useful OCR stack traces. Queried active SQLite `backend/data/rag_new.db` read-only and found recent failed jobs matching the observed failures: image uploads store `OCR is unavailable because the Tesseract service is not installed.`, while image-only DOCX uploads store `No readable content was found in the uploaded file.`
+  8. Created four safe fixtures: a PNG with clear English text, a normal text DOCX, an image-only DOCX containing that PNG, and a mixed text-plus-image DOCX.
+  9. Ran each fixture through signature validation, extractor selection, DOCX image introspection, direct OCR where applicable, `extract_source_chunks()`, and ingestion error classification.
+  10. Ran a focused monkeypatch trace against the image-only DOCX. With fake OCR success, the DOCX path produced one `image_ocr` chunk. With fake OCR failure, the DOCX path called OCR once, swallowed the sentinel error, and raised `DocumentParseError("No readable content was found in the uploaded file.")` with no preserved cause.
+- Reproduction results:
+  - PNG image: MIME guess `image/png`; signature validation passed; extractor `image/OcrParser -> extract_image_text`; OCR attempted; failed at `extract_ocr()` with `OcrError("OCR is unavailable because the Tesseract service is not installed.")`; mapped ingestion status would be `failed`, code `document_parse_failed`, message `OCR is unavailable because the Tesseract service is not installed.`
+  - Normal text DOCX: MIME guess `application/vnd.openxmlformats-officedocument.wordprocessingml.document`; signature validation passed; extractor `source_extraction._docx`; 1 paragraph, 0 embedded image parts; OCR not attempted; 1 prose chunk, extracted text length 53; extraction would complete.
+  - Image-only DOCX: MIME guess `application/vnd.openxmlformats-officedocument.wordprocessingml.document`; signature validation passed; extractor `source_extraction._docx`; 1 paragraph, 1 embedded image part, 1 relationship location; OCR was invoked internally, but the real Tesseract failure was swallowed; final exception `DocumentParseError("No readable content was found in the uploaded file.")`; mapped ingestion status `failed`, code `document_parse_failed`, message `No readable content was found in the uploaded file.`
+  - Mixed DOCX: MIME guess `application/vnd.openxmlformats-officedocument.wordprocessingml.document`; signature validation passed; extractor `source_extraction._docx`; 3 paragraphs, 1 embedded image part, 1 relationship location; native typed text produced 1 prose chunk; embedded OCR failure was swallowed as best-effort and did not fail the document; extraction would complete with typed text only and no `image_ocr` chunk.
+- Exact root cause:
+  - Configuration/dependency root cause: the backend cannot find a Tesseract executable. `backend/app/services/image_processor/ocr.py::_configure_tesseract` checks the current pytesseract command, `TESSERACT_CMD`, `%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe`, and `%ProgramFiles%\Tesseract-OCR\tesseract.exe` (lines 27-45). None resolve in the current runtime, so `extract_ocr()` calls `pytesseract.image_to_string()` with command `tesseract` (lines 48-69), which raises `TesseractNotFoundError` and is mapped to `OcrError("OCR is unavailable because the Tesseract service is not installed.")` (lines 81-95).
+  - Application-code root cause for DOCX masking: `backend/app/services/source_extraction.py::_docx` does invoke `_docx_image_chunks(document)` after prose/table extraction (lines 721-741). `_docx_image_chunks()` discovers internal image parts from `document.part.related_parts` and calls `_image_chunks_from_bytes()` (lines 230-258). `_image_chunks_from_bytes()` catches all exceptions from temporary-file OCR and returns `[]` (lines 124-131). For an image-only DOCX, no prose/table chunks exist; after the swallowed OCR error, `extract_source_chunks()` sees an empty chunk list and raises the generic no-readable-content error (lines 793-843).
+- Whether image upload and image-only DOCX share the same failure: yes at the underlying dependency level. Both depend on the same local OCR stack and fail because Tesseract is unavailable to the backend process. They differ at error mapping: direct image upload preserves the OCR dependency message through `DocumentParseError`, while DOCX embedded-image OCR intentionally treats OCR as best-effort and converts dependency failure into empty chunks, causing a generic no-readable-content error for image-only DOCX.
+- Dependency/configuration evidence:
+  - `backend/requirements.txt` includes `pytesseract==0.3.13` and `python-docx==1.2.0`.
+  - Backend venv import succeeded for `pytesseract`; Python executable was `backend\venv\Scripts\python.exe`.
+  - `tesseract --version` failed with command not recognized.
+  - `where.exe tesseract` found no executable.
+  - `TESSERACT_CMD` was not set in effective backend settings.
+  - Configured pytesseract command after `_configure_tesseract()` remained `tesseract`; `shutil.which()` returned no path; `os.path.isfile("tesseract")` was false.
+  - No `tesseract.exe` was found in the common Windows install paths checked.
+  - Language packs could not be listed because the executable was unavailable.
+- OCR exception swallowing: confirmed. `source_extraction._image_chunks_from_bytes()` catches all exceptions around `extract_image_text(path)` and returns `[]`. The monkeypatch trace proved the DOCX image-only path calls OCR once; when OCR raises `RuntimeError("sentinel OCR dependency failure")`, the final exception is `DocumentParseError("No readable content was found in the uploaded file.")` with `__cause__ is None`, so the underlying OCR exception is discarded.
+- Security and production safeguards observed:
+  - MIME/format validation is partly signature-based rather than extension-only: `backend/app/utils/file_validation.py::validate_file_signature` checks magic bytes for images, PDFs, Office ZIP, and legacy Office files, and rejects executable masquerades (lines 27-38).
+  - DOCX/OOXML archive safeguards exist: entry count, expanded size, compression ratio, traversal paths, and encrypted entries are checked in `_validate_office_archive()` (lines 41-64).
+  - Embedded OCR limits exist in `backend/app/config.py`: max images per document 25, max images per page 5, max pixels 16,000,000, max decoded bytes 20,000,000 (lines 99-102).
+  - Image OCR has a direct per-frame pixel limit 40,000,000 and pytesseract timeout 45 seconds in `backend/app/services/image_processor/ocr.py` (lines 10-11, 60-69).
+  - Production parser isolation exists in `ingestion_jobs._extract_bundle()` using a spawned process and `parser_timeout_seconds`; development runs extraction inline (lines 103-156).
+  - Temporary embedded-image files use `TemporaryDirectory`, which cleans up automatically (source_extraction lines 124-131).
+  - Client messages are sanitized by classification/storage in `ingestion_jobs._classify_error()` and `_fail_or_retry()`; messages are capped to 500 chars before persistence (lines 170-202 and 502-555). However, direct image OCR currently exposes the operational fact that Tesseract is not installed; that is useful locally but may be too specific for a hardened production client message.
+  - Server-side logging captures failure stage and exception type without document contents in `ingestion_jobs.process_job()` (lines 1262-1278). The current DOCX swallow point logs no embedded OCR failure detail, so image-only DOCX loses the actionable server-side reason.
+- Generic production-safe fix recommendation:
+  - Install Tesseract on the host or container image and either add it to PATH for the backend/worker service account or set `TESSERACT_CMD` to a non-user-specific deployment path. Validate at startup/readiness that OCR is available when image OCR is enabled, including version and required languages, while not exposing internal paths to clients.
+  - Change embedded OCR handling so dependency/configuration failures are distinguishable from per-image unreadable/oversized/malformed best-effort failures. For documents with no native text and at least one embedded image, preserve and surface a sanitized OCR-unavailable error instead of converting it to no-readable-content. For mixed documents, continue indexing native text but log a structured server-side OCR warning without document content.
+  - Avoid hard-coded user-specific Windows paths. Prefer service configuration (`TESSERACT_CMD`) and deployment documentation.
+  - Keep client errors generic in production, for example `OCR is unavailable for image-based documents. Please contact support or retry after OCR is configured.`, while logging server-side `TesseractNotFoundError`/configured-command diagnostics without secrets or raw document content.
+- Tests that should be added:
+  - Unit test: image upload extraction maps `pytesseract.TesseractNotFoundError` to a sanitized OCR-unavailable parse error.
+  - Unit test: DOCX with only embedded image and mocked OCR success produces an `image_ocr` chunk with Word provenance.
+  - Unit test: DOCX with only embedded image and mocked OCR dependency failure preserves an OCR-unavailable failure rather than generic no-readable-content.
+  - Unit test: mixed DOCX with native text plus OCR failure still extracts native prose and records/logs an OCR warning without failing the document.
+  - Unit test: embedded image count, decoded byte, pixel, and timeout limits are enforced without leaking paths/content.
+  - Integration test: queued ingestion job for image-only DOCX stores a stable `document_parse_failed` code with a useful sanitized message.
+  - Runtime/preflight test or health/readiness check: configured `TESSERACT_CMD` exists, is executable by the backend service account, returns a version, and lists required language packs.
+- Final verdict: both. The immediate root cause is a configuration/deployment issue: Tesseract executable is not installed or not visible to PATH/configuration for the backend/worker process. There is also an application-code issue: embedded DOCX OCR catches and discards all OCR exceptions, so image-only DOCX reports a misleading no-readable-content error instead of preserving the real OCR dependency failure. OCR investigation: ROOT CAUSE CONFIRMED
+
+## 2026-08-14 - Reliable OCR configuration and error propagation
+
+- Date: 2026-08-14.
+- Time: 10:11:53 +05:30.
+- Task name: Implement reliable OCR for direct images and image-based documents.
+- Affected files: `backend/app/config.py`, `backend/.env.example`, `backend/app/services/image_processor/ocr.py`, `backend/app/services/image_processor/image_parser.py`, `backend/app/services/document_loader.py`, `backend/app/services/source_extraction.py`, `backend/app/services/ingestion_jobs.py`, `backend/app/routes/health.py`, `backend/app/main.py`, `backend/README.md`, `backend/tests/test_document_parsers.py`, `backend/tests/test_multitenant_architecture.py`, `backend/tests/test_qdrant_integration.py`, and `changes/changes_backend`.
+- What changed:
+  - Added explicit OCR configuration fields `TESSERACT_CMD` and `OCR_REQUIRED_LANGUAGES`.
+  - Added safe OCR readiness validation that checks the Python OCR package, Tesseract executable, version command, and required languages without exposing executable paths in health responses.
+  - Added production startup fail-fast behavior when OCR is unavailable.
+  - Replaced raw/legacy OCR messages with sanitized typed failures: `ocr_unavailable`, `ocr_processing_failed`, `ocr_timeout`, and `ocr_no_text`.
+  - Preserved typed OCR infrastructure failures through direct image parsing, embedded DOCX/PDF extraction, and ingestion-job classification.
+  - Kept corrupt or oversized embedded images best-effort so readable native DOCX/PDF text still indexes, while OCR dependency, execution, and timeout failures now fail OCR-dependent documents accurately.
+  - Added `content_type: image_ocr` metadata to direct-image chunks in the queued source-extraction path.
+  - Updated health responses to include safe `ocr.status` and documented deployment/configuration requirements.
+- Why this approach:
+  - The smallest root-cause fix was to make OCR dependency state explicit and typed, then preserve those typed failures across embedded extraction instead of returning an empty result. This preserves old successful text/table behavior and avoids hard-coded user-specific executable paths.
+- Tests run:
+  - `.\venv\Scripts\python.exe -m compileall app` passed.
+  - `.\venv\Scripts\python.exe -m unittest tests.test_document_parsers -v` passed 29/29.
+  - `.\venv\Scripts\python.exe -m unittest tests.test_image_upload tests.test_security_limits tests.test_multitenant_architecture -v` passed 26/26.
+  - `.\venv\Scripts\python.exe -m unittest tests.test_qdrant_integration -v` passed 12/12.
+  - `.\venv\Scripts\python.exe -m unittest discover -s tests -v` passed 350/350 in 192.804 seconds.
+  - `git diff --check` passed with only existing LF-to-CRLF working-copy warnings.
+- Manual verification:
+  - Current local OCR health returns `{'status': 'unavailable'}` because Tesseract is still not installed/configured on this machine.
+  - Direct PNG fixture now fails with code `ocr_unavailable` and message `OCR is currently unavailable. Please contact the administrator or try again later.`
+  - Image-only DOCX fixture now fails with the same `ocr_unavailable` message instead of `No readable content was found in the uploaded file.`
+  - With mocked OCR success, the PNG fixture produced one `image` chunk with `content_type=image_ocr`; the image-only DOCX fixture produced one `word` chunk with `content_type=image_ocr`.
+- Security review:
+  - Client-facing errors are sanitized and do not expose executable paths, stack traces, document contents, or secrets.
+  - Server logs record OCR readiness/error type without extracted document text.
+  - Existing file signature checks, Office archive traversal/decompression limits, parser timeout, embedded-image byte/pixel/image-count limits, temporary-directory cleanup, tenant/owner ACLs, and retry/idempotency behavior are preserved.
+  - Failed OCR jobs remain failed and do not create successful chunks/vectors; retry can complete after OCR becomes available.
+- API documentation:
+  - `GET /health` now includes `ocr: {"status": "ready"}` or `ocr: {"status": "unavailable"}`.
+  - `GET /health/ready` includes the same safe OCR status alongside database, vector-store, and embedding readiness.
+  - Upload/ingestion failures for OCR dependency, execution, timeout, and no-text image cases use stable sanitized messages and stored error codes.
+- Database documentation:
+  - No schema change and no migration required. Existing failed OCR jobs can be retried after Tesseract is installed/configured. Existing successfully indexed documents are unchanged; OCR-dependent documents that previously failed need retry/reupload after configuration is corrected.
+- Frontend design documentation:
+  - No frontend files changed. Existing upload status surfaces the backend's sanitized job error message; no UI layout, typography, color, accessibility, or interaction behavior changed.
+- Commit message:
+  - `fix: preserve OCR dependency failures`
+  - Body:
+    - add explicit Tesseract configuration and safe OCR health status
+    - propagate embedded-image OCR infrastructure failures through ingestion
+    - add regression coverage for image and DOCX OCR error mapping, retry integrity, and health behavior
+- Remaining risks/prerequisites:
+  - Local and production environments must install Tesseract 5.x and the configured language packs, or set `TESSERACT_CMD` to a valid deployment path. This code verifies readiness but does not install the external executable.
+  - Optional vision analysis remains an enhancement and does not replace required local OCR for OCR-dependent ingestion.
+- Final status: PASS WITH WARNING. Application behavior is fixed and all backend tests pass, but this machine still needs Tesseract installed/configured before real non-mocked OCR uploads can succeed.

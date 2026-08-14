@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     max_workbook_sheets: int = 250
     max_workbook_rows: int = 200000
     parser_timeout_seconds: float = 120.0
+    tesseract_cmd: str = ""
+    ocr_required_languages: str = "eng"
     include_hidden_worksheets: bool = True
     include_very_hidden_worksheets: bool = False
     default_organization_name: str = "Default Organization"

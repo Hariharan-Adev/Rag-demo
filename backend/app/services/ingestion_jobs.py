@@ -172,7 +172,8 @@ def _classify_error(error: Exception) -> tuple[str, str, bool]:
     if isinstance(error, IngestionPolicyError):
         return error.code, str(error), False
     if isinstance(error, DocumentParseError):
-        return "document_parse_failed", str(error), False
+        code = getattr(error, "code", "document_parse_failed")
+        return code, str(error), False
     if isinstance(error, ArchiveValidationError):
         return "archive_validation_failed", str(error), False
     if isinstance(error, FileNotFoundError):

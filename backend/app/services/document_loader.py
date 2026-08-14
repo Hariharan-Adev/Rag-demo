@@ -17,6 +17,10 @@ from app.services.image_processor import (
 class DocumentParseError(ValueError):
     """Raised when a supported file cannot be converted to readable text."""
 
+    def __init__(self, message: str, code: str = "document_parse_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 class DocumentParser(Protocol):
     def extract_text(self, file_path: Path) -> str:
@@ -207,7 +211,7 @@ class OcrParser:
         try:
             return extract_image_text(file_path)
         except ImageProcessingError as error:
-            raise DocumentParseError(str(error)) from error
+            raise DocumentParseError(str(error), code=error.code) from error
 
 
 PARSER_REGISTRY: dict[str, DocumentParser] = {}

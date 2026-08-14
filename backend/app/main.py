@@ -17,6 +17,7 @@ from app.routes.ingestion import public_router as public_ingestion_router
 from app.routes.ingestion import router as ingestion_router
 from app.routes.search import router as search_router
 from app.routes.upload import router as upload_router
+from app.services.image_processor.ocr import require_ocr_ready_for_startup
 from app.utils.observability import log_event
 from app.worker import run_worker
 
@@ -78,6 +79,7 @@ app.include_router(collections_router)
 @app.on_event("startup")
 def startup() -> None:
     """Initialize persistence and start ingestion with the API."""
+    require_ocr_ready_for_startup()
     initialize_database()
     _start_ingestion_worker()
 

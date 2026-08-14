@@ -18,6 +18,10 @@ IMAGE_CHUNK_OVERLAP = 40
 class ImageProcessingError(ValueError):
     """Raised when neither OCR nor vision can extract useful image information."""
 
+    def __init__(self, message: str, code: str = "image_processing_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 def chunk_image_text(text: str) -> list[str]:
     """Use focused chunks so details in dense screenshots remain retrievable."""
@@ -51,8 +55,8 @@ def extract_image_text(file_path: Path) -> str:
     ocr_text = ocr_result.text if ocr_result is not None else ""
     if not ocr_text and not vision_text:
         if ocr_error is not None:
-            raise ImageProcessingError(str(ocr_error)) from ocr_error
-        raise ImageProcessingError("The image contains no readable text or visual information.")
+            raise ImageProcessingError(ocr_error.public_message, code=ocr_error.code) from ocr_error
+        raise ImageProcessingError("No readable text was detected in the image.", code="ocr_no_text")
 
     metadata = [f"Image: {file_path.stem}", "Document type: screenshot"]
     if ocr_result is not None:
